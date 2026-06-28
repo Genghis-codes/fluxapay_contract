@@ -25,6 +25,12 @@ import {
 import { NetworkProfileSwitcher, NetworkEnvironment, NetworkProfiles, NetworkProfile } from "./network-profiles.js";
 import { FxOracleClient } from "./contracts/fx-oracle.js";
 import { MerchantRegistryClient } from "./contracts/merchant-registry.js";
+import {
+  PaymentLinkManagerClient,
+  type PaymentLinkManagerConfig,
+  type PaymentLink,
+  type CreateLinkParams,
+} from "./contracts/payment-link-manager.js";
 
 export interface FluxapayConfig {
   network: NetworkEnvironment;
@@ -34,6 +40,8 @@ export interface FluxapayConfig {
   oracleContractId?: string;
   /** MerchantRegistry contract ID for merchant management operations. */
   merchantRegistryContractId?: string;
+  /** PaymentLinkManager contract ID for payment link operations. */
+  paymentLinkContractId?: string;
 }
 
 export interface CreatePaymentParams {
@@ -202,6 +210,7 @@ export class FluxapayClient {
   public networkSwitcher: NetworkProfileSwitcher;
   private fxOracleClient?: FxOracleClient;
   private merchantRegistryClient?: MerchantRegistryClient;
+  private paymentLinkManagerClient?: PaymentLinkManagerClient;
   private readonly config: FluxapayConfig;
 
   constructor(config: FluxapayConfig) {
@@ -274,6 +283,7 @@ export class FluxapayClient {
     });
     this.fxOracleClient = undefined;
     this.merchantRegistryClient = undefined;
+    this.paymentLinkManagerClient = undefined;
   }
 
   /**
@@ -525,6 +535,85 @@ export class FluxapayClient {
     );
   }
 
+  private getPaymentLinkManager(): PaymentLinkManagerClient {
+    if (!this.config.paymentLinkContractId) {
+      throw new Error(
+        "paymentLinkContractId is required in FluxapayConfig for payment link operations",
+      );
+    }
+
+    if (!this.paymentLinkManagerClient) {
+      const profile = this.networkSwitcher.getProfile();
+      this.paymentLinkManagerClient = new PaymentLinkManagerClient({
+        network: profile.environment,
+        rpcUrl: this.config.rpcUrl || profile.rpcUrl,
+        contractId: this.config.paymentLinkContractId,
+      });
+    }
+
+    return this.paymentLinkManagerClient;
+  }
+
+  /**
+   * Create a new payment link.
+   * Maps to `PaymentLinkManager.create_link` on-chain.
+   * @param params.merchant - The merchant's Stellar address
+   * @param params.amount - Optional fixed amount in stroops
+   * @param params.usdcToken - USDC token contract address
+   * @param params.metadata - Optional key/value metadata
+   * @returns A promise resolving to the new link ID
+   */
+  async createLink(params: CreateLinkParams): Promise<string> {
+    return this.getPaymentLinkManager().createLink(params);
+  }
+
+  /**
+   * Use a payment link to initiate a payment.
+   * Maps to `PaymentLinkManager.use_link` on-chain.
+   * @param payer - The payer's Stellar address
+   * @param linkId - The payment link ID
+   * @param amount - The amount to pay in stroops
+   * @param usdcToken - The USDC token contract address
+   */
+  async useLink(
+    payer: string,
+    linkId: string,
+    amount: bigint,
+    usdcToken: string,
+  ): Promise<void> {
+    return this.getPaymentLinkManager().useLink(payer, linkId, amount, usdcToken);
+  }
+
+  /**
+   * Deactivate a payment link (merchant only).
+   * Maps to `PaymentLinkManager.deactivate_link` on-chain.
+   * @param merchant - The merchant's Stellar address
+   * @param linkId - The payment link ID to deactivate
+   */
+  async deactivateLink(merchant: string, linkId: string): Promise<void> {
+    return this.getPaymentLinkManager().deactivateLink(merchant, linkId);
+  }
+
+  /**
+   * Retrieve details of a specific payment link.
+   * Maps to `PaymentLinkManager.get_link` on-chain.
+   * @param linkId - The payment link ID
+   * @returns A promise resolving to the PaymentLink details
+   */
+  async getLink(linkId: string): Promise<PaymentLink> {
+    return this.getPaymentLinkManager().getLink(linkId);
+  }
+
+  /**
+   * Verify a batch of payment links, returning only active ones.
+   * Maps to `PaymentLinkManager.verify_batch` on-chain.
+   * @param linkIds - Array of link IDs to verify
+   * @returns A promise resolving to an array of active link IDs
+   */
+  async verifyBatch(linkIds: string[]): Promise<string[]> {
+    return this.getPaymentLinkManager().verifyBatch(linkIds);
+  }
+
   /** Offline/hardware wallet payload builder utilities. */
   offlineSigner(): FluxapayOfflineSigner {
     return new FluxapayOfflineSigner(
@@ -571,3 +660,9 @@ export {
   type RateData,
   FX_ORACLE_ERROR_MAP,
 } from "./contracts/fx-oracle.js";
+export {
+  PaymentLinkManagerClient,
+  type PaymentLinkManagerConfig,
+  type PaymentLink,
+  type CreateLinkParams,
+} from "./contracts/payment-link-manager.js";

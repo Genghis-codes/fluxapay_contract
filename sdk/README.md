@@ -250,6 +250,93 @@ const oracle = client.fxOracle();
 const rate = await oracle.getRate("USDCNGN");
 ```
 
+## Payment Links (FluxapayClient)
+
+Payment links let merchants share a reusable URL that payers can settle against. Pass `paymentLinkContractId` in config to enable these methods.
+
+### Create a payment link
+
+```typescript
+import { FluxapayClient } from "@fluxapay/sdk";
+
+const client = new FluxapayClient({
+  network: "testnet",
+  contractId: "C...",
+  paymentLinkContractId: "C...", // PaymentLinkManager contract ID
+});
+
+// Fixed-amount link
+const linkId = await client.createLink({
+  merchant: "G...",
+  amount: 5_000_000n, // 0.5 USDC (7 decimals)
+  usdcToken: "C...",
+  metadata: { product: "Coffee", ref: "order_42" }, // optional
+});
+console.log("Link created:", linkId);
+
+// Open-amount link (payer sets the amount)
+const openLinkId = await client.createLink({
+  merchant: "G...",
+  usdcToken: "C...",
+});
+```
+
+### Use a payment link
+
+```typescript
+await client.useLink(
+  "G...",        // payer address
+  linkId,        // link ID returned by createLink
+  5_000_000n,    // amount in stroops
+  "C...",        // USDC token contract address
+);
+```
+
+### Retrieve and verify links
+
+```typescript
+// Fetch a single link
+const link = await client.getLink(linkId);
+console.log("Link active:", link.active);
+console.log("Merchant:", link.merchant);
+console.log("Metadata:", link.metadata);
+
+// Batch-verify multiple links (returns only active link IDs)
+const activeLinkIds = await client.verifyBatch([linkId, openLinkId, "C_other..."]);
+console.log("Active links:", activeLinkIds);
+```
+
+### Deactivate a link
+
+```typescript
+// Only the merchant that created the link can deactivate it
+await client.deactivateLink("G...", linkId);
+```
+
+### Standalone PaymentLinkManagerClient
+
+```typescript
+import { PaymentLinkManagerClient } from "@fluxapay/sdk";
+
+const linkClient = new PaymentLinkManagerClient({
+  network: "testnet",
+  rpcUrl: "https://soroban-testnet.stellar.org",
+  contractId: "C...", // PaymentLinkManager contract ID
+});
+
+const linkId = await linkClient.createLink({
+  merchant: "G...",
+  amount: 10_000_000n,
+  usdcToken: "C...",
+  metadata: { item: "Widget" },
+});
+
+const link = await linkClient.getLink(linkId);
+await linkClient.useLink("G_payer...", linkId, 10_000_000n, "C...");
+await linkClient.deactivateLink("G_merchant...", linkId);
+const active = await linkClient.verifyBatch([linkId]);
+```
+
 ## License
 
 MIT

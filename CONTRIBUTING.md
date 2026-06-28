@@ -108,7 +108,25 @@ Or via Makefile:
 cd fluxapay && make fmt && cargo clippy --all-targets --all-features
 ```
 
----
+### Linting GitHub Actions Workflows (actionlint)
+
+We use [actionlint](https://github.com/rhysd/actionlint) to statically check all `.github/workflows/*.yml` files.
+CI runs it automatically via the `rhysd/actionlint@v1` action — **do not commit the binary to the repo**.
+
+To run it locally, install the tool for your platform and execute it from the repo root:
+
+```bash
+# macOS (Homebrew)
+brew install actionlint
+
+# Linux (go install)
+go install github.com/rhysd/actionlint/cmd/actionlint@latest
+
+# Run against all workflows
+actionlint
+```
+
+
 
 ## 5. Branch Naming Conventions
 

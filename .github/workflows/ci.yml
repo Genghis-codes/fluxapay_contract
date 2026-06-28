@@ -413,11 +413,23 @@ jobs:
         working-directory: sdk
         run: npm test
 
+  # Job 7: Lint GitHub Actions workflows with actionlint
+  actionlint:
+    name: Lint GitHub Actions (actionlint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run actionlint
+        uses: rhysd/actionlint@v1
+
   # Final job: Report overall status
   ci-success:
     name: CI Success
     if: ${{ always() }}
-    needs: [format, lint, security-audit, build, test, coverage, sdk-check]
+    needs: [format, lint, security-audit, build, test, coverage, sdk-check, actionlint]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -429,7 +441,8 @@ jobs:
              [[ "${{ needs.build.result }}" == "success" ]] && \
              [[ "${{ needs.test.result }}" == "success" ]] && \
              [[ "${{ needs.coverage.result }}" == "success" ]] && \
-             [[ "${{ needs.sdk-check.result }}" == "success" ]]; then
+             [[ "${{ needs.sdk-check.result }}" == "success" ]] && \
+             [[ "${{ needs.actionlint.result }}" == "success" ]]; then
             echo "✅ All CI checks passed!"
             exit 0
           else

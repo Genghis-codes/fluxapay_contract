@@ -65,6 +65,7 @@ export interface CreatePaymentArgs {
   client_token: Option<string>;
   metadata_hash: Option<Buffer>;
   metadata: Option<Record<string, string>>;
+  fee_waiver_code: Option<string>;
 }
 
 export interface Merchant {

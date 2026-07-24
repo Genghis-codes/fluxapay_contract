@@ -34,6 +34,7 @@ fn payment_args(
         client_token: None,
         metadata_hash: None,
         metadata,
+        fee_waiver_code: None,
     }
 }
 

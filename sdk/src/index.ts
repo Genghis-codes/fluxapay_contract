@@ -56,6 +56,13 @@ export interface CreatePaymentParams {
   memoType?: string;
   tokenAddress?: string;
   clientToken?: string;
+  /**
+   * Optional per-payment fee-waiver code. If the code is valid at
+   * settlement time (exists, not expired, still has remaining uses), the
+   * platform fee is waived. See `addFeeWaiverCode` for how admin registers
+   * codes.
+   */
+  feeWaiverCode?: string;
 }
 
 export interface RegisterMerchantParams {
@@ -202,6 +209,7 @@ function toCreatePaymentArgs(params: CreatePaymentParams): CreatePaymentArgs {
     client_token: params.clientToken,
     metadata_hash: undefined,
     metadata: undefined,
+    fee_waiver_code: params.feeWaiverCode,
   };
 }
 
@@ -384,6 +392,66 @@ export class FluxapayClient {
       this.contract.verify_merchant({
         admin,
         merchant_id: merchantId,
+      }),
+    );
+  }
+
+  /**
+   * Apply or clear a time-based fee waiver for a merchant.
+   *
+   * Requires the MerchantRegistry admin signer. Delegates to
+   * `MerchantRegistryClient.setMerchantFeeWaiver` when the merchant registry
+   * contract ID is configured; falls back to calling the underlying
+   * `set_merchant_fee_waiver` on the main contract (MerchantRegistry
+   * embedded path).
+   */
+  async setMerchantFeeWaiver(params: {
+    admin: string;
+    merchantId: string;
+    expiresAt?: bigint | null;
+  }) {
+    if (this.config.merchantRegistryContractId) {
+      return this.getMerchantRegistry().setMerchantFeeWaiver(params);
+    }
+    return withMappedContractError(() =>
+      this.contract.set_merchant_fee_waiver({
+        admin: params.admin,
+        merchant_id: params.merchantId,
+        expires_at:
+          params.expiresAt === null || params.expiresAt === undefined
+            ? null
+            : params.expiresAt,
+      }),
+    );
+  }
+
+  /**
+   * Admin-only: register a reusable fee-waiver code for per-payment zero-fee
+   * promotions on the PaymentProcessor.
+   *
+   * Merchants pass the returned `code` via `CreatePaymentParams.feeWaiverCode`
+   * at `createPayment` time; at settlement, a valid code waives the platform
+   * fee and atomically decrements the code's `remainingUses` counter.
+   *
+   * Requires the PaymentProcessor ADMIN role.
+   *
+   * @param admin            – ADMIN signer for the PaymentProcessor contract
+   * @param code             – case-sensitive promo code string (e.g. "LAUNCH2026")
+   * @param expiresAt        – ledger timestamp (seconds) after which the code is rejected
+   * @param maxUses          – maximum total payments that can consume this code (>=1)
+   */
+  async addFeeWaiverCode(params: {
+    admin: string;
+    code: string;
+    expiresAt: bigint;
+    maxUses: number;
+  }) {
+    return withMappedContractError(() =>
+      this.contract.add_fee_waiver_code({
+        admin: params.admin,
+        code: params.code,
+        expires_at: params.expiresAt,
+        max_uses: params.maxUses,
       }),
     );
   }

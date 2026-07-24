@@ -472,6 +472,15 @@ pub struct AdminProposed {
     pub new_admin: Address,
 }
 
+/// Emitted when a multi-sig admin proposal is fully executed.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct AdminProposalExecuted {
+    pub proposal_id: u64,
+    pub action_tag: Symbol,
+    pub executor: Address,
+}
+
 /// Emitted when admin is claimed.
 #[contractevent]
 #[derive(Clone, Debug)]

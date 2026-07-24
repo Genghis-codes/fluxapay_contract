@@ -3588,3 +3588,606 @@ fn test_idempotency_still_blocks_during_active_window() {
     let result = client.try_create_payment(&args2);
     assert_eq!(result, Err(Ok(Error::DuplicateIdempotencyKey)));
 }
+
+// =============================================================================
+// Multi-sig admin proposal tests
+// =============================================================================
+
+/// Helper: set up a contract with a 2-of-3 multisig configuration.
+/// Returns (admin1, admin2, admin3, client).
+fn setup_multisig_2of3(
+    env: &Env,
+) -> (Address, Address, Address, PaymentProcessorClient<'_>) {
+    let (admin, client) = setup_payment_processor(env);
+    let signer2 = Address::generate(env);
+    let signer3 = Address::generate(env);
+
+    let signers = vec![env, admin.clone(), signer2.clone(), signer3.clone()];
+    client.set_multisig_config(&admin, &2u32, &signers);
+
+    (admin, signer2, signer3, client)
+}
+
+/// Threshold not met → execute_proposal must fail with AccessControlError.
+#[test]
+fn test_proposal_threshold_not_met_does_not_execute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _signer2, _signer3, client) = setup_multisig_2of3(&env);
+
+    // Create a proposal — admin is the first signer (1 of 2 required).
+    let action = AdminAction::SetDisputeBond(200_000i128);
+    let nonce = client.create_proposal(&admin, &action);
+
+    // Try to execute immediately with only 1 approval (threshold is 2).
+    let result = client.try_execute_proposal(&admin, &nonce);
+    assert_eq!(result, Err(Ok(Error::AccessControlError)));
+
+    // The dispute bond should still be the default (100_000).
+    assert_eq!(client.get_dispute_bond_amount(), 100_000i128);
+}
+
+/// Threshold met → execute_proposal applies the parameter change and emits the event.
+#[test]
+fn test_proposal_threshold_met_executes_dispute_bond() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, signer2, _signer3, client) = setup_multisig_2of3(&env);
+
+    let new_bond: i128 = 250_000;
+    let action = AdminAction::SetDisputeBond(new_bond);
+    let nonce = client.create_proposal(&admin, &action);
+
+    // Second signer votes — threshold of 2 is now met.
+    client.vote_proposal(&signer2, &nonce);
+
+    // Execute the proposal.
+    client.execute_proposal(&admin, &nonce);
+
+    // Dispute bond must reflect the new value.
+    assert_eq!(client.get_dispute_bond_amount(), new_bond);
+
+    // Verify ADMIN/PROPOSAL_EXECUTED event was emitted.
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1;
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (t0, t1),
+            (Ok(a), Ok(b))
+                if a == Symbol::new(&env, "ADMIN") && b == Symbol::new(&env, "PROPOSAL_EXECUTED")
+        )
+    });
+    assert!(found, "Expected ADMIN/PROPOSAL_EXECUTED event was not emitted");
+}
+
+/// Threshold met → SetVolumeCap updates tier cap for a specific KycTier.
+#[test]
+fn test_proposal_threshold_met_executes_volume_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, signer2, _signer3, client) = setup_multisig_2of3(&env);
+
+    let new_cap: i128 = 200_000_000_000i128; // $20,000 in stroops
+    let action = AdminAction::SetVolumeCap(crate::merchant_registry::KycTier::Basic, new_cap);
+    let nonce = client.create_proposal(&admin, &action);
+    client.vote_proposal(&signer2, &nonce);
+    client.execute_proposal(&admin, &nonce);
+
+    assert_eq!(
+        client.get_tier_volume_cap(&crate::merchant_registry::KycTier::Basic),
+        new_cap
+    );
+}
+
+/// Threshold met → SetRefundFeeBps updates the refund fee.
+#[test]
+fn test_proposal_threshold_met_executes_refund_fee_bps() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, signer2, _signer3, client) = setup_multisig_2of3(&env);
+
+    let new_bps: i128 = 50; // 0.5%
+    let action = AdminAction::SetRefundFeeBps(new_bps);
+    let nonce = client.create_proposal(&admin, &action);
+    client.vote_proposal(&signer2, &nonce);
+    client.execute_proposal(&admin, &nonce);
+
+    assert_eq!(client.get_refund_fee_bps(), new_bps);
+}
+
+/// Threshold met → SetRateLimit updates the global rate limit config.
+#[test]
+fn test_proposal_threshold_met_executes_rate_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, signer2, _signer3, client) = setup_multisig_2of3(&env);
+
+    // new: 120-second window, 10 payments max
+    let action = AdminAction::SetRateLimit(10u32, 120u64);
+    let nonce = client.create_proposal(&admin, &action);
+    client.vote_proposal(&signer2, &nonce);
+    client.execute_proposal(&admin, &nonce);
+
+    // Rate limit is stored under DataKey::GlobalRateLimit; verify via contract storage.
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let config = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RateLimitConfig>(&DataKey::GlobalRateLimit)
+            .expect("GlobalRateLimit should be set");
+        assert_eq!(config.max_per_window, 10u32);
+        assert_eq!(config.window_secs, 120u64);
+    });
+}
+
+/// Expired proposal (> 48 h) → execute_proposal returns an error.
+#[test]
+fn test_proposal_expired_after_48h() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, signer2, _signer3, client) = setup_multisig_2of3(&env);
+
+    let action = AdminAction::SetDisputeBond(999_999i128);
+    let nonce = client.create_proposal(&admin, &action);
+    // Second signer votes — threshold met.
+    client.vote_proposal(&signer2, &nonce);
+
+    // Advance ledger timestamp beyond 48 hours.
+    env.ledger().with_mut(|l| {
+        l.timestamp += 48 * 60 * 60 + 1; // 48h + 1 second
+    });
+
+    // Execute should fail with ProposalExpired (mapped to AccessControlError).
+    let result = client.try_execute_proposal(&admin, &nonce);
+    assert_eq!(result, Err(Ok(Error::AccessControlError)));
+
+    // Bond unchanged.
+    assert_eq!(client.get_dispute_bond_amount(), 100_000i128);
+}
+
+/// A non-signer cannot create a proposal.
+#[test]
+fn test_non_signer_cannot_create_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _signer2, _signer3, client) = setup_multisig_2of3(&env);
+    let outsider = Address::generate(&env);
+
+    // Reconfigure to 2-of-2 with only admin and signer2, excluding outsider.
+    let signers = vec![&env, admin.clone(), Address::generate(&env)];
+    client.set_multisig_config(&admin, &2u32, &signers);
+
+    let action = AdminAction::SetDisputeBond(1i128);
+    let result = client.try_create_proposal(&outsider, &action);
+    assert_eq!(result, Err(Ok(Error::AccessControlError)));
+}
+
+// =============================================================================
+// Platform fee split (FeeSplitConfig / set_fee_split_config) tests
+// =============================================================================
+
+/// Helper: register a token contract and mint `amount` to `recipient`.
+/// Returns the token contract address.
+fn setup_and_mint_token(env: &Env, recipient: &Address, amount: i128) -> Address {
+    let token_admin = Address::generate(env);
+    let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+    token::StellarAssetClient::new(env, &token_id).mint(recipient, &amount);
+    token_id
+}
+
+/// `set_fee_split_config` stores the config; validation rejects sums > 10 000.
+#[test]
+fn test_set_fee_split_config_stores_and_validates() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let treasury = Address::generate(&env);
+    let developer = Address::generate(&env);
+
+    // Valid: 7000 + 3000 = 10 000 (exactly 100%)
+    let config = FeeSplitConfig {
+        treasury_bps: 7_000,
+        developer_bps: 3_000,
+        treasury_address: treasury.clone(),
+        developer_address: developer.clone(),
+    };
+    client.set_fee_split_config(&admin, &config);
+    let stored = client.get_fee_split_config().expect("config should be stored");
+    assert_eq!(stored.treasury_bps, 7_000);
+    assert_eq!(stored.developer_bps, 3_000);
+
+    // Valid: 5000 + 4000 = 9000 (< 100% — remainder implicitly goes to treasury)
+    let partial = FeeSplitConfig {
+        treasury_bps: 5_000,
+        developer_bps: 4_000,
+        treasury_address: treasury.clone(),
+        developer_address: developer.clone(),
+    };
+    client.set_fee_split_config(&admin, &partial);
+
+    // Invalid: 6000 + 5000 = 11 000 > 10 000
+    let bad = FeeSplitConfig {
+        treasury_bps: 6_000,
+        developer_bps: 5_000,
+        treasury_address: treasury.clone(),
+        developer_address: developer.clone(),
+    };
+    let result = client.try_set_fee_split_config(&admin, &bad);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// Non-admin cannot call `set_fee_split_config`.
+#[test]
+fn test_set_fee_split_config_requires_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_payment_processor(&env);
+
+    let non_admin = Address::generate(&env);
+    let config = FeeSplitConfig {
+        treasury_bps: 7_000,
+        developer_bps: 3_000,
+        treasury_address: Address::generate(&env),
+        developer_address: Address::generate(&env),
+    };
+    let result = client.try_set_fee_split_config(&non_admin, &config);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// `configure_fee_split` (flat-args) also rejects sums > 10 000.
+#[test]
+fn test_configure_fee_split_sum_constraint() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    // Exactly 10 000 — valid
+    client.configure_fee_split(
+        &admin,
+        &8_000u32,
+        &2_000u32,
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+
+    // 11 000 — invalid
+    let result = client.try_configure_fee_split(
+        &admin,
+        &6_000u32,
+        &5_000u32,
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+/// When FeeSplitConfig is set, settle_payment splits the fee and transfers
+/// both portions in the same transaction. TreasuryBalance is NOT updated.
+#[test]
+fn test_settle_payment_splits_fee_between_treasury_and_developer() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    // Mint tokens to the contract so transfers succeed
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+
+    // Wire the USDC token
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    // 10% settlement fee
+    client.set_fee_rate(&admin, &1_000i128);
+
+    // 70 / 30 split
+    let treasury_addr = Address::generate(&env);
+    let dev_addr = Address::generate(&env);
+    client.set_fee_split_config(
+        &admin,
+        &FeeSplitConfig {
+            treasury_bps: 7_000,
+            developer_bps: 3_000,
+            treasury_address: treasury_addr.clone(),
+            developer_address: dev_addr.clone(),
+        },
+    );
+
+    let payment_id = String::from_str(&env, "split_fee_pay");
+    let amount = 10_000i128; // fee = 1000; treasury = 700; dev = 300
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    // Splits must cover net amount = 10 000 - 1 000 = 9 000
+    let splits = vec![
+        &env,
+        SettlementSplit {
+            recipient: Address::generate(&env),
+            amount: 9_000i128,
+        },
+    ];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    // Payment settled
+    assert_eq!(
+        client.get_payment(&payment_id).status,
+        PaymentStatus::Settled
+    );
+
+    // Treasury balance must NOT accumulate (fee was forwarded, not stored)
+    assert_eq!(
+        client.get_treasury_balance(),
+        0i128,
+        "TreasuryBalance should remain 0 when FeeSplitConfig is active"
+    );
+
+    // Token balances: treasury received 700, developer received 300
+    let token_client = token::TokenClient::new(&env, &token_id);
+    assert_eq!(
+        token_client.balance(&treasury_addr),
+        700i128,
+        "Treasury should receive 70% of the 1000-unit fee"
+    );
+    assert_eq!(
+        token_client.balance(&dev_addr),
+        300i128,
+        "Developer should receive 30% of the 1000-unit fee"
+    );
+}
+
+/// PAYMENT/FEE_SPLIT event is emitted with payment_id, treasury_amount, dev_amount.
+#[test]
+fn test_settle_payment_emits_fee_split_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    // 10% fee, 50/50 split
+    client.set_fee_rate(&admin, &1_000i128);
+    client.set_fee_split_config(
+        &admin,
+        &FeeSplitConfig {
+            treasury_bps: 5_000,
+            developer_bps: 5_000,
+            treasury_address: Address::generate(&env),
+            developer_address: Address::generate(&env),
+        },
+    );
+
+    let payment_id = String::from_str(&env, "split_event_pay");
+    let amount = 2_000i128; // fee = 200; treasury = 100; dev = 100
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    let splits = vec![
+        &env,
+        SettlementSplit {
+            recipient: Address::generate(&env),
+            amount: 1_800i128, // 2000 - 200
+        },
+    ];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    // Verify PAYMENT/FEE_SPLIT event was emitted
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (t0, t1),
+            (Ok(a), Ok(b))
+                if a == Symbol::new(&env, "PAYMENT") && b == Symbol::new(&env, "FEE_SPLIT")
+        )
+    });
+    assert!(found, "PAYMENT/FEE_SPLIT event must be emitted when FeeSplitConfig is active");
+}
+
+/// Zero developer_bps → entire fee goes to treasury address; no transfer to developer.
+#[test]
+fn test_settle_payment_zero_dev_bps_sends_all_to_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    // 10% fee, 100% to treasury, 0% to developer
+    client.set_fee_rate(&admin, &1_000i128);
+    let treasury_addr = Address::generate(&env);
+    let dev_addr = Address::generate(&env);
+    client.set_fee_split_config(
+        &admin,
+        &FeeSplitConfig {
+            treasury_bps: 10_000,
+            developer_bps: 0,
+            treasury_address: treasury_addr.clone(),
+            developer_address: dev_addr.clone(),
+        },
+    );
+
+    let payment_id = String::from_str(&env, "zero_dev_pay");
+    let amount = 5_000i128; // fee = 500
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    let splits = vec![
+        &env,
+        SettlementSplit {
+            recipient: Address::generate(&env),
+            amount: 4_500i128, // 5000 - 500
+        },
+    ];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    let token_client = token::TokenClient::new(&env, &token_id);
+
+    // Treasury gets the full 500
+    assert_eq!(
+        token_client.balance(&treasury_addr),
+        500i128,
+        "Treasury should receive 100% of the fee when developer_bps = 0"
+    );
+
+    // Developer receives nothing
+    assert_eq!(
+        token_client.balance(&dev_addr),
+        0i128,
+        "Developer should receive 0 when developer_bps = 0"
+    );
+}
+
+/// When no FeeSplitConfig is set, settle_payment falls back to accumulating
+/// the fee in TreasuryBalance and emitting FEE_COLLECTED (unchanged legacy behaviour).
+#[test]
+fn test_settle_payment_no_fee_split_config_falls_back_to_treasury_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    // No FeeSplitConfig set — verify legacy behaviour is intact
+    client.set_fee_rate(&admin, &100i128); // 1%
+
+    let payment_id = String::from_str(&env, "legacy_fee_pay");
+    let amount = 10_000i128; // fee = 100
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    let splits = vec![
+        &env,
+        SettlementSplit {
+            recipient: Address::generate(&env),
+            amount: 9_900i128,
+        },
+    ];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    // Legacy: TreasuryBalance accumulates the fee
+    assert_eq!(
+        client.get_treasury_balance(),
+        100i128,
+        "Without FeeSplitConfig the fee must accumulate in TreasuryBalance"
+    );
+
+    // Legacy: FEE_COLLECTED event, not FEE_SPLIT
+    let events = env.events().all();
+    let fee_collected = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (t0, t1),
+            (Ok(a), Ok(b))
+                if a == Symbol::new(&env, "PAYMENT") && b == Symbol::new(&env, "FEE_COLLECTED")
+        )
+    });
+    assert!(fee_collected, "FEE_COLLECTED event must be emitted on legacy path");
+
+    let fee_split = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (t0, t1),
+            (Ok(a), Ok(b))
+                if a == Symbol::new(&env, "PAYMENT") && b == Symbol::new(&env, "FEE_SPLIT")
+        )
+    });
+    assert!(!fee_split, "FEE_SPLIT must NOT be emitted on legacy path");
+}
+
+/// Rounding dust (odd amounts) goes to treasury, not lost.
+#[test]
+fn test_settle_payment_fee_split_rounding_dust_to_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    // 10% fee on 1001 → fee = 100 (integer); 33.3% to dev → dev = 33, treasury = 67
+    client.set_fee_rate(&admin, &1_000i128);
+    let treasury_addr = Address::generate(&env);
+    let dev_addr = Address::generate(&env);
+    client.set_fee_split_config(
+        &admin,
+        &FeeSplitConfig {
+            treasury_bps: 6_667,
+            developer_bps: 3_333,
+            treasury_address: treasury_addr.clone(),
+            developer_address: dev_addr.clone(),
+        },
+    );
+
+    let amount = 1_000i128; // fee = 100; dev = 100*3333/10000 = 33; treasury = 100 - 33 = 67
+    let payment_id = String::from_str(&env, "rounding_pay");
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    let splits = vec![
+        &env,
+        SettlementSplit {
+            recipient: Address::generate(&env),
+            amount: 900i128, // 1000 - 100
+        },
+    ];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    let token_client = token::TokenClient::new(&env, &token_id);
+    let dev_bal = token_client.balance(&dev_addr);
+    let treasury_bal = token_client.balance(&treasury_addr);
+
+    // dev = 33, treasury = 67, total = 100
+    assert_eq!(dev_bal, 33i128);
+    assert_eq!(treasury_bal, 67i128);
+    assert_eq!(dev_bal + treasury_bal, 100i128, "All fee tokens must be accounted for");
+}

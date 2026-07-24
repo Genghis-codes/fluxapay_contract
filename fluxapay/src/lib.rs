@@ -55,10 +55,13 @@ pub mod fx_oracle;
 pub mod merchant_auth;
 use access_control::{
     role_admin, role_merchant, role_oracle, role_settlement_operator, role_arbitrator, AccessControl,
+    AdminAction, AdminProposal,
 };
 // Re-export for tests
 #[allow(unused_imports)]
 pub use access_control::AccessControlDataKey;
+#[allow(unused_imports)]
+pub use access_control::{AdminAction, AdminProposal};
 pub use dex_router::{DexRouter, DexRouterClient};
 pub use fx_oracle::{FXOracle, FXOracleClient, FXOracleError};
 pub use merchant_auth::{
@@ -675,6 +678,12 @@ pub enum DataKey {
     ContractVersion,
     /// Configurable settlement fee rate in basis points (issue: settle_payment fee).
     SettlementFeeRate,
+    /// Configurable dispute bond amount in stablecoin stroops (overrides DISPUTE_BOND_AMOUNT const).
+    DisputeBondAmount,
+    /// Configurable monthly volume cap per KYC tier in stablecoin stroops (overrides TIER_CAP_* const).
+    TierVolumeCap(KycTier),
+    /// Configurable refund fee in basis points (overrides REFUND_FEE_BPS const).
+    RefundFeeBps,
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
@@ -899,8 +908,9 @@ impl RefundManager {
         Ok(())
     }
 
-    /// Issue #168: Configure fee split destinations for refund fees.
+    /// Issue #168: Configure fee split destinations for platform fees.
     /// Admin can set allocation ratios and destination addresses.
+    /// `treasury_bps + developer_bps` must be ≤ 10 000; any remainder goes to treasury.
     pub fn configure_fee_split(
         env: Env,
         admin: Address,
@@ -910,13 +920,12 @@ impl RefundManager {
         developer_address: Address,
     ) -> Result<(), Error> {
         admin.require_auth();
-        
+
         if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
             return Err(Error::Unauthorized);
         }
 
-        // Validate that splits add up to 100%
-        if treasury_bps + developer_bps != 10_000 {
+        if treasury_bps.saturating_add(developer_bps) > 10_000 {
             return Err(Error::InvalidAmount);
         }
 
@@ -934,6 +943,35 @@ impl RefundManager {
         env.events().publish(
             (Symbol::new(&env, "FEE_SPLIT"), Symbol::new(&env, "CONFIGURED")),
             (treasury_bps, developer_bps),
+        );
+
+        Ok(())
+    }
+
+    /// Struct-based setter for the platform fee split config (alias for `configure_fee_split`).
+    /// Admin only. `config.treasury_bps + config.developer_bps` must be ≤ 10 000.
+    pub fn set_fee_split_config(
+        env: Env,
+        admin: Address,
+        config: FeeSplitConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if config.treasury_bps.saturating_add(config.developer_bps) > 10_000 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeSplitConfig, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "FEE_SPLIT"), Symbol::new(&env, "CONFIGURED")),
+            (config.treasury_bps, config.developer_bps),
         );
 
         Ok(())
@@ -5347,6 +5385,7 @@ impl PaymentProcessor {
                 .get::<DataKey, Address>(&DataKey::UsdcToken)
         });
 
+        // ── Configurable settlement fee split (treasury + developer) ─────────────
         let now = env.ledger().timestamp();
 
         // ── Fee-waiver evaluation (merchant time-based + per-payment code) ────────
@@ -5433,23 +5472,69 @@ impl PaymentProcessor {
         };
 
         if settlement_fee > 0 {
-            // Accumulate fee in TreasuryBalance (not forwarded immediately)
-            let current_treasury: i128 = env
+            // Check whether a FeeSplitConfig has been configured.
+            let fee_split_config: Option<FeeSplitConfig> = env
                 .storage()
                 .persistent()
-                .get::<DataKey, i128>(&DataKey::TreasuryBalance)
-                .unwrap_or(0);
-            env.storage()
-                .persistent()
-                .set(&DataKey::TreasuryBalance, &current_treasury.saturating_add(settlement_fee));
+                .get(&DataKey::FeeSplitConfig);
 
-            env.events().publish(
-                (
-                    Symbol::new(&env, "PAYMENT"),
-                    Symbol::new(&env, "FEE_COLLECTED"),
-                ),
-                (payment_id.clone(), payment.merchant_id.clone(), settlement_fee),
-            );
+            if let Some(ref fsc) = fee_split_config {
+                // Split the fee between treasury and developer.
+                // dev_amount = fee * developer_bps / 10000; treasury gets the remainder
+                // (including any rounding dust) so no tokens are lost.
+                let dev_amount: i128 =
+                    settlement_fee * fsc.developer_bps as i128 / 10_000;
+
+                // Rounding dust goes to treasury.
+                let treasury_total = settlement_fee.saturating_sub(dev_amount);
+
+                if let Some(ref st) = settlement_token {
+                    let token_client = token::TokenClient::new(&env, st);
+                    let from = env.current_contract_address();
+                    if treasury_total > 0 {
+                        let _ = token_client.try_transfer(
+                            &from,
+                            &fsc.treasury_address,
+                            &treasury_total,
+                        );
+                    }
+                    if dev_amount > 0 {
+                        let _ = token_client.try_transfer(
+                            &from,
+                            &fsc.developer_address,
+                            &dev_amount,
+                        );
+                    }
+                }
+
+                // Emit PAYMENT/FEE_SPLIT
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "PAYMENT"),
+                        Symbol::new(&env, "FEE_SPLIT"),
+                    ),
+                    (payment_id.clone(), treasury_total, dev_amount),
+                );
+            } else {
+                // No FeeSplitConfig — accumulate entire fee in TreasuryBalance (legacy path).
+                let current_treasury: i128 = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::TreasuryBalance)
+                    .unwrap_or(0);
+                env.storage().persistent().set(
+                    &DataKey::TreasuryBalance,
+                    &current_treasury.saturating_add(settlement_fee),
+                );
+
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "PAYMENT"),
+                        Symbol::new(&env, "FEE_COLLECTED"),
+                    ),
+                    (payment_id.clone(), payment.merchant_id.clone(), settlement_fee),
+                );
+            }
         }
 
         // Net amount after settlement fee
@@ -6560,6 +6645,173 @@ impl PaymentProcessor {
         );
 
         Ok(())
+    }
+
+    // =========================================================================
+    // Multi-sig admin proposal functions
+    // =========================================================================
+
+    /// Configure the multi-sig threshold and signer set.
+    /// Only the current admin may call this.
+    pub fn set_multisig_config(
+        env: Env,
+        admin: Address,
+        threshold: u32,
+        signers: Vec<Address>,
+    ) -> Result<(), Error> {
+        AccessControl::set_multisig_config(&env, admin, threshold, signers)
+            .map_err(|_| Error::AccessControlError)
+    }
+
+    /// Returns the current multi-sig (threshold, signers) configuration.
+    pub fn get_multisig_config(env: Env) -> (u32, Vec<Address>) {
+        AccessControl::get_multisig_config(&env)
+    }
+
+    /// Create a new admin proposal for a contract parameter change.
+    /// The calling signer must be in the multisig signer set.
+    /// Returns the proposal nonce.
+    pub fn create_proposal(
+        env: Env,
+        signer: Address,
+        action: AdminAction,
+    ) -> Result<u64, Error> {
+        AccessControl::create_proposal(&env, signer, action)
+            .map_err(|_| Error::AccessControlError)
+    }
+
+    /// Vote to approve an existing proposal.
+    /// The calling signer must be in the multisig signer set and must not have
+    /// already voted on this proposal.
+    pub fn vote_proposal(env: Env, signer: Address, nonce: u64) -> Result<(), Error> {
+        AccessControl::vote_proposal(&env, signer, nonce)
+            .map_err(|_| Error::AccessControlError)
+    }
+
+    /// Execute a proposal once the multisig threshold is met.
+    ///
+    /// * Proposals expire after 48 hours if the threshold is not reached.
+    /// * For parameter-change actions (`SetDisputeBond`, `SetVolumeCap`,
+    ///   `SetRefundFeeBps`, `SetRateLimit`) the new value is written to
+    ///   persistent storage and a `ADMIN/PROPOSAL_EXECUTED` event is emitted.
+    pub fn execute_proposal(env: Env, executor: Address, nonce: u64) -> Result<(), Error> {
+        executor.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &executor) {
+            return Err(Error::Unauthorized);
+        }
+
+        let remaining = AccessControl::execute_proposal(&env, nonce)
+            .map_err(|_| Error::AccessControlError)?;
+
+        let action_tag = if let Some(ref action) = remaining {
+            match action {
+                AdminAction::SetDisputeBond(amount) => {
+                    if *amount < 0 {
+                        return Err(Error::InvalidAmount);
+                    }
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::DisputeBondAmount, amount);
+                    Symbol::new(&env, "SET_DISPUTE_BOND")
+                }
+                AdminAction::SetVolumeCap(tier, cap) => {
+                    if *cap < 0 {
+                        return Err(Error::InvalidAmount);
+                    }
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::TierVolumeCap(tier.clone()), cap);
+                    Symbol::new(&env, "SET_VOLUME_CAP")
+                }
+                AdminAction::SetRefundFeeBps(bps) => {
+                    if *bps < 0 || *bps > 10_000 {
+                        return Err(Error::InvalidAmount);
+                    }
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::RefundFeeBps, bps);
+                    Symbol::new(&env, "SET_REFUND_FEE")
+                }
+                AdminAction::SetRateLimit(max_per_window, window_secs) => {
+                    let config = RateLimitConfig {
+                        window_secs: *window_secs,
+                        max_per_window: *max_per_window,
+                    };
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::GlobalRateLimit, &config);
+                    Symbol::new(&env, "SET_RATE_LIMIT")
+                }
+                AdminAction::SetGlobalPause(paused, _reason) => {
+                    let empty = String::from_str(&env, "multisig_proposal");
+                    let state = PauseState {
+                        paused: *paused,
+                        reason: empty,
+                        admin: Some(executor.clone()),
+                        timestamp: env.ledger().timestamp(),
+                    };
+                    env.storage().persistent().set(&DataKey::Paused, &state);
+                    Symbol::new(&env, "SET_GLOBAL_PAUSE")
+                }
+                AdminAction::AllowToken(token) => {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::AllowedToken(token.clone()), &true);
+                    Symbol::new(&env, "ALLOW_TOKEN")
+                }
+                _ => Symbol::new(&env, "EXECUTED"),
+            }
+        } else {
+            Symbol::new(&env, "EXECUTED")
+        };
+
+        // Emit ADMIN/PROPOSAL_EXECUTED event
+        env.events().publish(
+            (Symbol::new(&env, "ADMIN"), Symbol::new(&env, "PROPOSAL_EXECUTED")),
+            (nonce, action_tag, executor),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve a pending proposal by nonce.
+    pub fn get_proposal(env: Env, nonce: u64) -> Option<AdminProposal> {
+        AccessControl::get_proposal(&env, nonce)
+    }
+
+    /// Read the effective dispute bond amount (configurable via multi-sig proposal).
+    /// Falls back to the compile-time constant if not set via proposal.
+    pub fn get_dispute_bond_amount(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::DisputeBondAmount)
+            .unwrap_or(DISPUTE_BOND_AMOUNT)
+    }
+
+    /// Read the effective monthly volume cap for a KYC tier.
+    /// Falls back to compile-time constants if not overridden by a proposal.
+    pub fn get_tier_volume_cap(env: Env, tier: KycTier) -> i128 {
+        if let Some(cap) = env.storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::TierVolumeCap(tier.clone()))
+        {
+            return cap;
+        }
+        match tier {
+            KycTier::Unverified => TIER_CAP_UNVERIFIED,
+            KycTier::Basic => TIER_CAP_BASIC,
+            KycTier::Full => TIER_CAP_FULL,
+            KycTier::Business => TIER_CAP_BUSINESS,
+        }
+    }
+
+    /// Read the effective refund fee in basis points.
+    /// Falls back to the compile-time constant if not overridden by a proposal.
+    pub fn get_refund_fee_bps(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::RefundFeeBps)
+            .unwrap_or(REFUND_FEE_BPS)
     }
 }
 

@@ -385,7 +385,7 @@ jobs:
               }
             }
 
-  # Job 6: Check SDK build
+  # Job 6: Check SDK build and types
   sdk-check:
     name: SDK Build Check
     runs-on: ubuntu-latest
@@ -397,17 +397,21 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "lts/*"
           cache: "npm"
-          cache-working-directory: sdk
+          cache-dependency-path: sdk/package-lock.json
 
       - name: Install dependencies
         working-directory: sdk
-        run: npm install
+        run: npm ci
 
       - name: Build SDK
         working-directory: sdk
         run: npm run build
+
+      - name: Type check
+        working-directory: sdk
+        run: npx tsc --noEmit
 
       - name: Test SDK
         working-directory: sdk

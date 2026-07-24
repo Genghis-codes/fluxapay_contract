@@ -27,6 +27,45 @@ export interface UpdateMerchantParams {
 }
 
 /**
+ * Stellar Anchor Protocol (SEP-6 / SEP-24) configuration for fiat offramp.
+ *
+ * Bridges on-chain USDC settlement to a merchant's bank account via a
+ * compliant anchor partner (MoneyGram, Circle, Tempo, etc.).
+ *
+ * Passed as the `anchorConfig` argument to `setMerchantAnchor`. Pass
+ * `undefined` or `null` to `setMerchantAnchor` to clear the anchor and
+ * revert to on-chain-only settlement.
+ */
+export interface AnchorConfig {
+  /** Fully qualified anchor domain, e.g. "api.moneygram.com". */
+  anchorDomain: string;
+  /** Full URL of the anchor's SEP-6 transfer server. */
+  sep6Endpoint: string;
+  /** Full URL of the anchor's SEP-24 interactive transfer server. */
+  sep24Endpoint: string;
+  /**
+   * Fiat currencies this anchor can payout for this merchant.
+   * ISO-4217 alphabetic codes, e.g. ["USD", "EUR", "NGN"].
+   */
+  supportedCurrencies: string[];
+}
+
+export interface SetMerchantAnchorParams {
+  merchantId: string;
+  /** Pass a valid config to enable SEP-6 offramp; pass `null` to disable. */
+  anchorConfig: AnchorConfig | null;
+}
+
+export interface SetMerchantFeeWaiverParams {
+  /** Must be the MerchantRegistry admin signer. */
+  admin: string;
+  merchantId: string;
+  /** Timestamp (seconds) until which all platform fees are waived for this
+   *  merchant. Pass `undefined`/`null` to immediately clear a running waiver. */
+  expiresAt?: bigint | null;
+}
+
+/**
  * MerchantRegistryClient provides a high-level interface for interacting with the MerchantRegistry contract.
  * Manages merchant registration, verification, and account status operations.
  */
@@ -152,6 +191,66 @@ export class MerchantRegistryClient {
       this.getContract().verify_merchant({
         admin: operator,
         merchant_id: merchantId,
+      }),
+    );
+  }
+
+  /**
+   * Configure or clear the merchant's Stellar Anchor (SEP-6 / SEP-24)
+   * integration for automated fiat offramp during settlement.
+   *
+   * When a valid `anchorConfig` is supplied, every subsequent settlement for
+   * this merchant will emit a `PAYMENT/ANCHOR_WITHDRAW` event that the
+   * off-chain Settlement Service consumes to call the anchor's SEP-6
+   * withdrawal endpoint and bridge USDC → the merchant's bank account.
+   *
+   * Pass `anchorConfig: null` to clear the anchor and revert to
+   * on-chain-only settlement (USDC stays in the merchant's payout address).
+   *
+   * Requires the merchant's signature — only the merchant themselves may
+   * change their anchor configuration.
+   *
+   * Emits an on-chain `(MERCHANT, ANCHOR_UPDATED)` event.
+   */
+  async setMerchantAnchor(params: SetMerchantAnchorParams): Promise<void> {
+    return withMappedContractError(() =>
+      this.getContract().set_merchant_anchor({
+        merchant_id: params.merchantId,
+        anchor_config: params.anchorConfig
+          ? {
+              anchor_domain: params.anchorConfig.anchorDomain,
+              sep6_endpoint: params.anchorConfig.sep6Endpoint,
+              sep24_endpoint: params.anchorConfig.sep24Endpoint,
+              supported_currencies: params.anchorConfig.supportedCurrencies,
+            }
+          : null,
+      }),
+    );
+  }
+
+  /**
+   * Admin-only: apply or clear a time-based platform fee waiver for a
+   * merchant (onboarding / promotional campaigns).
+   *
+   * While the current ledger timestamp is below `expiresAt`, every
+   * `settle_payment` for this merchant will waive both the global settlement
+   * fee and the merchant-level FeeConfig fee.
+   *
+   * Pass `expiresAt: null` (or omit) to immediately revoke an active waiver.
+   *
+   * Requires the MerchantRegistry admin signature.
+   *
+   * Emits `(MERCHANT, FEE_WAIVER_SET)` on success.
+   */
+  async setMerchantFeeWaiver(params: SetMerchantFeeWaiverParams): Promise<void> {
+    return withMappedContractError(() =>
+      this.getContract().set_merchant_fee_waiver({
+        admin: params.admin,
+        merchant_id: params.merchantId,
+        expires_at:
+          params.expiresAt === null || params.expiresAt === undefined
+            ? null
+            : params.expiresAt,
       }),
     );
   }

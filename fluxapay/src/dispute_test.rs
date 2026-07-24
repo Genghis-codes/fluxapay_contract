@@ -1,4 +1,4 @@
-﻿use crate::{
+use crate::{
     DataKey, Dispute, DisputeStatus, PaymentProcessor, PaymentProcessorClient, Refund,
     RefundManager, RefundManagerClient, RefundStatus,
 };
@@ -36,6 +36,7 @@ fn create_payment_args(
     crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant_id.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(env, "USDC"),
         deposit_address: Address::generate(env),
@@ -47,6 +48,7 @@ fn create_payment_args(
         client_token: None,
         metadata_hash: None,
         metadata: None,
+        fee_waiver_code: None,
     }
 }
 

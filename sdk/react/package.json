@@ -1,0 +1,46 @@
+{
+  "name": "@fluxapay/react",
+  "version": "0.1.0",
+  "description": "React hooks for the FluxaPay SDK — payments, refunds, and merchant data for Next.js dashboards",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MetroLogic/fluxapay_contract.git",
+    "directory": "sdk/react"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "stellar",
+    "soroban",
+    "fluxapay",
+    "react",
+    "hooks",
+    "payments"
+  ],
+  "author": "FluxaPay Team",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": ">=17.0.0"
+  },
+  "dependencies": {
+    "@fluxapay/sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.0.0",
+    "react": "^18.0.0"
+  }
+}

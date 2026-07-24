@@ -354,6 +354,7 @@ fn test_unverified_merchant_cannot_create_payment() {
     let args = crate::CreatePaymentArgs {
         payment_id,
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -416,6 +417,7 @@ fn test_verified_merchant_can_create_payment() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -1342,6 +1344,7 @@ fn test_basic_tier_cap_enforced() {
     payment_client.create_payment(&crate::CreatePaymentArgs {
         payment_id: pid1.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 90_000_000_000,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: deposit.clone(),
@@ -1367,6 +1370,7 @@ fn test_basic_tier_cap_enforced() {
     payment_client.create_payment(&crate::CreatePaymentArgs {
         payment_id: pid2.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 20_000_000_000,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: deposit.clone(),
@@ -1413,6 +1417,7 @@ fn test_business_tier_no_cap() {
     payment_client.create_payment(&crate::CreatePaymentArgs {
         payment_id: pid.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 10_000_000_000_000, // $1,000,000
         currency: Symbol::new(&env, "USDC"),
         deposit_address: deposit.clone(),
@@ -1457,6 +1462,7 @@ fn test_volume_resets_next_month() {
     payment_client.create_payment(&crate::CreatePaymentArgs {
         payment_id: pid1.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 100_000_000_000,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: deposit.clone(),
@@ -1485,6 +1491,7 @@ fn test_volume_resets_next_month() {
     payment_client.create_payment(&crate::CreatePaymentArgs {
         payment_id: pid2.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 100_000_000_000,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: deposit.clone(),
@@ -1844,4 +1851,112 @@ fn test_transfer_admin_emits_event() {
         }
     });
     assert!(found, "MERCHANT_REGISTRY/ADMIN_TRANSFERRED event not emitted");
+}
+
+// ─── Customer Whitelist Mode Tests (Issue #516) ──────────────────────────────
+
+#[test]
+fn test_whitelist_mode_requires_business_tier() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, _payment_client, registry_client, merchant, _oracle) =
+        setup_volume_cap_env(&env);
+
+    // Merchant is still Unverified — enabling whitelist mode must fail.
+    let result = registry_client.try_set_merchant_whitelist_mode(&merchant, &true);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_whitelist_mode_toggle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, _payment_client, registry_client, merchant, _oracle) =
+        setup_volume_cap_env(&env);
+
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Business, &None);
+
+    registry_client.set_merchant_whitelist_mode(&merchant, &true);
+    assert!(registry_client.get_merchant(&merchant).whitelist_mode);
+
+    registry_client.set_merchant_whitelist_mode(&merchant, &false);
+    assert!(!registry_client.get_merchant(&merchant).whitelist_mode);
+}
+
+#[test]
+fn test_non_whitelisted_payer_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (admin, payment_client, registry_client, merchant, _oracle) =
+        setup_volume_cap_env(&env);
+
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Business, &None);
+    registry_client.set_merchant_whitelist_mode(&merchant, &true);
+
+    let payer = Address::generate(&env);
+    let deposit = Address::generate(&env);
+
+    let result = payment_client.try_create_payment(&crate::CreatePaymentArgs {
+        payment_id: String::from_str(&env, "pay_wl_1"),
+        merchant_id: merchant.clone(),
+        payer: Some(payer),
+        amount: 1_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit,
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+
+    assert!(result.is_err(), "Expected PayerNotWhitelisted error");
+}
+
+#[test]
+fn test_whitelisted_payer_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (admin, payment_client, registry_client, merchant, _oracle) =
+        setup_volume_cap_env(&env);
+
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Business, &None);
+    registry_client.set_merchant_whitelist_mode(&merchant, &true);
+
+    let payer = Address::generate(&env);
+    registry_client.add_to_customer_whitelist(&merchant, &payer);
+
+    let deposit = Address::generate(&env);
+
+    let payment = payment_client.create_payment(&crate::CreatePaymentArgs {
+        payment_id: String::from_str(&env, "pay_wl_2"),
+        merchant_id: merchant.clone(),
+        payer: Some(payer.clone()),
+        amount: 1_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit,
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+
+    assert_eq!(payment.merchant_id, merchant);
+
+    // Removing the payer from the whitelist should block subsequent payments.
+    registry_client.remove_from_customer_whitelist(&merchant, &payer);
+    assert!(!registry_client.is_customer_whitelisted(&merchant, &payer));
 }

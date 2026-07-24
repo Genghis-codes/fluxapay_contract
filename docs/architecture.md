@@ -232,6 +232,126 @@ PaymentLinkManager
 
 ---
 
+## FX & Settlement: Stellar Anchor Protocol (SEP-6 / SEP-24) Fiat Offramp
+
+FluxaPay's settlement layer bridges on-chain USDC on Stellar to merchants' off-chain bank accounts via the Stellar Anchor Protocol. The integration supports both **SEP-6** (programmatic, no UI — for merchants with existing KYC) and **SEP-24** (interactive hosted UI — for merchants that still need to complete KYC or bank details). Compliant anchor partners include MoneyGram, Circle (USDC issuer), Tempo, and region-specific anchors.
+
+### Design Rationale
+
+Soroban contracts cannot make HTTP calls to anchor APIs from on-chain. The architecture therefore uses an **on-chain event + off-chain callback** pattern:
+
+1. On-chain: `PaymentProcessor::settle_payment` transfers USDC to the merchant's `payout_address`, marks the `Payment.status = Settled`, and **emits** a `PAYMENT / ANCHOR_WITHDRAW` event containing all parameters the off-chain service needs (anchor endpoints, amount, currency, merchant payout address, etc.).
+2. Off-chain: a **Settlement Service** (indexer) picks up the `ANCHOR_WITHDRAW` event and calls the anchor's SEP-6 `/transactions/withdraw` endpoint. It polls for terminal status and posts a callback webhook (`POST /settlement/anchor/callback`) to FluxaPay's backend.
+
+This keeps the on-chain contracts simple (no HTTP, no async), and moves the inherently-asynchronous fiat-bank-network logic to the service layer where it belongs. Full protocol details, request/response mappings, failure handling, and reference anchor configs live in the companion document: [sep6-sep24-anchor-integration.md](sep6-sep24-anchor-integration.md).
+
+### Merchant Anchor Config (MerchantRegistry)
+
+Merchants opt in to anchor offramp via `MerchantRegistry::set_merchant_anchor`, which stores an `AnchorConfig` struct on their Merchant record:
+
+| Field | Purpose |
+|-------|---------|
+| `anchor_domain` | Fully qualified anchor domain (e.g. `api.moneygram.com`) for SEP-1 TOML discovery |
+| `sep6_endpoint` | Full URL to the anchor's SEP-6 programmatic transfer server |
+| `sep24_endpoint` | Full URL to the anchor's SEP-24 interactive transfer server (fallback) |
+| `supported_currencies` | ISO-4217 codes this anchor can payout for this merchant (USD, EUR, NGN, …) |
+
+- SDK surface: `MerchantRegistryClient.setMerchantAnchor({ merchantId, anchorConfig })`. Pass `null` to clear the anchor and revert to on-chain-only settlement.
+- Auth: `set_merchant_anchor` requires the merchant's own signature — only the merchant controls their anchor.
+- Backwards compatibility: the `Merchant.anchor_config` field is a `MaybeAnchorConfig` enum (`None` / `Some(AnchorConfig)`). Existing merchants read back `None` — same behavior as before (no anchor, USDC to payout address directly).
+
+### Settlement → Anchor Flow
+
+```
+PaymentProcessor::settle_payment
+  │
+  ├─ Transfer USDC → merchant.payout_address        (on-chain)
+  ├─ Payment.status = Settled                       (on-chain)
+  ├─ emit PAYMENT / SETTLED
+  │
+  └─ if merchant.anchor_config.is_some:
+       emit PAYMENT / ANCHOR_WITHDRAW               (off-chain trigger)
+         Topics:   (PAYMENT, ANCHOR_WITHDRAW, merchant_id, anchor_domain)
+         Payload:  (payment_id, amount, currency,
+                    merchant_payout_addr,
+                    sep6_endpoint, sep24_endpoint,
+                    supported_currencies, ledger_ts)
+          │
+          ▼
+  Off-chain Settlement Service
+    ├─ Consume event (Soroban RPC / Horizon getEvents)
+    ├─ Authenticated via SEP-10 JWT per anchor
+    ├─ POST {sep6_endpoint}/transactions/withdraw
+    │    → body: { asset_code=USDC, amount,
+    │              dest=bank_account, account=payout_addr,
+    │              memo=payment_id }
+    ├─ Poll /transactions/{id} until terminal
+    │    - completed  → webhook success
+    │    - incomplete → fall back to SEP-24 URL → notify merchant
+    │    - error      → webhook error + alert ops
+    └─ POST /api/settlement/anchor/callback  (FluxaPay backend)
+         → webhook HMAC-signed; 200 OK = ack; 5xx = retry w/ backoff
+```
+
+### Updated Cross-Contract Diagram
+
+```
+PaymentProcessor
+  ├─ calls MerchantRegistry
+  │   ├─ verify_merchant(merchant_id) → ok/error
+  │   ├─ get_merchant(merchant_id) → Merchant
+  │   │                          ├─ .fee_config       → % + fixed fee calc in settle_payment
+  │   │                          ├─ .anchor_config    → ANCHOR_WITHDRAW event payload
+  │   │                          └─ ...
+  │   └─ set_merchant_anchor(merchant_id, AnchorConfig | None)
+  │
+  ├─ calls DexRouter (for swap_and_pay)
+  │   └─ swap_exact_tokens_for_tokens() → Vec<amounts>
+  │
+  ├─ calls FXOracle (optional, for rate validation)
+  │   └─ get_rate(pair) → (rate, timestamp)
+  │
+  ├─ calls RefundManager
+  │   ├─ process_refund(refund_id) → ok/error
+  │   └─ create_refund(...) → refund_id
+  │
+  ├─ calls PaymentLinkManager
+  │   ├─ create_link(...) → link_id
+  │   └─ use_link(link_id) → payment_id
+  │
+  └─ emits events → Off-chain Settlement Service
+       └─ PAYMENT / ANCHOR_WITHDRAW  ──┐
+                                       ▼
+                              Stellar Anchor (SEP-6 / SEP-24)
+                                 MoneyGram / Circle / Tempo
+                                       │
+                                       ▼
+                              Merchant Bank Account (fiat)
+                                       │
+                                       ▼
+                         POST /settlement/anchor/callback
+```
+
+### Key Events
+
+| On-Chain Event | Consumer | Purpose |
+|----------------|----------|---------|
+| `(MERCHANT, ANCHOR_UPDATED)` | Indexer / audit | Records whenever a merchant sets or clears their anchor config |
+| `(PAYMENT, ANCHOR_WITHDRAW, merchant_id, anchor_domain)` | Off-chain Settlement Service | Triggers SEP-6 withdrawal with the anchor partner on successful settlement |
+| `(PAYMENT, SETTLED)` | General indexer | Canonical settlement event (fires regardless of whether an anchor is configured) |
+
+### Failure & Security Notes
+
+- **Anchor API unreachable**: settlement on-chain already succeeded; the off-chain Settlement Service retries with exponential backoff and alerts ops if failing for >2 h. USDC is already safely in the merchant's on-chain payout address, so the merchant is never at risk of losing funds — worst case the fiat payout is delayed.
+- **KYC / bank missing at anchor**: SEP-6 responds `incomplete`. The service redirects the merchant to the SEP-24 interactive URL; once the merchant completes the flow the next settlement auto-uses SEP-6.
+- **Double-withdraw protection**: the off-chain service keys every request idempotently by `payment_id`.
+- **SEP-10 mutual auth**: every call to the anchor must use a fresh SEP-10 JWT signed by the merchant / FluxaPay operator key for that anchor.
+- **Payout address 48h delay**: if the merchant also changes their on-chain `payout_address` after configuring an anchor, the existing 48-hour change cooldown applies, preventing a compromised merchant key from silently redirecting USDC before it reaches the anchor.
+
+Full SEP-6 / SEP-24 protocol integration details, request payloads, anchor status mapping, and callback webhook schema are documented in [sep6-sep24-anchor-integration.md](sep6-sep24-anchor-integration.md).
+
+---
+
 ## Security Considerations
 
 - **Reentrancy Protection**: `ReentrancyLock` guards concurrent settle/refund operations

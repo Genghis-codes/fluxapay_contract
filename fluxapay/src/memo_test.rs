@@ -1,4 +1,4 @@
-﻿use crate::{
+use crate::{
     access_control::role_merchant, CreatePaymentArgs, Error, PaymentProcessor,
     PaymentProcessorClient, PaymentStatus,
 };
@@ -23,6 +23,7 @@ fn create_payment_args(
     CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant_id.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(env, "USDC"),
         deposit_address: Address::generate(env),
@@ -33,6 +34,7 @@ fn create_payment_args(
         token_address: None,
         client_token: None,
         metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     }
 }
 

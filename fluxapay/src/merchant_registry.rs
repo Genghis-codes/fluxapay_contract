@@ -66,6 +66,68 @@ impl From<Option<FeeConfig>> for MaybeFeeConfig {
     }
 }
 
+/// Stellar Anchor Protocol (SEP-6 / SEP-24) configuration for fiat offramp.
+///
+/// Bridges on-chain USDC settlement to a merchant's bank account via a
+/// compliant anchor partner such as MoneyGram, Circle, or Tempo.
+///
+/// All endpoint URLs are stored as plain strings because Soroban's
+/// `#[contracttype]` does not support URL-specific newtypes; the off-chain
+/// Settlement Service validates them against the allowlisted `anchor_domain`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnchorConfig {
+    /// Fully qualified anchor domain (e.g. "api.moneygram.com").
+    /// Used for SEP-1 TOML discovery and webfinger verification.
+    pub anchor_domain: String,
+    /// Full URL of the anchor's SEP-6 transfer server.
+    /// Programmatic withdrawal endpoint used by the off-chain Settlement Service.
+    pub sep6_endpoint: String,
+    /// Full URL of the anchor's SEP-24 interactive transfer server.
+    /// Used as a fallback when SEP-6 reports `incomplete` (missing KYC / bank).
+    pub sep24_endpoint: String,
+    /// Fiat currencies this anchor can payout for this merchant.
+    /// ISO-4217 alphabetic codes, e.g. ["USD", "EUR", "NGN"].
+    pub supported_currencies: Vec<String>,
+}
+
+/// Soroban-compatible nullable wrapper for AnchorConfig.
+///
+/// Pattern mirrors `MaybeFeeConfig` — `#[contracttype]` cannot directly nest
+/// `Option<AnchorConfig>` because `AnchorConfig` is itself a `#[contracttype]`
+/// struct. Using an enum variant is the idiomatic workaround.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaybeAnchorConfig {
+    None,
+    Some(AnchorConfig),
+}
+
+impl MaybeAnchorConfig {
+    pub fn as_option(&self) -> Option<&AnchorConfig> {
+        match self {
+            MaybeAnchorConfig::Some(ref c) => Some(c),
+            MaybeAnchorConfig::None => None,
+        }
+    }
+
+    pub fn into_option(self) -> Option<AnchorConfig> {
+        match self {
+            MaybeAnchorConfig::Some(c) => Some(c),
+            MaybeAnchorConfig::None => None,
+        }
+    }
+}
+
+impl From<Option<AnchorConfig>> for MaybeAnchorConfig {
+    fn from(opt: Option<AnchorConfig>) -> Self {
+        match opt {
+            Some(c) => MaybeAnchorConfig::Some(c),
+            None => MaybeAnchorConfig::None,
+        }
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Merchant {
@@ -95,6 +157,16 @@ pub struct Merchant {
     pub currency_payout_addresses: Map<String, Address>,
     /// Whitelist of approved payout addresses (issue #210)
     pub payout_whitelist: Vec<Address>,
+    /// Stellar Anchor (SEP-6 / SEP-24) config for fiat offramp.
+    /// `None` means on-chain-only settlement (no anchor).
+    pub anchor_config: MaybeAnchorConfig,
+    /// Timestamp until which all platform fees are waived for this merchant.
+    /// Used for onboarding campaigns and merchant promotions.
+    /// `None` means no merchant-wide fee waiver is active.
+    pub fee_waiver_expires_at: Option<u64>,
+    /// When true, only customers in `MerchantDataKey::MerchantCustomerWhitelist`
+    /// may initiate payments to this merchant (issue #516).
+    pub whitelist_mode: bool,
 }
 
 #[contracttype]
@@ -113,6 +185,8 @@ pub enum MerchantDataKey {
     MerchantPayoutHistory(Address),
     /// KYC tier limits
     TierLimit(KycTier),
+    /// Customer whitelist for a merchant in whitelist mode (issue #516)
+    MerchantCustomerWhitelist(Address),
 }
 
 /// Platform fee configuration stored in MerchantRegistry.
@@ -135,6 +209,10 @@ pub enum MerchantError {
     NotVerified = 4,
     AdminAlreadySet = 5,
     PayoutAddressNotWhitelisted = 6,
+    /// Whitelist mode may only be enabled by Business-tier merchants (issue #516)
+    WhitelistModeRequiresBusinessTier = 7,
+    /// Payer is not in the merchant's customer whitelist (issue #516)
+    PayerNotWhitelisted = 8,
 }
 
 #[cfg_attr(
@@ -240,6 +318,9 @@ impl MerchantRegistry {
             metadata_hash: None,
             currency_payout_addresses: map![&env],
             payout_whitelist: vec![&env],
+            anchor_config: MaybeAnchorConfig::None,
+            fee_waiver_expires_at: None,
+            whitelist_mode: false,
         };
 
         env.storage()
@@ -1260,5 +1341,183 @@ impl MerchantRegistry {
         env.storage()
             .persistent()
             .get(&MerchantDataKey::Admin)
+    }
+
+    /// Configure or clear the merchant's Stellar Anchor (SEP-6 / SEP-24)
+    /// integration for fiat offramp during settlement.
+    ///
+    /// When `anchor_config` is `Some`, the off-chain Settlement Service will
+    /// call the anchor's SEP-6 withdrawal endpoint after each on-chain
+    /// settlement. If `anchor_config` is `None`, the merchant reverts to
+    /// on-chain-only settlement (USDC remains at their `payout_address`).
+    ///
+    /// Only the merchant themselves may call this. Admin can set an anchor
+    /// on the merchant's behalf by first impersonating them via their
+    /// authorized signer setup (outside this contract).
+    ///
+    /// Emits `(MERCHANT, ANCHOR_UPDATED) → (merchant_id, anchor_domain_opt)`
+    /// where `anchor_domain_opt` is the empty string when clearing.
+    pub fn set_merchant_anchor(
+        env: Env,
+        merchant_id: Address,
+        anchor_config: Option<AnchorConfig>,
+    /// Enable/disable whitelist mode for a merchant (issue #516).
+    /// Only Business-tier merchants may enable whitelist mode.
+    pub fn set_merchant_whitelist_mode(
+        env: Env,
+        merchant_id: Address,
+        enabled: bool,
+    ) -> Result<(), MerchantError> {
+        merchant_id.require_auth();
+
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        merchant.anchor_config = MaybeAnchorConfig::from(anchor_config.clone());
+
+
+        if enabled && merchant.kyc_tier != KycTier::Business {
+            return Err(MerchantError::WhitelistModeRequiresBusinessTier);
+        }
+
+        merchant.whitelist_mode = enabled;
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "WHITELIST_UPDATED"),
+            ),
+            (merchant_id, enabled),
+        );
+
+        Ok(())
+    }
+
+    /// Admin-only: apply or clear a time-based fee waiver for a merchant.
+    ///
+    /// While `expires_at` is `Some(ts)`, all settlements for this merchant pay zero
+    /// platform fee until `ledger.timestamp < expires_at`. This enables
+    /// onboarding/promotion campaigns. Pass `None` to immediately revoke
+    /// an active waiver.
+    ///
+    /// Auth: only the MerchantRegistry admin.
+    ///
+    /// Emits `(MERCHANT, FEE_WAIVER_SET) → (merchant_id, expires_at_opt)`
+    /// where `expires_at_opt` is 0 when clearing.
+    pub fn set_merchant_fee_waiver(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+        expires_at: Option<u64>,
+    ) -> Result<(), MerchantError> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
+        if admin != stored_admin {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        merchant.fee_waiver_expires_at = expires_at.clone();
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        let expires_at_for_event = expires_at.unwrap_or(0u64);
+        env.events().publish(
+            (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "FEE_WAIVER_SET")),
+            (merchant_id, expires_at_for_event),
+    /// Add a customer address to the merchant's payment whitelist (issue #516).
+    pub fn add_to_customer_whitelist(
+        env: Env,
+        merchant_id: Address,
+        customer: Address,
+    ) -> Result<(), MerchantError> {
+        merchant_id.require_auth();
+        Self::get_merchant_internal(&env, &merchant_id)?;
+
+        let key = MerchantDataKey::MerchantCustomerWhitelist(merchant_id.clone());
+        let mut whitelist: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![&env]);
+
+        if !whitelist.iter().any(|addr| addr == customer) {
+            whitelist.push_back(customer.clone());
+            env.storage().persistent().set(&key, &whitelist);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "WHITELIST_UPDATED"),
+            ),
+            (merchant_id, customer, true),
+        );
+
+        Ok(())
+    }
+
+    /// Remove a customer address from the merchant's payment whitelist (issue #516).
+    pub fn remove_from_customer_whitelist(
+        env: Env,
+        merchant_id: Address,
+        customer: Address,
+    ) -> Result<(), MerchantError> {
+        merchant_id.require_auth();
+        Self::get_merchant_internal(&env, &merchant_id)?;
+
+        let key = MerchantDataKey::MerchantCustomerWhitelist(merchant_id.clone());
+        let whitelist: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut new_whitelist = vec![&env];
+        for addr in whitelist.iter() {
+            if addr != customer {
+                new_whitelist.push_back(addr);
+            }
+        }
+        env.storage().persistent().set(&key, &new_whitelist);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "WHITELIST_UPDATED"),
+            ),
+            (merchant_id, customer, false),
+        );
+
+        Ok(())
+    }
+
+    /// Check whether a customer address is allowed to pay a merchant (issue #516).
+    /// Returns true when whitelist mode is disabled, or when the address is
+    /// present in the merchant's customer whitelist.
+    pub fn is_customer_whitelisted(
+        env: Env,
+        merchant_id: Address,
+        customer: Address,
+    ) -> Result<bool, MerchantError> {
+        let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        if !merchant.whitelist_mode {
+            return Ok(true);
+        }
+
+        let whitelist: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::MerchantCustomerWhitelist(merchant_id))
+            .unwrap_or_else(|| vec![&env]);
+
+        Ok(whitelist.iter().any(|addr| addr == customer))
     }
 }

@@ -1,4 +1,4 @@
-﻿#![cfg(test)]
+#![cfg(test)]
 
 use super::*;
 use access_control::{role_admin, role_oracle, role_settlement_operator};
@@ -113,6 +113,7 @@ fn create_payment_args(
         token_address: None,
         client_token: None,
         metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     }
 }
 
@@ -2264,6 +2265,7 @@ fn test_create_payment_idempotency_retry_returns_same_payment() {
         token_address: None,
         client_token: client_token.clone(),
         metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     };
 
     let first = client.create_payment(&args);
@@ -2301,6 +2303,7 @@ fn test_create_payment_idempotency_different_payment_id_fails() {
         token_address: None,
         client_token: client_token.clone(),
         metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     };
 
     // First call succeeds
@@ -2341,6 +2344,7 @@ fn test_create_payment_without_idempotency_token_fails_on_retry() {
         token_address: None,
         client_token: None,
         metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     };
 
     client.create_payment(&args);

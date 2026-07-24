@@ -1,4 +1,4 @@
-﻿use crate::{
+use crate::{
     DataKey, Dispute, DisputeStatus, PaymentProcessor, PaymentProcessorClient, Refund,
     RefundManager, RefundManagerClient, RefundStatus,
 };
@@ -48,6 +48,7 @@ fn create_payment_args(
         client_token: None,
         metadata_hash: None,
         metadata: None,
+        fee_waiver_code: None,
     }
 }
 

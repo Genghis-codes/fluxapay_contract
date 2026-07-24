@@ -98,6 +98,7 @@ proptest! {
             token_address: None,
             client_token: None,
             metadata_hash: None, metadata: None,
+            fee_waiver_code: None,
         };
 
         client.create_payment(&args);
@@ -149,6 +150,7 @@ proptest! {
             token_address: None,
             client_token: None,
             metadata_hash: None, metadata: None,
+            fee_waiver_code: None,
         };
 
         client.create_payment(&args);

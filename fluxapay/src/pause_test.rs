@@ -1,4 +1,4 @@
-﻿#![cfg(test)]
+#![cfg(test)]
 
 use crate::{CreatePaymentArgs, PaymentProcessorClient};
 use soroban_sdk::{testutils::Address as _, Address, Env, String, Symbol};
@@ -62,6 +62,7 @@ fn test_global_pause_blocks_creation() {
         token_address: None,
         client_token: None,
         metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     });
 
     assert!(res.is_err());
@@ -108,6 +109,7 @@ fn test_creation_pause_blocks_only_creation() {
         token_address: None,
         client_token: None,
         metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     });
     assert!(res.is_err());
 

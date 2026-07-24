@@ -1,4 +1,4 @@
-﻿use crate::{
+use crate::{
     merchant_registry::{KycTier, MerchantRegistry, MerchantRegistryClient},
     DataKey, DisputeStatus, Error, PaymentProcessor, PaymentProcessorClient, PaymentStatus,
     RefundManager, RefundManagerClient, RefundStatus, SettlementSplit,
@@ -59,6 +59,7 @@ fn integration_payment_args(
         client_token: None,
         metadata_hash: None,
         metadata: None,
+        fee_waiver_code: None,
     }
 }
 

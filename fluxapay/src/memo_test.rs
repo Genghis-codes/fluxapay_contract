@@ -1,4 +1,4 @@
-﻿use crate::{
+use crate::{
     access_control::role_merchant, CreatePaymentArgs, Error, PaymentProcessor,
     PaymentProcessorClient, PaymentStatus,
 };
@@ -34,6 +34,7 @@ fn create_payment_args(
         token_address: None,
         client_token: None,
         metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     }
 }
 

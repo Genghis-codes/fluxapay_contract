@@ -306,8 +306,51 @@ jobs:
       - name: Run tests
         run: cargo test --verbose --all-features
 
+  # Job 5b: Bounded property tests (separate job for independent failure reporting)
+  proptest:
+    name: Property Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.85.0
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-proptest-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-proptest-
+
+      - name: Cache proptest regressions
+        uses: actions/cache@v4
+        with:
+          path: fluxapay/proptest-regressions
+          key: ${{ runner.os }}-proptest-regressions-${{ github.run_id }}
+          restore-keys: |
+            ${{ runner.os }}-proptest-regressions-
+
       - name: Run bounded property tests
         run: PROPTEST_CASES=64 cargo test -p fluxapay proptests:: --all-features -- --test-threads=1
+
+      - name: Upload proptest regression cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proptest-regressions-${{ github.sha }}
+          path: fluxapay/proptest-regressions
+          retention-days: 30
 
   # Job 5: Coverage report
   coverage:
@@ -429,7 +472,7 @@ jobs:
   ci-success:
     name: CI Success
     if: ${{ always() }}
-    needs: [format, lint, security-audit, build, test, coverage, sdk-check, actionlint]
+    needs: [format, lint, security-audit, build, test, proptest, coverage, sdk-check, actionlint]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -440,6 +483,7 @@ jobs:
              [[ "${{ needs.security-audit.result }}" == "success" ]] && \
              [[ "${{ needs.build.result }}" == "success" ]] && \
              [[ "${{ needs.test.result }}" == "success" ]] && \
+             [[ "${{ needs.proptest.result }}" == "success" ]] && \
              [[ "${{ needs.coverage.result }}" == "success" ]] && \
              [[ "${{ needs.sdk-check.result }}" == "success" ]] && \
              [[ "${{ needs.actionlint.result }}" == "success" ]]; then

@@ -47,6 +47,7 @@ fn integration_payment_args(
     crate::CreatePaymentArgs {
         payment_id: String::from_str(env, payment_id),
         merchant_id: merchant_id.clone(),
+        payer: None,
         amount: 1000,
         currency: Symbol::new(env, "USDC"),
         deposit_address: Address::generate(env),
@@ -212,6 +213,7 @@ fn test_happy_path_flow() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -283,6 +285,7 @@ fn test_settlement_path() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -336,6 +339,7 @@ fn test_failure_and_expiration_path() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -457,6 +461,7 @@ fn test_upgrade_contract_storage_compatibility() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -503,6 +508,7 @@ fn test_prune_expired_payments_expired_pending() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -548,6 +554,7 @@ fn test_prune_expired_payments_non_expired_skipped() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -592,6 +599,7 @@ fn test_prune_expired_payments_non_pending_skipped() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -685,6 +693,7 @@ fn test_settle_payment_with_zero_merchant_fee() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -748,6 +757,7 @@ fn test_settle_payment_with_bps_only_fee() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -811,6 +821,7 @@ fn test_settle_payment_with_fixed_fee() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -874,6 +885,7 @@ fn test_settle_payment_with_combined_fee() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -923,6 +935,7 @@ fn test_settle_payment_no_registry_configured() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -993,6 +1006,7 @@ fn test_cross_contract_happy_path() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -1062,6 +1076,7 @@ fn test_cross_contract_unverified_merchant_rejection() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -1117,6 +1132,7 @@ fn test_cross_contract_suspended_merchant_rejection() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -1164,6 +1180,7 @@ fn test_cross_contract_registry_not_set_regression() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),

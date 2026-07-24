@@ -164,6 +164,9 @@ pub struct Merchant {
     /// Used for onboarding campaigns and merchant promotions.
     /// `None` means no merchant-wide fee waiver is active.
     pub fee_waiver_expires_at: Option<u64>,
+    /// When true, only customers in `MerchantDataKey::MerchantCustomerWhitelist`
+    /// may initiate payments to this merchant (issue #516).
+    pub whitelist_mode: bool,
 }
 
 #[contracttype]
@@ -182,6 +185,8 @@ pub enum MerchantDataKey {
     MerchantPayoutHistory(Address),
     /// KYC tier limits
     TierLimit(KycTier),
+    /// Customer whitelist for a merchant in whitelist mode (issue #516)
+    MerchantCustomerWhitelist(Address),
 }
 
 /// Platform fee configuration stored in MerchantRegistry.
@@ -204,6 +209,10 @@ pub enum MerchantError {
     NotVerified = 4,
     AdminAlreadySet = 5,
     PayoutAddressNotWhitelisted = 6,
+    /// Whitelist mode may only be enabled by Business-tier merchants (issue #516)
+    WhitelistModeRequiresBusinessTier = 7,
+    /// Payer is not in the merchant's customer whitelist (issue #516)
+    PayerNotWhitelisted = 8,
 }
 
 #[cfg_attr(
@@ -311,6 +320,7 @@ impl MerchantRegistry {
             payout_whitelist: vec![&env],
             anchor_config: MaybeAnchorConfig::None,
             fee_waiver_expires_at: None,
+            whitelist_mode: false,
         };
 
         env.storage()
@@ -1351,24 +1361,34 @@ impl MerchantRegistry {
         env: Env,
         merchant_id: Address,
         anchor_config: Option<AnchorConfig>,
+    /// Enable/disable whitelist mode for a merchant (issue #516).
+    /// Only Business-tier merchants may enable whitelist mode.
+    pub fn set_merchant_whitelist_mode(
+        env: Env,
+        merchant_id: Address,
+        enabled: bool,
     ) -> Result<(), MerchantError> {
         merchant_id.require_auth();
 
         let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
         merchant.anchor_config = MaybeAnchorConfig::from(anchor_config.clone());
 
+
+        if enabled && merchant.kyc_tier != KycTier::Business {
+            return Err(MerchantError::WhitelistModeRequiresBusinessTier);
+        }
+
+        merchant.whitelist_mode = enabled;
         env.storage()
             .persistent()
             .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
 
-        let anchor_domain = match anchor_config {
-            Some(ref c) => c.anchor_domain.clone(),
-            None => String::from_str(&env, ""),
-        };
-
         env.events().publish(
-            (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "ANCHOR_UPDATED")),
-            (merchant_id, anchor_domain),
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "WHITELIST_UPDATED"),
+            ),
+            (merchant_id, enabled),
         );
 
         Ok(())
@@ -1412,8 +1432,92 @@ impl MerchantRegistry {
         env.events().publish(
             (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "FEE_WAIVER_SET")),
             (merchant_id, expires_at_for_event),
+    /// Add a customer address to the merchant's payment whitelist (issue #516).
+    pub fn add_to_customer_whitelist(
+        env: Env,
+        merchant_id: Address,
+        customer: Address,
+    ) -> Result<(), MerchantError> {
+        merchant_id.require_auth();
+        Self::get_merchant_internal(&env, &merchant_id)?;
+
+        let key = MerchantDataKey::MerchantCustomerWhitelist(merchant_id.clone());
+        let mut whitelist: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![&env]);
+
+        if !whitelist.iter().any(|addr| addr == customer) {
+            whitelist.push_back(customer.clone());
+            env.storage().persistent().set(&key, &whitelist);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "WHITELIST_UPDATED"),
+            ),
+            (merchant_id, customer, true),
         );
 
         Ok(())
+    }
+
+    /// Remove a customer address from the merchant's payment whitelist (issue #516).
+    pub fn remove_from_customer_whitelist(
+        env: Env,
+        merchant_id: Address,
+        customer: Address,
+    ) -> Result<(), MerchantError> {
+        merchant_id.require_auth();
+        Self::get_merchant_internal(&env, &merchant_id)?;
+
+        let key = MerchantDataKey::MerchantCustomerWhitelist(merchant_id.clone());
+        let whitelist: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut new_whitelist = vec![&env];
+        for addr in whitelist.iter() {
+            if addr != customer {
+                new_whitelist.push_back(addr);
+            }
+        }
+        env.storage().persistent().set(&key, &new_whitelist);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "WHITELIST_UPDATED"),
+            ),
+            (merchant_id, customer, false),
+        );
+
+        Ok(())
+    }
+
+    /// Check whether a customer address is allowed to pay a merchant (issue #516).
+    /// Returns true when whitelist mode is disabled, or when the address is
+    /// present in the merchant's customer whitelist.
+    pub fn is_customer_whitelisted(
+        env: Env,
+        merchant_id: Address,
+        customer: Address,
+    ) -> Result<bool, MerchantError> {
+        let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        if !merchant.whitelist_mode {
+            return Ok(true);
+        }
+
+        let whitelist: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::MerchantCustomerWhitelist(merchant_id))
+            .unwrap_or_else(|| vec![&env]);
+
+        Ok(whitelist.iter().any(|addr| addr == customer))
     }
 }

@@ -36,6 +36,7 @@ fn create_payment_args(
     crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant_id.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(env, "USDC"),
         deposit_address: Address::generate(env),

@@ -87,6 +87,7 @@ proptest! {
         let args = crate::CreatePaymentArgs {
             payment_id: payment_id.clone(),
             merchant_id: merchant.clone(),
+            payer: None,
             amount,
             currency: Symbol::new(&env, "USDC"),
             deposit_address: Address::generate(&env),
@@ -138,6 +139,7 @@ proptest! {
         let args = crate::CreatePaymentArgs {
             payment_id: payment_id.clone(),
             merchant_id: merchant.clone(),
+            payer: None,
             amount,
             currency: Symbol::new(&env, "USDC"),
             deposit_address: Address::generate(&env),

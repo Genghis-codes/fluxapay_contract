@@ -23,6 +23,7 @@ fn payment_args(
     CreatePaymentArgs {
         payment_id: String::from_str(env, "pay_meta_01"),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 1_000_000_000i128,
         currency: Symbol::new(env, "USDC"),
         deposit_address: Address::generate(env),

@@ -51,6 +51,7 @@ fn test_global_pause_blocks_creation() {
     let res = client.try_create_payment(&CreatePaymentArgs {
         payment_id: String::from_str(&env, "p1"),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 100,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -97,6 +98,7 @@ fn test_creation_pause_blocks_only_creation() {
     let res = client.try_create_payment(&CreatePaymentArgs {
         payment_id: String::from_str(&env, "p1"),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 100,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),

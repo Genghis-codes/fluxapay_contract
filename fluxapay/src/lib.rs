@@ -284,6 +284,8 @@ pub enum Error {
     MemoTooLong = 51,
     /// Issue #397: Id memo is not parseable as a u64.
     InvalidMemoId = 52,
+    /// Issue #516: Payer address is not on the merchant's customer whitelist.
+    PayerNotWhitelisted = 53,
 }
 
 #[contracttype]
@@ -303,6 +305,9 @@ pub struct CreatePaymentArgs {
     pub metadata_hash: Option<BytesN<32>>,
     /// Arbitrary key-value metadata (max 20 keys, 256 chars per value).
     pub metadata: Option<Map<String, String>>,
+    /// Customer/payer address, checked against the merchant's whitelist when
+    /// `Merchant.whitelist_mode` is enabled (issue #516).
+    pub payer: Option<Address>,
 }
 
 #[contracttype]
@@ -4462,6 +4467,15 @@ impl PaymentProcessor {
                     {
                         return Err(Error::Unauthorized);
                     }
+
+                    // Issue #516: Enforce merchant whitelist mode against the payer.
+                    if merchant.whitelist_mode {
+                        let payer = args.payer.clone().ok_or(Error::PayerNotWhitelisted)?;
+                        match registry_client.try_is_customer_whitelisted(&args.merchant_id, &payer) {
+                            Ok(Ok(true)) => {}
+                            _ => return Err(Error::PayerNotWhitelisted),
+                        }
+                    }
                 }
                 _ => {
                     // If registry lookup fails, reject the payment
@@ -5642,6 +5656,7 @@ impl PaymentProcessor {
         let create_args = CreatePaymentArgs {
             payment_id: args.payment_id.clone(),
             merchant_id: args.merchant_id,
+            payer: None,
             amount: args.amount,
             currency: args.currency,
             deposit_address: args.deposit_address.clone(),

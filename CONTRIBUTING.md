@@ -16,6 +16,7 @@ For security vulnerabilities, see [SECURITY.md](SECURITY.md) instead of opening 
 5. [Branch Naming Conventions](#5-branch-naming-conventions)
 6. [Commit Message Format](#6-commit-message-format)
 7. [Pull Request Requirements](#7-pull-request-requirements)
+   - [Adding Contract Events](#72-adding-contract-events)
 8. [Issue Workflow](#8-issue-workflow)
 
 ---
@@ -222,6 +223,46 @@ This repository uses [Dependabot](https://docs.github.com/en/code-security/depen
 5. **For major version bumps**: Additional manual testing may be required before merging
 
 > **Note**: Dependabot runs weekly. If you need an urgent security update, you can manually trigger it via the [Dependabot dashboard](https://github.com/Yunusabdul38/fluxapay_contract/security/dependabot).
+
+---
+
+## 7.2. Adding Contract Events
+
+FluxaPay contract events are defined with `#[contractevent]`. Follow these steps when adding a new one:
+
+1. **Define the event struct** in [`fluxapay/src/events.rs`](fluxapay/src/events.rs):
+
+   ```rust
+   #[contractevent]
+   #[derive(Clone, Debug)]
+   pub struct MerchantSuspended {
+       pub merchant_id: Address,
+       pub reason: Symbol,
+   }
+   ```
+
+2. **Emit it in the correct entry point** — call `.publish()` on the event from the contract function that triggers it:
+
+   ```rust
+   MerchantSuspended {
+       merchant_id: merchant_id.clone(),
+       reason: Symbol::new(&env, "compliance_hold"),
+   }
+   .publish(&env);
+   ```
+
+3. **Update the event catalog** in [`docs/events.md`](docs/events.md) — add a section documenting the event's fields, emitting function(s), and an example payload.
+
+4. **Add an indexer subscription** in [`indexer/sync.yml`](indexer/sync.yml) under the relevant contract's `events` list so the indexer picks up the new event.
+
+5. **Add the SDK event type** in `sdk/src` so consumers of the TypeScript SDK get typed access to the new event.
+
+**Worked example — adding `MerchantSuspended`:**
+- Struct added to `fluxapay/src/events.rs` under a `// Merchant Registry Events` section
+- Emitted from `merchant_registry::suspend_merchant`
+- Documented in `docs/events.md` under `## MERCHANT / SUSPENDED`
+- Subscribed to in `indexer/sync.yml` under the `merchant_registry` contract mapping
+- Typed in the SDK alongside the other merchant registry events
 
 ---
 

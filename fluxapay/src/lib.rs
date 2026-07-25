@@ -687,6 +687,10 @@ pub enum DataKey {
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
+    /// Minimum payment duration in seconds (default: CREATE_PAYMENT_WINDOW_SECS = 60).
+    MinPaymentDurationSecs,
+    /// Maximum payment duration in seconds (default: 30 days).
+    MaxPaymentDurationSecs,
 }
 
 /// Default initial contract version string.
@@ -3886,6 +3890,40 @@ impl PaymentProcessor {
         Ok(())
     }
 
+    pub fn set_min_payment_duration_secs(env: Env, admin: Address, min_secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if min_secs < CREATE_PAYMENT_WINDOW_SECS {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinPaymentDurationSecs, &min_secs);
+        Ok(())
+    }
+
+    pub fn set_max_payment_duration_secs(env: Env, admin: Address, max_secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if max_secs > 30 * 24 * 3600 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxPaymentDurationSecs, &max_secs);
+        Ok(())
+    }
+
     /// Return the accumulated treasury balance collected via settlement fees.
     pub fn get_treasury_balance(env: Env) -> i128 {
         env.storage()
@@ -4669,13 +4707,34 @@ impl PaymentProcessor {
         Self::enforce_create_payment_rate_limit(&env, &args.merchant_id)?;
 
         let now = env.ledger().timestamp();
+        let min_duration = env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MinPaymentDurationSecs)
+            .unwrap_or(CREATE_PAYMENT_WINDOW_SECS);
+        let max_duration = env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MaxPaymentDurationSecs)
+            .unwrap_or(30 * 24 * 3600);
+
         let resolved_expires_at = match args.expires_at {
-            Some(ts) => ts,
-            None => now.saturating_add(args.duration_secs.unwrap_or(DEFAULT_PAYMENT_DURATION_SECS)),
+            Some(ts) => {
+                if ts <= now {
+                    return Err(Error::InvalidExpiry);
+                }
+                let duration = ts.saturating_sub(now);
+                if duration < min_duration || duration > max_duration {
+                    return Err(Error::InvalidExpiry);
+                }
+                ts
+            }
+            None => {
+                let duration = args.duration_secs.unwrap_or(DEFAULT_PAYMENT_DURATION_SECS);
+                if duration < min_duration || duration > max_duration {
+                    return Err(Error::InvalidExpiry);
+                }
+                now.saturating_add(duration)
+            }
         };
-        if resolved_expires_at <= now {
-            return Err(Error::InvalidExpiry);
-        }
 
         let payment = PaymentCharge {
             payment_id: args.payment_id.clone(),

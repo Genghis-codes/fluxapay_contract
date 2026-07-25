@@ -4191,3 +4191,251 @@ fn test_settle_payment_fee_split_rounding_dust_to_treasury() {
     assert_eq!(treasury_bal, 67i128);
     assert_eq!(dev_bal + treasury_bal, 100i128, "All fee tokens must be accounted for");
 }
+
+#[test]
+fn test_create_payment_future_expiry_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_future_expiry");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    let future_expiry = now + 7200; // 2 hours in the future
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(future_expiry),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let payment = client.create_payment(&args);
+    assert_eq!(payment.expires_at, future_expiry);
+}
+
+#[test]
+fn test_create_payment_current_timestamp_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_current_expiry");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(now), // Exactly now
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_past_expiry_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_past_expiry");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    let past_expiry = now - 3600; // 1 hour in the past
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(past_expiry),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_duration_min_bound_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_min_duration");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+        duration_secs: Some(30), // Below CREATE_PAYMENT_WINDOW_SECS (60)
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_duration_max_bound_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_max_duration");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+        duration_secs: Some(31 * 24 * 3600), // Exceeds 30 days
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_valid_duration_within_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_valid_duration");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let duration_secs = 7200u64; // 2 hours, within bounds
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+        duration_secs: Some(duration_secs),
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let payment = client.create_payment(&args);
+    let now = env.ledger().timestamp();
+    let expected_expiry = now + duration_secs;
+    assert_eq!(payment.expires_at, expected_expiry);
+}
+
+#[test]
+fn test_admin_set_min_payment_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let new_min = 120u64;
+    client.set_min_payment_duration_secs(&admin, &new_min);
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let stored_min: u64 = env.storage()
+            .persistent()
+            .get(&DataKey::MinPaymentDurationSecs)
+            .unwrap();
+        assert_eq!(stored_min, new_min);
+    });
+}
+
+#[test]
+fn test_admin_set_max_payment_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let new_max = 14 * 24 * 3600u64; // 14 days
+    client.set_max_payment_duration_secs(&admin, &new_max);
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let stored_max: u64 = env.storage()
+            .persistent()
+            .get(&DataKey::MaxPaymentDurationSecs)
+            .unwrap();
+        assert_eq!(stored_max, new_max);
+    });
+}

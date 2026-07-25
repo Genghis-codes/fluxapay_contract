@@ -53,6 +53,7 @@ mod dex_router;
 pub mod events;
 pub mod fx_oracle;
 pub mod merchant_auth;
+mod payment_state_machine;
 use access_control::{
     role_admin, role_merchant, role_oracle, role_settlement_operator, role_arbitrator, AccessControl,
     AdminAction, AdminProposal,
@@ -294,6 +295,8 @@ pub enum Error {
     InvalidMemoId = 52,
     /// Issue #516: Payer address is not on the merchant's customer whitelist.
     PayerNotWhitelisted = 53,
+    /// Issue #505: Invalid payment status transition attempted.
+    InvalidStatusTransition = 54,
 }
 
 #[contracttype]
@@ -5176,7 +5179,8 @@ impl PaymentProcessor {
             }
         }
 
-        payment.status = new_status.clone();
+        // Issue #505: Validate status transition through state machine
+        payment.status = payment_state_machine::transition_status(&payment.status, new_status.clone())?;
 
         if let Some(refund_amount) = overpaid_refund_amount {
             if let Some(registry_address) = env
@@ -5426,7 +5430,7 @@ impl PaymentProcessor {
 
         // Ensure the current time is less than the expiry time; if not, mark as expired and return.
         if env.ledger().timestamp() >= payment.expires_at {
-            payment.status = PaymentStatus::Expired;
+            payment.status = payment_state_machine::transition_status(&payment.status, PaymentStatus::Expired)?;
 
             env.storage()
                 .persistent()
@@ -5455,7 +5459,7 @@ impl PaymentProcessor {
             return Err(Error::Unauthorized);
         }
 
-        payment.status = PaymentStatus::Failed;
+        payment.status = payment_state_machine::transition_status(&payment.status, PaymentStatus::Failed)?;
 
         env.storage()
             .persistent()
@@ -5489,7 +5493,7 @@ impl PaymentProcessor {
             return Err(Error::PaymentExpired);
         }
 
-        payment.status = PaymentStatus::Expired;
+        payment.status = payment_state_machine::transition_status(&payment.status, PaymentStatus::Expired)?;
 
         env.storage()
             .persistent()
@@ -5832,7 +5836,7 @@ impl PaymentProcessor {
                         ),
                     );
 
-                    payment.status = PaymentStatus::Settled;
+                    payment.status = payment_state_machine::transition_status(&payment.status, PaymentStatus::Settled)?;
                     env.storage()
                         .persistent()
                         .set(&DataKey::Payment(payment_id.clone()), &payment);
@@ -5936,7 +5940,7 @@ impl PaymentProcessor {
             }
         }
 
-        payment.status = PaymentStatus::Settled;
+        payment.status = payment_state_machine::transition_status(&payment.status, PaymentStatus::Settled)?;
 
         env.storage()
             .persistent()

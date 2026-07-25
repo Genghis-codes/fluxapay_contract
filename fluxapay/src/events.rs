@@ -642,3 +642,50 @@ pub struct SwapAndPayExecuted {
     pub token_in: Address,
     pub amount_in: i128,
 }
+
+// ============================================================================
+// Payment Retry Events (Issue #482)
+// ============================================================================
+
+/// Emitted when a payment retry is created.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentRetryCreated {
+    pub original_id: String,
+    pub new_id: String,
+}
+
+// ============================================================================
+// FX Oracle Rate Deviation Events (Issue #478)
+// ============================================================================
+
+/// Emitted when a rate update is within 50% of deviation limit.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RateDeviationWarning {
+    pub currency: Symbol,
+    pub current_rate: i128,
+    pub previous_rate: i128,
+    pub deviation_bps: u32,
+}
+
+// ============================================================================
+// Merchant Dispute Events (Issue #481)
+// ============================================================================
+
+/// Emitted when a merchant is auto-suspended due to dispute threshold.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantAutoSuspended {
+    pub merchant_id: Address,
+    pub resolved_against_count: u32,
+    pub threshold: u32,
+}
+
+/// Emitted when a merchant appeals a suspension.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantSuspensionAppealed {
+    pub merchant_id: Address,
+    pub reason: String,
+}

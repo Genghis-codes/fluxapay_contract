@@ -215,7 +215,7 @@ pub struct ArbitratorVote {
 }
 
 #[contracterror]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     PaymentNotFound = 404,
     RefundNotFound = 405,
@@ -294,6 +294,8 @@ pub enum Error {
     InvalidMemoId = 52,
     /// Issue #516: Payer address is not on the merchant's customer whitelist.
     PayerNotWhitelisted = 53,
+    /// Payment link has reached its configured max_uses limit.
+    LinkMaxUsesReached = 54,
 }
 
 #[contracttype]
@@ -323,6 +325,29 @@ pub struct CreatePaymentArgs {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// Arguments for a single dispute in `batch_create_disputes` / `create_dispute`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateDisputeArgs {
+    pub payment_id: String,
+    pub amount: i128,
+    pub reason: String,
+    pub evidence: String,
+    pub disputer: Address,
+    pub payout_splits: Vec<SettlementSplit>,
+}
+
+/// Per-item outcome for `batch_create_disputes` (partial success allowed).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisputeBatchItemResult {
+    Ok(String),
+    Err(u32),
+}
+
+/// Hard cap for dispute batch size.
+pub const MAX_DISPUTE_BATCH: u32 = 20;
+
 pub struct SwapAndPayArgs {
     pub payer: Address,
     pub payment_id: String,
@@ -410,6 +435,19 @@ pub struct VoteTally {
     /// Number of arbitrators who have voted.
     pub vote_count: u32,
 }
+
+/// Record of a single admin treasury withdrawal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryWithdrawal {
+    pub amount: i128,
+    pub destination: Address,
+    pub admin: Address,
+    pub withdrawn_at: u64,
+}
+
+/// Maximum number of withdrawal records retained in `TreasuryWithdrawalHistory`.
+pub const TREASURY_WITHDRAWAL_HISTORY_CAP: u32 = 100;
 
 /// Issue #168: Fee split configuration for refund fees.
 #[contracttype]
@@ -687,6 +725,8 @@ pub enum DataKey {
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
+    /// Paginated log of treasury withdrawals (newest-first, capped at 100).
+    TreasuryWithdrawalHistory,
 }
 
 /// Default initial contract version string.
@@ -1266,6 +1306,46 @@ impl RefundManager {
             .unwrap_or(0)
     }
 
+    /// Append a withdrawal record, retaining only the newest
+    /// `TREASURY_WITHDRAWAL_HISTORY_CAP` entries (newest-first).
+    fn record_treasury_withdrawal(env: &Env, record: TreasuryWithdrawal) {
+        let key = DataKey::TreasuryWithdrawalHistory;
+        let mut history: Vec<TreasuryWithdrawal> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![env]);
+        history.push_front(record);
+        while history.len() > TREASURY_WITHDRAWAL_HISTORY_CAP {
+            history.pop_back();
+        }
+        env.storage().persistent().set(&key, &history);
+    }
+
+    /// Return a page of treasury withdrawal history (newest-first).
+    /// `offset` skips the first N records; `limit` caps the page size (max 100).
+    pub fn get_treasury_withdrawal_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<TreasuryWithdrawal> {
+        let history: Vec<TreasuryWithdrawal> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryWithdrawalHistory)
+            .unwrap_or_else(|| vec![&env]);
+        let page_limit = limit.min(TREASURY_WITHDRAWAL_HISTORY_CAP);
+        let mut page: Vec<TreasuryWithdrawal> = vec![&env];
+        let mut i = offset;
+        while i < history.len() && page.len() < page_limit {
+            if let Some(item) = history.get(i) {
+                page.push_back(item);
+            }
+            i = i.saturating_add(1);
+        }
+        page
+    }
+
     pub fn withdraw_treasury(
         env: Env,
         admin: Address,
@@ -1301,9 +1381,19 @@ impl RefundManager {
 
         token_client.transfer(&contract_address, &destination, &amount);
 
+        Self::record_treasury_withdrawal(
+            &env,
+            TreasuryWithdrawal {
+                amount,
+                destination: destination.clone(),
+                admin: admin.clone(),
+                withdrawn_at: env.ledger().timestamp(),
+            },
+        );
+
         env.events().publish(
             (Symbol::new(&env, "TREASURY"), Symbol::new(&env, "WITHDRAWN")),
-            (amount, destination),
+            (amount, destination.clone()),
         );
 
         Ok(())
@@ -1724,6 +1814,83 @@ impl RefundManager {
         payout_splits: Vec<SettlementSplit>,
     ) -> Result<String, Error> {
         disputer.require_auth();
+        Self::create_dispute_inner(
+            &env,
+            payment_id,
+            amount,
+            reason,
+            evidence,
+            disputer,
+            payout_splits,
+        )
+    }
+
+    /// Batch-create disputes for marketplace bulk filing.
+    ///
+    /// Processes up to `max_batch` items (hard cap 20). Each item is handled
+    /// identically to `create_dispute`; failures do not revert successes.
+    /// Bonds are deducted only for successful disputes.
+    /// Emits `DISPUTE/BATCH_CREATED` with `(success_count, fail_count)`.
+    pub fn batch_create_disputes(
+        env: Env,
+        disputes: Vec<CreateDisputeArgs>,
+        max_batch: u32,
+    ) -> Result<Vec<DisputeBatchItemResult>, Error> {
+        let effective_max = max_batch.min(MAX_DISPUTE_BATCH);
+        if max_batch > MAX_DISPUTE_BATCH || disputes.len() > effective_max {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut results: Vec<DisputeBatchItemResult> = vec![&env];
+        let mut success_count: u32 = 0;
+        let mut fail_count: u32 = 0;
+        let mut total_bond_deducted: i128 = 0;
+
+        for args in disputes.iter() {
+            args.disputer.require_auth();
+            match Self::create_dispute_inner(
+                &env,
+                args.payment_id.clone(),
+                args.amount,
+                args.reason.clone(),
+                args.evidence.clone(),
+                args.disputer.clone(),
+                args.payout_splits.clone(),
+            ) {
+                Ok(dispute_id) => {
+                    success_count = success_count.saturating_add(1);
+                    // Each successful dispute locks 2x DISPUTE_BOND_AMOUNT (disputer + merchant).
+                    total_bond_deducted = total_bond_deducted
+                        .saturating_add(DISPUTE_BOND_AMOUNT.saturating_mul(2));
+                    results.push_back(DisputeBatchItemResult::Ok(dispute_id));
+                }
+                Err(e) => {
+                    fail_count = fail_count.saturating_add(1);
+                    results.push_back(DisputeBatchItemResult::Err(e as u32));
+                }
+            }
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "DISPUTE"),
+                Symbol::new(&env, "BATCH_CREATED"),
+            ),
+            (success_count, fail_count, total_bond_deducted),
+        );
+
+        Ok(results)
+    }
+
+    fn create_dispute_inner(
+        env: &Env,
+        payment_id: String,
+        amount: i128,
+        reason: String,
+        evidence: String,
+        disputer: Address,
+        payout_splits: Vec<SettlementSplit>,
+    ) -> Result<String, Error> {
 
         // Issue #404: Validate payment_id format
         if !utils::validate_id(&payment_id) {
@@ -3886,12 +4053,105 @@ impl PaymentProcessor {
         Ok(())
     }
 
-    /// Return the accumulated treasury balance collected via settlement fees.
+    /// Return the accumulated treasury balance collected via settlement fees
+    /// and platform fees (when no custom fee_recipient).
     pub fn get_treasury_balance(env: Env) -> i128 {
         env.storage()
             .persistent()
             .get(&DataKey::TreasuryBalance)
             .unwrap_or(0)
+    }
+
+    fn record_treasury_withdrawal(env: &Env, record: TreasuryWithdrawal) {
+        let key = DataKey::TreasuryWithdrawalHistory;
+        let mut history: Vec<TreasuryWithdrawal> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| vec![env]);
+        history.push_front(record);
+        while history.len() > TREASURY_WITHDRAWAL_HISTORY_CAP {
+            history.pop_back();
+        }
+        env.storage().persistent().set(&key, &history);
+    }
+
+    /// Return a page of treasury withdrawal history (newest-first).
+    pub fn get_treasury_withdrawal_history(
+        env: Env,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<TreasuryWithdrawal> {
+        let history: Vec<TreasuryWithdrawal> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TreasuryWithdrawalHistory)
+            .unwrap_or_else(|| vec![&env]);
+        let page_limit = limit.min(TREASURY_WITHDRAWAL_HISTORY_CAP);
+        let mut page: Vec<TreasuryWithdrawal> = vec![&env];
+        let mut i = offset;
+        while i < history.len() && page.len() < page_limit {
+            if let Some(item) = history.get(i) {
+                page.push_back(item);
+            }
+            i = i.saturating_add(1);
+        }
+        page
+    }
+
+    /// Admin withdrawal of accumulated treasury fees. Emits `TREASURY/WITHDRAWN`
+    /// with `(amount, destination)` and appends to the paginated history log.
+    pub fn withdraw_treasury(
+        env: Env,
+        admin: Address,
+        amount: i128,
+        destination: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let treasury_balance = Self::get_treasury_balance(env.clone());
+        if amount > treasury_balance {
+            return Err(Error::InsufficientTreasuryBalance);
+        }
+
+        let usdc_token_address: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcToken)
+            .ok_or(Error::Unauthorized)?;
+        let token_client = token::TokenClient::new(&env, &usdc_token_address);
+        let contract_address = env.current_contract_address();
+
+        env.storage().persistent().set(
+            &DataKey::TreasuryBalance,
+            &treasury_balance.saturating_sub(amount),
+        );
+
+        token_client.transfer(&contract_address, &destination, &amount);
+
+        Self::record_treasury_withdrawal(
+            &env,
+            TreasuryWithdrawal {
+                amount,
+                destination: destination.clone(),
+                admin: admin.clone(),
+                withdrawn_at: env.ledger().timestamp(),
+            },
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "TREASURY"), Symbol::new(&env, "WITHDRAWN")),
+            (amount, destination),
+        );
+
+        Ok(())
     }
 
     /// Admin-only: register a reusable fee-waiver code for per-payment zero-fee
@@ -5769,14 +6029,6 @@ impl PaymentProcessor {
 
                     let net_merchant_amount = net_after_settlement_fee.saturating_sub(actual_fee);
 
-                    // Get fee recipient
-                    let fee_recipient: Address = if let Some(custom_recipient) = &fee_config.fee_recipient {
-                        custom_recipient.clone()
-                    } else {
-                        // Default to admin if no custom recipient
-                        AccessControl::get_admin(&env).unwrap_or_else(|| env.current_contract_address())
-                    };
-
                     // Transfer using the resolved settlement token (if configured)
                     if let Some(ref settlement_token) = settlement_token {
                         let token_client = token::TokenClient::new(&env, settlement_token);
@@ -5786,12 +6038,33 @@ impl PaymentProcessor {
                         if net_merchant_amount > 0 {
                             let _ = token_client.try_transfer(&from, &payment.merchant_id, &net_merchant_amount);
                         }
-
-                        // Transfer fee to fee_recipient
-                        if actual_fee > 0 {
-                            let _ = token_client.try_transfer(&from, &fee_recipient, &actual_fee);
-                        }
                     }
+
+                    // Platform fee: custom fee_recipient receives a transfer; otherwise
+                    // credit DataKey::TreasuryBalance (unified treasury accounting).
+                    let fee_recipient: Address = if let Some(custom_recipient) = &fee_config.fee_recipient {
+                        if actual_fee > 0 {
+                            if let Some(ref settlement_token) = settlement_token {
+                                let token_client = token::TokenClient::new(&env, settlement_token);
+                                let from = env.current_contract_address();
+                                let _ = token_client.try_transfer(&from, custom_recipient, &actual_fee);
+                            }
+                        }
+                        custom_recipient.clone()
+                    } else {
+                        if actual_fee > 0 {
+                            let current_treasury: i128 = env
+                                .storage()
+                                .persistent()
+                                .get::<DataKey, i128>(&DataKey::TreasuryBalance)
+                                .unwrap_or(0);
+                            env.storage().persistent().set(
+                                &DataKey::TreasuryBalance,
+                                &current_treasury.saturating_add(actual_fee),
+                            );
+                        }
+                        env.current_contract_address()
+                    };
 
                     // Emit FEE_COLLECTED event (merchant-level fee)
                     env.events().publish(
@@ -5905,9 +6178,21 @@ impl PaymentProcessor {
             }
         }
 
-        // Transfer platform fee to fee_recipient using the resolved settlement token (if configured)
+        // Platform fee: when the registry returns the contract itself as recipient
+        // (no custom fee_recipient), credit TreasuryBalance. Otherwise transfer out.
         if platform_fee > 0 {
-            if let Some(ref settlement_token) = settlement_token {
+            let contract_addr = env.current_contract_address();
+            if fee_recipient == contract_addr {
+                let current_treasury: i128 = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::TreasuryBalance)
+                    .unwrap_or(0);
+                env.storage().persistent().set(
+                    &DataKey::TreasuryBalance,
+                    &current_treasury.saturating_add(platform_fee),
+                );
+            } else if let Some(ref settlement_token) = settlement_token {
                 let token_client = token::TokenClient::new(&env, settlement_token);
                 let from = env.current_contract_address();
                 let _ = token_client.try_transfer(&from, &fee_recipient, &platform_fee);

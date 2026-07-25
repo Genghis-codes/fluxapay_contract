@@ -4289,3 +4289,117 @@ fn test_refund_cooldown_configurable() {
     let res = client.try_create_refund(&requester, &payment_id, &100, &String::from_str(&env, "Too much"));
     assert!(res.is_ok(), "Should allow immediate refund when cooldown is set to 0");
 }
+
+#[test]
+fn test_merchant_payment_count_accurate_after_creates() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_payment_processor(&env);
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    // Initially count should be 0
+    let mut count = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count, 0u32, "Initial count should be 0");
+
+    // Create 1 payment
+    let _ = client.create_payment(&CreatePaymentArgs {
+        payment_id: String::from_str(&env, "pay1"),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 100,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    });
+
+    count = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count, 1u32, "Count should be 1 after 1 payment");
+
+    // Create 9 more payments (total 10)
+    for i in 2..=10 {
+        let _ = client.create_payment(&CreatePaymentArgs {
+            payment_id: String::from_str(&env, &format!("pay{}", i)),
+            merchant_id: merchant.clone(),
+            payer: None,
+            amount: 100,
+            currency: Symbol::new(&env, "USDC"),
+            deposit_address: Address::generate(&env),
+            expires_at: None,
+            duration_secs: None,
+            memo: None,
+            memo_type: None,
+            token_address: None,
+            client_token: None,
+            metadata_hash: None,
+            metadata: None,
+            fee_waiver_code: None,
+        });
+    }
+
+    count = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count, 10u32, "Count should be 10 after 10 payments");
+}
+
+#[test]
+fn test_merchant_payment_count_not_decremented_on_cancel() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_payment_processor(&env);
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let payment_id = String::from_str(&env, "cancel_test");
+    let _ = client.create_payment(&CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 100,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    });
+
+    let count_before = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count_before, 1u32, "Count should be 1");
+
+    // Cancel the payment (set cooldown to 0 first to allow immediate operations)
+    let _ = client.try_cancel_payment(&merchant, &payment_id);
+
+    let count_after = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count_after, 1u32, "Count should NOT decrease after cancellation");
+}

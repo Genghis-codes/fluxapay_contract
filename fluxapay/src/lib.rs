@@ -113,6 +113,10 @@ pub struct PaymentCharge {
     /// has not expired, and still has remaining uses), `settle_payment`
     /// waives the platform fee and decrements `max_uses`.
     pub fee_waiver_code: Option<String>,
+    /// Issue #482: Payment ID of the original payment if this is a retry; None if original or not retried.
+    pub retry_of_payment_id: Option<String>,
+    /// Issue #484: Muxed account ID from payer M-address; None for G-addresses or on-chain payments.
+    pub payer_muxed_id: Option<u64>,
 }
 
 #[contracttype]
@@ -294,6 +298,10 @@ pub enum Error {
     InvalidMemoId = 52,
     /// Issue #516: Payer address is not on the merchant's customer whitelist.
     PayerNotWhitelisted = 53,
+    /// Issue #482: Maximum retry chain depth (3) exceeded for payment retry.
+    MaxRetriesExceeded = 54,
+    /// Issue #478: FX oracle rate deviation exceeds configured limit.
+    RateDeviationExceeded = 55,
 }
 
 #[contracttype]
@@ -316,6 +324,10 @@ pub struct CreatePaymentArgs {
     /// Optional per-payment fee waiver code. If valid during settlement, the
     /// platform fee is waived. `None` means no per-payment waiver request.
     pub fee_waiver_code: Option<String>,
+    /// Issue #482: Payment ID of the original payment if this is a retry; None if original or not retried.
+    pub retry_of_payment_id: Option<String>,
+    /// Issue #484: Muxed account ID from payer M-address; None for G-addresses or on-chain payments.
+    pub payer_muxed_id: Option<u64>,
     /// Customer/payer address, checked against the merchant's whitelist when
     /// `Merchant.whitelist_mode` is enabled (issue #516).
     pub payer: Option<Address>,
@@ -687,6 +699,12 @@ pub enum DataKey {
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
+    /// Issue #482: Payment retry chain tracking - maps original_id to list of retry payment IDs
+    PaymentRetries(String),
+    /// Issue #478: FX oracle max rate deviation per currency pair in basis points
+    MaxRateDeviation(Symbol),
+    /// Issue #481: Admin-configurable dispute threshold for auto-suspension
+    DisputeThreshold,
 }
 
 /// Default initial contract version string.
@@ -1061,6 +1079,8 @@ impl RefundManager {
                 fx_rate_at: None,
                 metadata: None,
                 fee_waiver_code: None,
+            retry_of_payment_id: None,
+            payer_muxed_id: None,
             };
             env.storage()
                 .persistent()
@@ -3611,6 +3631,8 @@ impl RefundManager {
                 fx_rate_at: None,
                 metadata: None,
                 fee_waiver_code: None,
+            retry_of_payment_id: None,
+            payer_muxed_id: None,
             };
 
             env.storage()
@@ -4700,6 +4722,8 @@ impl PaymentProcessor {
             fx_rate_at: None,
             metadata: args.metadata.clone(),
             fee_waiver_code: args.fee_waiver_code.clone(),
+            retry_of_payment_id: None,
+            payer_muxed_id: None,
         };
 
         env.storage()
@@ -4921,6 +4945,8 @@ impl PaymentProcessor {
                 fx_rate_at: None,
                 metadata: args.metadata.clone(),
                 fee_waiver_code: None,
+            retry_of_payment_id: None,
+            payer_muxed_id: None,
             };
 
             env.storage()
@@ -4983,6 +5009,7 @@ impl PaymentProcessor {
         transaction_hash: BytesN<32>,
         payer_address: Address,
         amount_received: i128,
+        payer_muxed_id: Option<u64>,
     ) -> Result<PaymentStatus, Error> {
         Self::require_not_paused(&env)?;
         oracle.require_auth();
@@ -5016,6 +5043,8 @@ impl PaymentProcessor {
         payment.payer_address = Some(payer_address.clone());
         payment.transaction_hash = Some(transaction_hash);
         payment.confirmed_at = Some(env.ledger().timestamp());
+        // Issue #484: Store muxed ID if M-address was used
+        payment.payer_muxed_id = payer_muxed_id;
 
         // Get merchant-specific tolerance if available, otherwise use global default
         let merchant_tolerance = if let Some(registry_address) = env
@@ -5215,6 +5244,119 @@ impl PaymentProcessor {
         );
 
         Ok(new_status)
+    }
+
+
+    /// Issue #482: Create a retry payment for an expired or failed original payment.
+    /// Returns the payment_id of the newly created payment, linked to the original.
+    /// Maximum retry chain depth is 3.
+    pub fn retry_payment(
+        env: Env,
+        merchant_id: Address,
+        original_payment_id: String,
+        new_expires_at: u64,
+    ) -> Result<String, Error> {
+        Self::require_creation_not_paused(&env)?;
+        merchant_id.require_auth();
+        Self::require_not_blacklisted(&env, &merchant_id)?;
+
+        // Retrieve original payment
+        let mut original = Self::get_payment_internal(&env, &original_payment_id)?;
+
+        // Validate original payment status (must be Expired or Failed)
+        if original.status != PaymentStatus::Expired && original.status != PaymentStatus::Failed {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        // Validate merchant ownership
+        if original.merchant_id != merchant_id {
+            return Err(Error::Unauthorized);
+        }
+
+        // Check retry chain depth (max 3)
+        let mut current_id = original_payment_id.clone();
+        let mut depth = 1u32;
+        loop {
+            if let Some(ref retry_of) = {
+                let payment = Self::get_payment_internal(&env, &current_id)?;
+                payment.retry_of_payment_id.clone()
+            } {
+                current_id = retry_of;
+                depth = depth.saturating_add(1);
+                if depth > 3 {
+                    return Err(Error::MaxRetriesExceeded);
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Validate new_expires_at
+        let now = env.ledger().timestamp();
+        if new_expires_at <= now {
+            return Err(Error::InvalidExpiry);
+        }
+
+        // Generate new payment ID
+        let new_payment_id = format_id(&env, "pay_", env.ledger().timestamp());
+
+        // Create new PaymentCharge with inherited properties
+        let new_payment = PaymentCharge {
+            payment_id: new_payment_id.clone(),
+            merchant_id: original.merchant_id.clone(),
+            amount: original.amount,
+            currency: original.currency.clone(),
+            deposit_address: original.deposit_address.clone(),
+            status: PaymentStatus::Pending,
+            payer_address: None,
+            transaction_hash: None,
+            created_at: now,
+            confirmed_at: None,
+            expires_at: new_expires_at,
+            amount_received: None,
+            memo: original.memo.clone(),
+            memo_type: original.memo_type.clone(),
+            token_address: original.token_address.clone(),
+            metadata_hash: original.metadata_hash.clone(),
+            original_token: None,
+            swap_path: None,
+            fx_rate: None,
+            fx_rate_at: None,
+            metadata: original.metadata.clone(),
+            fee_waiver_code: original.fee_waiver_code.clone(),
+            retry_of_payment_id: Some(original_payment_id.clone()),
+            payer_muxed_id: None,
+        };
+
+        // Store new payment
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(new_payment_id.clone()), &new_payment);
+        Self::bump_payment_ttl(&env, &new_payment_id, &new_payment.status);
+
+        // Track retry link
+        let retries_key = DataKey::PaymentRetries(original_payment_id.clone());
+        let mut retries: Vec<String> = env
+            .storage()
+            .persistent()
+            .get(&retries_key)
+            .unwrap_or_else(|| vec![&env]);
+        retries.push_back(new_payment_id.clone());
+        env.storage()
+            .persistent()
+            .set(&retries_key, &retries);
+        Self::bump_ttl(&env, &retries_key, LONG_LIVE_TTL);
+
+        // Emit PAYMENT/RETRY_CREATED event
+        env.events().publish(
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "RETRY_CREATED"),
+            ),
+            (original_payment_id, new_payment_id.clone()),
+        );
+
+        Ok(new_payment_id)
     }
 
     pub fn get_payment(env: Env, payment_id: String) -> Result<PaymentCharge, Error> {

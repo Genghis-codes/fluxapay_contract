@@ -155,6 +155,9 @@ impl PaymentLinkManager {
     ) -> Result<String, crate::Error> {
         merchant.require_auth();
 
+        if !crate::utils::validate_id(&link_id) {
+            return Err(crate::Error::InvalidPaymentId);
+        }
         if let Some(ref meta_map) = metadata {
             if meta_map.len() > 20 {
                 return Err(crate::Error::MetadataTooLarge);

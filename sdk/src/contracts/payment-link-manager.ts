@@ -26,6 +26,26 @@ export interface PaymentLink {
 }
 
 /**
+ * Analytics summary for a payment link.
+ *
+ * Returned by `getLinkAnalytics`. `conversion_rate` is expressed in
+ * basis points (bps): `(use_count * 10_000) / view_count`, or `0`
+ * when the link has not been viewed yet.
+ */
+export interface LinkAnalytics {
+  /** Number of times the link has been viewed */
+  view_count: number;
+  /** Number of times the link has been successfully used */
+  use_count: number;
+  /** Total revenue accumulated from successful uses (in USDC stroops) */
+  total_revenue: string;
+  /** Conversion rate in basis points (bps). 100 bps = 1%. */
+  conversion_rate: number;
+}
+
+
+
+/**
  * Parameters for creating a new payment link.
  */
 export interface CreateLinkParams {
@@ -164,4 +184,39 @@ export class PaymentLinkManagerClient {
       }),
     );
   }
+
+  /**
+   * Record a view of a payment link (permissionless).
+   *
+   * Increments the link's `view_count` so merchants can track
+   * how many people viewed the link versus how many actually paid.
+   * @param linkId - The payment link ID
+   */
+  async recordLinkView(linkId: string): Promise<void> {
+    return withMappedContractError(() =>
+      this.getContract().record_link_view({
+        link_id: linkId,
+      }),
+    );
+  }
+
+  /**
+   * Retrieve analytics for a payment link.
+   *
+   * Returns view_count, use_count, total_revenue, and conversion_rate
+   * (in basis points: `use_count * 10_000 / view_count`, or `0` if
+   * the link has not been viewed).
+   * @param linkId - The payment link ID
+   * @returns A promise resolving to the LinkAnalytics
+   */
+  async getLinkAnalytics(linkId: string): Promise<LinkAnalytics> {
+    return withMappedContractError(() =>
+      this.getContract().get_link_analytics({
+        link_id: linkId,
+      }),
+    );
+  }
 }
+
+
+

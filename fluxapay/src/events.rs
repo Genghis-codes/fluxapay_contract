@@ -408,6 +408,13 @@ pub struct LinkDeactivated {
     pub link_id: String,
 }
 
+/// Emitted when a payment link is viewed (record_link_view).
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct LinkViewed {
+    pub link_id: String,
+}
+
 // ============================================================================
 // Merchant Events
 // ============================================================================
@@ -420,7 +427,10 @@ pub struct MerchantRegistered {
     pub settlement_currency: String,
 }
 
+
 /// Emitted when a merchant is verified.
+
+
 #[contractevent]
 #[derive(Clone, Debug)]
 pub struct MerchantVerified {

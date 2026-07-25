@@ -53,6 +53,10 @@ pub struct PaymentLink {
     pub expires_at: Option<u64>,
     pub max_uses: Option<u32>,
     pub use_count: u32,
+    /// Number of times this link has been viewed (incremented by `record_link_view`).
+    pub view_count: u32,
+    /// Total revenue (in USDC stroops) accumulated from successful `use_link` calls.
+    pub total_revenue: i128,
     pub active: bool,
     /// If true, funds are transferred directly to the merchant wallet on use_link,
     /// bypassing the escrow/platform wallet (issue #111).
@@ -61,6 +65,21 @@ pub struct PaymentLink {
     pub metadata: Option<Map<String, String>>,
     /// Fiat configuration for multi-currency invoicing (issue #413).
     pub fiat: MaybeFiatConfig,
+}
+
+/// Analytics summary for a payment link.
+///
+/// Returned by `get_link_analytics`. `conversion_rate` is expressed in
+/// basis points (bps): `(use_count * 10_000) / view_count`, or `0` when
+/// the link has not been viewed yet.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkAnalytics {
+    pub view_count: u32,
+    pub use_count: u32,
+    pub total_revenue: i128,
+    /// Conversion rate in basis points (bps). 100 bps = 1%.
+    pub conversion_rate: u32,
 }
 
 #[contracttype]
@@ -156,6 +175,8 @@ impl PaymentLinkManager {
             expires_at,
             max_uses,
             use_count: 0,
+            view_count: 0,
+            total_revenue: 0,
             active: true,
             direct_transfer,
             metadata,
@@ -173,6 +194,34 @@ impl PaymentLinkManager {
         );
 
         Ok(link_id)
+    }
+
+    /// Record a view of a payment link.
+    ///
+    /// This is a permissionless entry point — any caller may increment the
+    /// `view_count` for an active link. Merchants use this (typically from
+    /// their storefront or checkout page) to track how many people viewed
+    /// the link versus how many actually paid, enabling conversion-rate
+    /// analytics via `get_link_analytics`.
+    pub fn record_link_view(env: Env, link_id: String) -> Result<(), crate::Error> {
+        let mut link = Self::get_link_internal(&env, &link_id)?;
+
+        if !link.active {
+            return Err(crate::Error::Unauthorized);
+        }
+
+        link.view_count = link.view_count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&LinkDataKey::Link(link_id.clone()), &link);
+
+        // Emit LINK/VIEWED event
+        env.events().publish(
+            (Symbol::new(&env, "LINK"), Symbol::new(&env, "VIEWED")),
+            link_id,
+        );
+
+        Ok(())
     }
 
     pub fn use_link(
@@ -246,6 +295,8 @@ impl PaymentLinkManager {
         };
 
         link.use_count += 1;
+        // Accumulate revenue from this payment.
+        link.total_revenue = link.total_revenue.saturating_add(resolved_amount);
         env.storage()
             .persistent()
             .set(&LinkDataKey::Link(link_id.clone()), &link);
@@ -368,6 +419,28 @@ impl PaymentLinkManager {
             .persistent()
             .get(&LinkDataKey::Link(link_id.clone()))
             .ok_or(crate::Error::PaymentNotFound)
+    }
+
+    /// Retrieve analytics for a payment link.
+    ///
+    /// Returns view_count, use_count, total_revenue, and conversion_rate
+    /// (in basis points: `use_count * 10_000 / view_count`, or `0` if
+    /// the link has not been viewed).
+    pub fn get_link_analytics(env: Env, link_id: String) -> Result<LinkAnalytics, crate::Error> {
+        let link = Self::get_link_internal(&env, &link_id)?;
+
+        let conversion_rate = if link.view_count > 0 {
+            (link.use_count as u32).saturating_mul(10_000) / link.view_count
+        } else {
+            0
+        };
+
+        Ok(LinkAnalytics {
+            view_count: link.view_count,
+            use_count: link.use_count,
+            total_revenue: link.total_revenue,
+            conversion_rate,
+        })
     }
 
     /// Verify the status of multiple payment links in a single call.

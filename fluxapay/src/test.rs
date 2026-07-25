@@ -3580,3 +3580,412 @@ fn test_idempotency_still_blocks_during_active_window() {
     let result = client.try_create_payment(&args2);
     assert_eq!(result, Err(Ok(Error::DuplicateIdempotencyKey)));
 }
+
+#[test]
+fn test_reconciliation_report_covers_correct_time_range() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    
+    // Create payment 1 at t=0
+    let payment_id_1 = String::from_str(&env, "recon_pay_1");
+    let mut args1 = create_payment_args(&env, &payment_id_1, &merchant_id, 1000);
+    args1.expires_at = Some(now + 3600);
+    client.create_payment(&args1);
+    env.ledger().with_mut(|li| li.timestamp = now + 10);
+    // Manually set payment to Confirmed status for test
+    env.as_contract(&client.address, || {
+        let mut payment = PaymentProcessor::get_payment_internal(&env, &payment_id_1).unwrap();
+        payment.status = PaymentStatus::Confirmed;
+        payment.confirmed_at = Some(now + 10);
+        env.storage().persistent().set(&DataKey::Payment(payment_id_1.clone()), &payment);
+    });
+
+    // Create payment 2 at t=100 (outside period)
+    env.ledger().with_mut(|li| li.timestamp = now + 100);
+    let payment_id_2 = String::from_str(&env, "recon_pay_2");
+    let mut args2 = create_payment_args(&env, &payment_id_2, &merchant_id, 2000);
+    args2.expires_at = Some(now + 4000);
+    client.create_payment(&args2);
+    env.ledger().with_mut(|li| li.timestamp = now + 110);
+    env.as_contract(&client.address, || {
+        let mut payment = PaymentProcessor::get_payment_internal(&env, &payment_id_2).unwrap();
+        payment.status = PaymentStatus::Confirmed;
+        payment.confirmed_at = Some(now + 110);
+        env.storage().persistent().set(&DataKey::Payment(payment_id_2.clone()), &payment);
+    });
+
+    // Generate report for period t=0 to t=50 (should only include payment 1)
+    env.ledger().with_mut(|li| li.timestamp = now + 200);
+    let report = client.generate_reconciliation_report(&merchant_id, &now, &(now + 50), &0, &10);
+
+    assert_eq!(report.merchant_id, merchant_id);
+    assert_eq!(report.period_start, now);
+    assert_eq!(report.period_end, now + 50);
+    assert_eq!(report.payments.len(), 1);
+    assert_eq!(report.payments.get(0).unwrap().payment_id, payment_id_1);
+    assert_eq!(report.total_gross, 1000);
+    assert_eq!(report.total_refunds, 0);
+}
+
+#[test]
+fn test_reconciliation_report_fees_and_refunds_summed_correctly() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    
+    // Create payment with refund
+    let payment_id = String::from_str(&env, "recon_refund_pay");
+    let mut args = create_payment_args(&env, &payment_id, &merchant_id, 1000);
+    args.expires_at = Some(now + 3600);
+    client.create_payment(&args);
+    env.ledger().with_mut(|li| li.timestamp = now + 10);
+    // Manually set payment to Confirmed status
+    env.as_contract(&client.address, || {
+        let mut payment = PaymentProcessor::get_payment_internal(&env, &payment_id).unwrap();
+        payment.status = PaymentStatus::Confirmed;
+        payment.confirmed_at = Some(now + 10);
+        env.storage().persistent().set(&DataKey::Payment(payment_id.clone()), &payment);
+    });
+
+    // Manually create a completed refund in storage
+    let refund_id = String::from_str(&env, "refund_test");
+    let requester = Address::generate(&env);
+    let refund = Refund {
+        refund_id: refund_id.clone(),
+        payment_id: payment_id.clone(),
+        amount: 500,
+        reason: String::from_str(&env, "test"),
+        status: RefundStatus::Completed,
+        requester,
+        created_at: now + 400,
+        processed_at: Some(now + 410),
+        approved: true,
+        receipt_hash: None,
+        expiry_at: now + 10000,
+    };
+    
+    env.as_contract(&client.address, || {
+        env.storage().persistent().set(&DataKey::Refund(refund_id.clone()), &refund);
+        
+        // Add refund to payment's refund list
+        let mut payment_refunds = vec![&env];
+        payment_refunds.push_back(refund_id.clone());
+        env.storage().persistent().set(&DataKey::PaymentRefunds(payment_id.clone()), &payment_refunds);
+    });
+
+    // Generate report
+    env.ledger().with_mut(|li| li.timestamp = now + 500);
+    let report = client.generate_reconciliation_report(&merchant_id, &now, &(now + 1000), &0, &10);
+
+    assert_eq!(report.payments.len(), 1);
+    assert_eq!(report.total_gross, 1000);
+    assert_eq!(report.total_refunds, 500);
+    assert_eq!(report.total_fees, 5); // 500 * 100 bps / 10000 = 5
+    assert_eq!(report.total_net_settled, 500);
+}
+
+#[test]
+fn test_reconciliation_report_pagination() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    
+    // Create 5 payments
+    for i in 0..5u32 {
+        let payment_id = format_id(&env, "recon_page_", i as u64);
+        let mut args = create_payment_args(&env, &payment_id, &merchant_id, 1000);
+        args.expires_at = Some(now + 3600);
+        client.create_payment(&args);
+        let confirm_time = now + 10 + (i as u64) * 20;
+        env.ledger().with_mut(|li| li.timestamp = confirm_time);
+        // Manually set payment to Confirmed status
+        env.as_contract(&client.address, || {
+            let mut payment = PaymentProcessor::get_payment_internal(&env, &payment_id).unwrap();
+            payment.status = PaymentStatus::Confirmed;
+            payment.confirmed_at = Some(confirm_time);
+            env.storage().persistent().set(&DataKey::Payment(payment_id.clone()), &payment);
+        });
+    }
+
+    env.ledger().with_mut(|li| li.timestamp = now + 500);
+
+    // Page 1: offset 0, limit 2
+    let page1 = client.generate_reconciliation_report(&merchant_id, &now, &(now + 1000), &0, &2);
+    assert_eq!(page1.payments.len(), 2);
+
+    // Page 2: offset 2, limit 2
+    let page2 = client.generate_reconciliation_report(&merchant_id, &now, &(now + 1000), &2, &2);
+    assert_eq!(page2.payments.len(), 2);
+
+    // Page 3: offset 4, limit 2 (only 1 remaining)
+    let page3 = client.generate_reconciliation_report(&merchant_id, &now, &(now + 1000), &4, &2);
+    assert_eq!(page3.payments.len(), 1);
+}
+
+#[test]
+fn test_reconciliation_report_empty_when_no_payments() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    
+    // Generate report for period with no payments
+    let report = client.generate_reconciliation_report(&merchant_id, &now, &(now + 3600), &0, &10);
+
+    assert_eq!(report.payments.len(), 0);
+    assert_eq!(report.total_gross, 0);
+    assert_eq!(report.total_fees, 0);
+    assert_eq!(report.total_refunds, 0);
+    assert_eq!(report.total_net_settled, 0);
+}
+
+#[test]
+fn test_reconciliation_report_invalid_time_range() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    
+    // from_ts > to_ts should return error
+    let result = client.try_generate_reconciliation_report(&merchant_id, &(now + 100), &now, &0, &10);
+    assert_eq!(result, Err(Ok(Error::InvalidExpiry)));
+}
+
+#[test]
+fn test_reconciliation_report_limit_capped_at_100() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    
+    // Create 5 payments
+    for i in 0..5u32 {
+        let payment_id = format_id(&env, "recon_cap_", i as u64);
+        let mut args = create_payment_args(&env, &payment_id, &merchant_id, 1000);
+        args.expires_at = Some(now + 3600);
+        client.create_payment(&args);
+        let confirm_time = now + 10 + (i as u64) * 20;
+        env.ledger().with_mut(|li| li.timestamp = confirm_time);
+        // Manually set payment to Confirmed status
+        env.as_contract(&client.address, || {
+            let mut payment = PaymentProcessor::get_payment_internal(&env, &payment_id).unwrap();
+            payment.status = PaymentStatus::Confirmed;
+            payment.confirmed_at = Some(confirm_time);
+            env.storage().persistent().set(&DataKey::Payment(payment_id.clone()), &payment);
+        });
+    }
+
+    env.ledger().with_mut(|li| li.timestamp = now + 500);
+
+    // Request limit > 100 should be capped
+    let report = client.generate_reconciliation_report(&merchant_id, &now, &(now + 1000), &0, &200);
+    assert_eq!(report.payments.len(), 5); // All 5 payments returned (capped at 100, but only 5 exist)
+}
+
+#[test]
+fn test_merchant_payment_tolerance_used() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let (admin, merchant_client) = merchant_registry::setup_merchant_registry(&env);
+    let (payment_admin, payment_client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    merchant_client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Test Merchant"),
+        &String::from_str(&env, "USDC"),
+        &Some(Address::generate(&env)),
+    );
+
+    // Set merchant-specific tolerance to 1000 stroops
+    merchant_client.set_merchant_payment_tolerance(&merchant_id, &Some(1000i128));
+
+    // Configure payment processor to use merchant registry
+    payment_client.set_merchant_registry_address(&payment_admin, &merchant_client.address);
+
+    // Create payment
+    let payment_id = String::from_str(&env, "tolerance_test");
+    let args = create_payment_args(&env, &payment_id, &merchant_id, 100000i128); // 100000 stroops
+    payment_client.grant_role(&payment_admin, &role_merchant(&env), &merchant_id);
+    payment_client.create_payment(&args);
+
+    // Verify payment with underpayment of 500 stroops (within merchant tolerance of 1000)
+    let oracle = Address::generate(&env);
+    payment_client.grant_role(&payment_admin, &role_oracle(&env), &oracle);
+    let status = payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &99500i128, // 500 less than expected
+    );
+
+    assert_eq!(status, PaymentStatus::Confirmed);
+}
+
+#[test]
+fn test_merchant_tolerance_fallback_to_global() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let (admin, merchant_client) = merchant_registry::setup_merchant_registry(&env);
+    let (payment_admin, payment_client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    merchant_client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Test Merchant"),
+        &String::from_str(&env, "USDC"),
+        &Some(Address::generate(&env)),
+    );
+
+    // Set global tolerance to 500 stroops
+    merchant_client.set_global_payment_tolerance(&admin, &500i128);
+
+    // Merchant tolerance is None (default)
+    let merchant = merchant_client.get_merchant(&merchant_id).unwrap();
+    assert_eq!(merchant.payment_tolerance, None);
+
+    // Configure payment processor to use merchant registry
+    payment_client.set_merchant_registry_address(&payment_admin, &merchant_client.address);
+
+    // Create payment
+    let payment_id = String::from_str(&env, "global_tolerance_test");
+    let args = create_payment_args(&env, &payment_id, &merchant_id, 100000i128);
+    payment_client.grant_role(&payment_admin, &role_merchant(&env), &merchant_id);
+    payment_client.create_payment(&args);
+
+    // Verify payment with underpayment of 400 stroops (within global tolerance of 500)
+    let oracle = Address::generate(&env);
+    payment_client.grant_role(&payment_admin, &role_oracle(&env), &oracle);
+    let status = payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &99600i128, // 400 less than expected
+    );
+
+    assert_eq!(status, PaymentStatus::Confirmed);
+}
+
+#[test]
+fn test_tolerance_cap_enforced_at_1_percent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let (admin, merchant_client) = merchant_registry::setup_merchant_registry(&env);
+    let (payment_admin, payment_client) = setup_payment_processor(&env);
+
+    let merchant_id = Address::generate(&env);
+    merchant_client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Test Merchant"),
+        &String::from_str(&env, "USDC"),
+        &Some(Address::generate(&env)),
+    );
+
+    // Set merchant tolerance to 10000 stroops (1% of 1,000,000)
+    merchant_client.set_merchant_payment_tolerance(&merchant_id, &Some(10000i128));
+
+    // Configure payment processor to use merchant registry
+    payment_client.set_merchant_registry_address(&payment_admin, &merchant_client.address);
+
+    // Create payment for 100000 stroops (1% cap = 1000 stroops)
+    let payment_id = String::from_str(&env, "cap_test");
+    let args = create_payment_args(&env, &payment_id, &merchant_id, 100000i128);
+    payment_client.grant_role(&payment_admin, &role_merchant(&env), &merchant_id);
+    payment_client.create_payment(&args);
+
+    // Verify payment with underpayment of 900 stroops (within capped tolerance of 1000)
+    let oracle = Address::generate(&env);
+    payment_client.grant_role(&payment_admin, &role_oracle(&env), &oracle);
+    let status = payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &99100i128, // 900 less than expected
+    );
+
+    assert_eq!(status, PaymentStatus::Confirmed);
+
+    // Create another payment for same amount
+    let payment_id2 = String::from_str(&env, "cap_test2");
+    let args2 = create_payment_args(&env, &payment_id2, &merchant_id, 100000i128);
+    payment_client.create_payment(&args2);
+
+    // Verify payment with underpayment of 1100 stroops (exceeds capped tolerance of 1000)
+    let status2 = payment_client.verify_payment(
+        &oracle,
+        &payment_id2,
+        &BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &98900i128, // 1100 less than expected
+    );
+
+    assert_eq!(status2, PaymentStatus::PartiallyPaid);
+}
+
+#[test]
+fn test_set_merchant_tolerance_requires_auth() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let (admin, merchant_client) = merchant_registry::setup_merchant_registry(&env);
+
+    let merchant_id = Address::generate(&env);
+    merchant_client.register_merchant(
+        &merchant_id,
+        &String::from_str(&env, "Test Merchant"),
+        &String::from_str(&env, "USDC"),
+        &Some(Address::generate(&env)),
+    );
+
+    // Try to set tolerance without merchant auth
+    let unauthorized = Address::generate(&env);
+    let result = merchant_client.try_set_merchant_payment_tolerance(&unauthorized, &merchant_id, &Some(1000i128));
+    assert_eq!(result, Err(Ok(merchant_registry::MerchantError::Unauthorized)));
+}
+
+#[test]
+fn test_set_global_tolerance_requires_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    
+    let (admin, merchant_client) = merchant_registry::setup_merchant_registry(&env);
+
+    // Try to set global tolerance without admin auth
+    let unauthorized = Address::generate(&env);
+    let result = merchant_client.try_set_global_payment_tolerance(&unauthorized, &1000i128);
+    assert_eq!(result, Err(Ok(merchant_registry::MerchantError::Unauthorized)));
+}

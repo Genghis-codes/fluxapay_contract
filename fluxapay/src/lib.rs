@@ -1240,6 +1240,7 @@ impl RefundManager {
 
     pub fn process_refund(env: Env, operator: Address, refund_id: String) -> Result<(), Error> {
         operator.require_auth();
+        Self::require_not_paused(&env)?;
         Self::require_not_blacklisted(&env, &operator)?;
         
         // Issue #171: Allow either operator OR customer (requester) to process approved refunds
@@ -1724,6 +1725,7 @@ impl RefundManager {
         payout_splits: Vec<SettlementSplit>,
     ) -> Result<String, Error> {
         disputer.require_auth();
+        Self::require_not_paused(&env)?;
 
         // Issue #404: Validate payment_id format
         if !utils::validate_id(&payment_id) {
@@ -2092,6 +2094,7 @@ impl RefundManager {
         operator_signature: String,
     ) -> Result<String, Error> {
         operator.require_auth();
+        Self::require_not_paused(&env)?;
 
         let has_settlement =
             AccessControl::has_role(&env, &role_settlement_operator(&env), &operator);
@@ -5493,7 +5496,9 @@ impl PaymentProcessor {
         Ok(())
     }
 
-    pub fn batch_expire_payments(env: Env, payment_ids: Vec<String>) -> u32 {
+    pub fn batch_expire_payments(env: Env, payment_ids: Vec<String>) -> Result<u32, Error> {
+        Self::require_not_paused(&env)?;
+
         let mut count = 0;
         let mut i = 0;
         let len = payment_ids.len();
@@ -5507,7 +5512,7 @@ impl PaymentProcessor {
             }
             i += 1;
         }
-        count
+        Ok(count)
     }
 
     pub fn settle_payment(
@@ -5521,6 +5526,8 @@ impl PaymentProcessor {
         if !AccessControl::has_role(&env, &role_settlement_operator(&env), &operator) {
             return Err(Error::Unauthorized);
         }
+
+        Self::require_not_paused(&env)?;
 
         if env
             .storage()
@@ -6107,6 +6114,7 @@ impl PaymentProcessor {
     #[allow(clippy::too_many_arguments)]
     pub fn swap_and_pay(env: Env, args: SwapAndPayArgs) -> Result<PaymentCharge, Error> {
         args.payer.require_auth();
+        Self::require_creation_not_paused(&env)?;
 
         // Validate inputs
         if args.amount <= 0 || args.amount_in <= 0 {

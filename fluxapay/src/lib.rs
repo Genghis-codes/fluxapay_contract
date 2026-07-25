@@ -684,6 +684,8 @@ pub enum DataKey {
     TierVolumeCap(KycTier),
     /// Configurable refund fee in basis points (overrides REFUND_FEE_BPS const).
     RefundFeeBps,
+    /// Configurable refund cooldown period in seconds (overrides REFUND_COOLDOWN_SECS const).
+    RefundCooldownSecs,
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
@@ -1168,7 +1170,8 @@ impl RefundManager {
         // Issue #174: Check cooldown period after payment confirmation
         let confirmed_at = payment.confirmed_at.ok_or(Error::PaymentAlreadyProcessed)?;
         let now = env.ledger().timestamp();
-        if now < confirmed_at + REFUND_COOLDOWN_SECS {
+        let cooldown_secs = Self::get_refund_cooldown_secs(&env);
+        if now < confirmed_at + cooldown_secs {
             return Err(Error::RefundCooldownNotElapsed);
         }
 
@@ -6983,6 +6986,30 @@ impl PaymentProcessor {
             .persistent()
             .get::<DataKey, i128>(&DataKey::RefundFeeBps)
             .unwrap_or(REFUND_FEE_BPS)
+    }
+
+    /// Set the refund cooldown period in seconds (overrides REFUND_COOLDOWN_SECS constant).
+    /// Admin-only operation.
+    pub fn set_refund_cooldown(env: Env, admin: Address, secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RefundCooldownSecs, &secs);
+        Ok(())
+    }
+
+    /// Read the effective refund cooldown period in seconds.
+    /// Falls back to the compile-time constant if not overridden by admin.
+    fn get_refund_cooldown_secs(env: &Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::RefundCooldownSecs)
+            .unwrap_or(REFUND_COOLDOWN_SECS)
     }
 }
 

@@ -5017,11 +5017,27 @@ impl PaymentProcessor {
         payment.transaction_hash = Some(transaction_hash);
         payment.confirmed_at = Some(env.ledger().timestamp());
 
+        // Get merchant-specific tolerance if available, otherwise use global default
+        let merchant_tolerance = if let Some(registry_address) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+        {
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+            match registry_client.try_get_merchant(&payment.merchant_id) {
+                Ok(Ok(merchant)) => merchant.payment_tolerance,
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Scale tolerance by token decimals: 1 unit in the smallest denomination per decimal place.
         // USDC has 7 decimals on Stellar (stroops); other tokens may differ.
         // tolerance = 10^(decimals - 6) clamped to at least 1, so a 6-decimal token gets tolerance=1,
         // a 7-decimal token gets tolerance=10, a 2-decimal token gets tolerance=1 (clamped).
-        let tolerance = if let Some(ref token_addr) = payment.token_address {
+        let base_tolerance = if let Some(ref token_addr) = payment.token_address {
             let decimals = token::TokenClient::new(&env, token_addr).decimals();
             if decimals >= 6 {
                 let exp = decimals - 6;
@@ -5038,6 +5054,25 @@ impl PaymentProcessor {
         } else {
             PAYMENT_TOLERANCE
         };
+
+        // Use merchant tolerance if set, otherwise use global tolerance, otherwise base tolerance
+        let global_tolerance = if let Some(registry_address) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+        {
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+            registry_client.get_global_payment_tolerance()
+        } else {
+            PAYMENT_TOLERANCE
+        };
+
+        let tolerance = merchant_tolerance.unwrap_or(global_tolerance);
+
+        // Cap tolerance at 1% of payment amount to prevent abuse
+        let max_tolerance = payment.amount / 100; // 1% of payment amount
+        let tolerance = tolerance.min(max_tolerance);
 
         let diff = amount_received - payment.amount;
 
@@ -5231,6 +5266,134 @@ impl PaymentProcessor {
         }
 
         page
+    }
+
+    /// Generate a reconciliation report for a merchant over a time period.
+    ///
+    /// This is a read-only query that returns a structured summary of all
+    /// settlements, fees, refunds, and disputes in the specified period.
+    ///
+    /// # Parameters
+    /// * `merchant_id` - The merchant to generate the report for
+    /// * `from_ts` - Start timestamp (inclusive)
+    /// * `to_ts` - End timestamp (inclusive)
+    /// * `offset` - Pagination offset (number of payments to skip)
+    /// * `limit` - Maximum number of payments to include (max 100)
+    pub fn generate_reconciliation_report(
+        env: Env,
+        merchant_id: Address,
+        from_ts: u64,
+        to_ts: u64,
+        offset: u32,
+        limit: u32,
+    ) -> Result<ReconciliationReport, Error> {
+        if from_ts > to_ts {
+            return Err(Error::InvalidExpiry);
+        }
+
+        let capped_limit = if limit == 0 || limit > 100 { 100 } else { limit };
+
+        let all_payment_ids = Self::get_merchant_payments_internal(&env, &merchant_id);
+
+        let mut payments_in_period = vec![&env];
+        let mut total_gross: i128 = 0;
+        let mut total_fees: i128 = 0;
+        let mut total_refunds: i128 = 0;
+        let mut dispute_adjustments: i128 = 0;
+
+        let default_fee_bps = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CurrentFee)
+            .unwrap_or(REFUND_FEE_BPS);
+
+        let merchant_fee_bps = if let Some(registry_address) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+        {
+            let registry_client =
+                crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+            match registry_client.try_get_merchant(&merchant_id) {
+                Ok(Ok(merchant)) => {
+                    use crate::merchant_registry::KycTier;
+                    match merchant.kyc_tier {
+                        KycTier::Business => REFUND_FEE_BPS_BUSINESS,
+                        KycTier::Full => REFUND_FEE_BPS_FULL,
+                        KycTier::Basic => REFUND_FEE_BPS_BASIC,
+                        KycTier::Unverified => default_fee_bps,
+                    }
+                }
+                _ => default_fee_bps,
+            }
+        } else {
+            default_fee_bps
+        };
+
+        for payment_id in all_payment_ids.iter() {
+            if let Ok(payment) = Self::get_payment_internal(&env, &payment_id) {
+                let payment_time = payment.confirmed_at.unwrap_or(payment.created_at);
+                
+                if payment_time >= from_ts && payment_time <= to_ts {
+                    let mut refund_amount: i128 = 0;
+                    
+                    let refund_ids = Self::get_payment_refunds_internal(&env, &payment_id);
+                    for refund_id in refund_ids.iter() {
+                        if let Ok(refund) = Self::get_refund_internal(&env, &refund_id) {
+                            if refund.status == RefundStatus::Completed {
+                                refund_amount += refund.amount;
+                            }
+                        }
+                    }
+
+                    let fee = if refund_amount > 0 {
+                        refund_amount * merchant_fee_bps / 10_000
+                    } else {
+                        0
+                    };
+
+                    let summary = PaymentSummary {
+                        payment_id: payment.payment_id.clone(),
+                        amount: payment.amount,
+                        fee,
+                        refund_amount,
+                        status: payment.status.clone(),
+                        settled_at: payment.confirmed_at,
+                    };
+
+                    payments_in_period.push_back(summary.clone());
+                    total_gross += payment.amount;
+                    total_fees += fee;
+                    total_refunds += refund_amount;
+                }
+            }
+        }
+
+        let mut paginated_payments = vec![&env];
+        let start = offset;
+        let end = core::cmp::min(payments_in_period.len(), start.saturating_add(capped_limit));
+
+        let mut i = start;
+        while i < end {
+            if let Some(summary) = payments_in_period.get(i) {
+                paginated_payments.push_back(summary);
+            }
+            i += 1;
+        }
+
+        let total_net_settled = total_gross - total_refunds;
+
+        Ok(ReconciliationReport {
+            merchant_id,
+            period_start: from_ts,
+            period_end: to_ts,
+            payments: paginated_payments,
+            total_gross,
+            total_fees,
+            total_refunds,
+            total_net_settled,
+            dispute_adjustments,
+        })
     }
 
     #[allow(deprecated)]

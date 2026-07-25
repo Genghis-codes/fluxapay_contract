@@ -1,7 +1,9 @@
-﻿use crate::{
-    FiatConfig, MaybeFiatConfig, PaymentLinkManager, PaymentLinkManagerClient, FXOracle,
+use crate::{
+    FiatConfig, LinkAnalytics, MaybeFiatConfig, PaymentLinkManager, PaymentLinkManagerClient, FXOracle,
     FXOracleClient,
 };
+
+
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
     token, vec, Address, BytesN, Env, Map, String, Symbol,
@@ -310,7 +312,7 @@ fn test_max_uses() {
     client.use_link(&payer, &link_id, &100i128, &None);
 }
 
-// ── Issue #111: Direct-to-Merchant Payment Flow ──────────────────────────────
+// -- Issue #111: Direct-to-Merchant Payment Flow ------------------------------
 
 #[test]
 fn test_direct_transfer_link_transfers_to_merchant() {
@@ -383,7 +385,7 @@ fn test_direct_transfer_without_token_address_fails() {
     client.use_link(&payer, &link_id, &500i128, &None);
 }
 
-// ── Issue #317: Payment Link Metadata Validation ────────────────────────────
+// -- Issue #317: Payment Link Metadata Validation ----------------------------
 
 #[test]
 #[should_panic(expected = "Error(Contract, #49)")]
@@ -502,7 +504,7 @@ fn test_metadata_none_succeeds() {
     assert!(link.metadata.is_none());
 }
 
-// ── Issue #413: Multi-Currency Invoicing (Fiat) ────────────────────────────
+// -- Issue #413: Multi-Currency Invoicing (Fiat) ----------------------------
 
 #[test]
 fn test_create_fiat_link_and_use_with_rate() {
@@ -571,7 +573,7 @@ fn test_use_fiat_link_requires_correct_usdc() {
 
     let link_id = String::from_str(&env, "fiat_use");
     let fiat = FiatConfig {
-        amount: 50i128, // $50 → should require 25 USDC (50/2)
+        amount: 50i128, // $50 ? should require 25 USDC (50/2)
         currency: Symbol::new(&env, "USD"),
         oracle: oracle_id,
     };
@@ -616,7 +618,7 @@ fn test_use_fiat_link_rejects_wrong_usdc() {
 
     let link_id = String::from_str(&env, "fiat_wrong");
     let fiat = FiatConfig {
-        amount: 100i128, // $100 → should require 100 USDC (rate 1.0)
+        amount: 100i128, // $100 ? should require 100 USDC (rate 1.0)
         currency: Symbol::new(&env, "USD"),
         oracle: oracle_id,
     };
@@ -637,3 +639,223 @@ fn test_use_fiat_link_rejects_wrong_usdc() {
     // 50 USDC is wrong when fiat_amount=100 at rate=1
     client.use_link(&payer, &link_id, &50i128, &None);
 }
+
+// ── Payment Link Analytics (view_count, total_revenue, conversion_rate) ─────
+
+#[test]
+fn test_record_link_view_increments_view_count() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "view_link");
+    client.create_link(
+        &_merchant,
+        &link_id,
+        &None,
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "View Test"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    // Initially zero views
+    let link = client.get_link(&link_id);
+    assert_eq!(link.view_count, 0);
+
+    // Record 3 views
+    client.record_link_view(&link_id);
+    client.record_link_view(&link_id);
+    client.record_link_view(&link_id);
+
+    let link = client.get_link(&link_id);
+    assert_eq!(link.view_count, 3);
+}
+
+#[test]
+fn test_use_link_accumulates_revenue() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "revenue_link");
+    let amount = 1000i128;
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(amount),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Revenue"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    // Initially zero revenue
+    let link = client.get_link(&link_id);
+    assert_eq!(link.total_revenue, 0);
+
+    // First use
+    client.use_link(&payer, &link_id, &amount, &None);
+    let link = client.get_link(&link_id);
+    assert_eq!(link.total_revenue, amount);
+
+    // Second use (different payer)
+    let payer2 = Address::generate(&env);
+    client.use_link(&payer2, &link_id, &amount, &None);
+    let link = client.get_link(&link_id);
+    assert_eq!(link.total_revenue, amount * 2);
+}
+
+#[test]
+fn test_get_link_analytics_conversion_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "analytics_link");
+    let amount = 1000i128;
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(amount),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Analytics"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    // Record 10 views
+    for _ in 0..10 {
+        client.record_link_view(&link_id);
+    }
+
+    // Use the link once (1 conversion out of 10 views = 10%)
+    client.use_link(&payer, &link_id, &amount, &None);
+
+    let analytics = client.get_link_analytics(&link_id);
+    assert_eq!(analytics.view_count, 10);
+    assert_eq!(analytics.use_count, 1);
+    assert_eq!(analytics.total_revenue, amount);
+    // 1/10 = 10% = 1000 bps
+    assert_eq!(analytics.conversion_rate, 1000);
+}
+
+#[test]
+fn test_get_link_analytics_zero_views() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "zero_views_link");
+    let amount = 500i128;
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(amount),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Zero Views"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    // Use the link without any views
+    client.use_link(&payer, &link_id, &amount, &None);
+
+    let analytics = client.get_link_analytics(&link_id);
+    assert_eq!(analytics.view_count, 0);
+    assert_eq!(analytics.use_count, 1);
+    assert_eq!(analytics.total_revenue, amount);
+    // No views → conversion rate is 0 (avoid division by zero)
+    assert_eq!(analytics.conversion_rate, 0);
+}
+
+#[test]
+fn test_get_link_analytics_full_conversion() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "full_conv_link");
+    let amount = 1000i128;
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(amount),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Full Conversion"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    // 4 views, 4 uses → 100% conversion = 10000 bps
+    for _ in 0..4 {
+        client.record_link_view(&link_id);
+        let p = Address::generate(&env);
+        client.use_link(&p, &link_id, &amount, &None);
+    }
+
+    let analytics = client.get_link_analytics(&link_id);
+    assert_eq!(analytics.view_count, 4);
+    assert_eq!(analytics.use_count, 4);
+    assert_eq!(analytics.total_revenue, amount * 4);
+    assert_eq!(analytics.conversion_rate, 10000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")]
+fn test_record_link_view_rejects_inactive_link() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "inactive_view_link");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &None,
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Inactive View"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    client.deactivate_link(&merchant, &link_id);
+    // Should fail because the link is no longer active
+    client.record_link_view(&link_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #404)")]
+fn test_get_link_analytics_not_found() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_merchant, client) = setup_payment_link(&env);
+
+    let nonexistent = String::from_str(&env, "does_not_exist");
+    client.get_link_analytics(&nonexistent);
+}
+
+
+

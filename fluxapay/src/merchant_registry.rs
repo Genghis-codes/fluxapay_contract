@@ -469,6 +469,87 @@ impl MerchantRegistry {
         Ok(())
     }
 
+    /// Set merchant-specific payment tolerance (merchant auth required).
+    /// Tolerance is in smallest currency units. None means use global default.
+    /// Max tolerance is capped at 1% of payment amount to prevent abuse.
+    pub fn set_merchant_payment_tolerance(
+        env: Env,
+        merchant_id: Address,
+        tolerance: Option<i128>,
+    ) -> Result<(), MerchantError> {
+        merchant_id.require_auth();
+
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        
+        // Validate tolerance if provided
+        if let Some(t) = tolerance {
+            if t < 0 {
+                return Err(MerchantError::Unauthorized);
+            }
+        }
+        
+        merchant.payment_tolerance = tolerance;
+
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "TOLERANCE_UPDATED"),
+            ),
+            (merchant_id, tolerance.unwrap_or(0)),
+        );
+
+        Ok(())
+    }
+
+    /// Set the global default payment tolerance (admin only).
+    pub fn set_global_payment_tolerance(
+        env: Env,
+        admin: Address,
+        tolerance: i128,
+    ) -> Result<(), MerchantError> {
+        admin.require_auth();
+        
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
+        
+        if admin != stored_admin {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        if tolerance < 0 {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::GlobalPaymentTolerance, &tolerance);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "GLOBAL_TOLERANCE_UPDATED"),
+            ),
+            tolerance,
+        );
+
+        Ok(())
+    }
+
+    /// Get the global default payment tolerance.
+    pub fn get_global_payment_tolerance(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&MerchantDataKey::GlobalPaymentTolerance)
+            .unwrap_or(crate::PAYMENT_TOLERANCE)
+    }
+
     /// Get merchant info
     /// 
     /// This function automatically reinstates merchants whose suspension has expired.

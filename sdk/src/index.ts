@@ -29,8 +29,11 @@ import {
   PaymentLinkManagerClient,
   type PaymentLinkManagerConfig,
   type PaymentLink,
+  type LinkAnalytics,
   type CreateLinkParams,
 } from "./contracts/payment-link-manager.js";
+
+
 
 export interface FluxapayConfig {
   network: NetworkEnvironment;
@@ -682,7 +685,28 @@ export class FluxapayClient {
     return this.getPaymentLinkManager().verifyBatch(linkIds);
   }
 
+  /**
+   * Record a view of a payment link (permissionless).
+   * Maps to `PaymentLinkManager.record_link_view` on-chain.
+   * @param linkId - The payment link ID
+   */
+  async recordLinkView(linkId: string): Promise<void> {
+    return this.getPaymentLinkManager().recordLinkView(linkId);
+  }
+
+  /**
+   * Retrieve analytics for a payment link.
+   * Maps to `PaymentLinkManager.get_link_analytics` on-chain.
+   * @param linkId - The payment link ID
+   * @returns A promise resolving to the LinkAnalytics
+   */
+  async getLinkAnalytics(linkId: string): Promise<LinkAnalytics> {
+    return this.getPaymentLinkManager().getLinkAnalytics(linkId);
+  }
+
   /** Offline/hardware wallet payload builder utilities. */
+
+
   offlineSigner(): FluxapayOfflineSigner {
     return new FluxapayOfflineSigner(
       this.contract as import("./offline-signer.js").OfflineCapableClient,
@@ -732,5 +756,9 @@ export {
   PaymentLinkManagerClient,
   type PaymentLinkManagerConfig,
   type PaymentLink,
+  type LinkAnalytics,
   type CreateLinkParams,
 } from "./contracts/payment-link-manager.js";
+
+
+

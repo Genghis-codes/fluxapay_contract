@@ -4439,3 +4439,144 @@ fn test_admin_set_max_payment_duration() {
         assert_eq!(stored_max, new_max);
     });
 }
+
+#[test]
+fn test_create_payment_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_zero_amount");
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount: 0,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_negative_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_negative_amount");
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount: -1000i128,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_minimum_positive_amount_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_min_amount");
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount: 1, // Minimum valid amount (1 stroop)
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let payment = client.create_payment(&args);
+    assert_eq!(payment.amount, 1i128);
+}
+
+#[test]
+fn test_create_refund_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_for_refund");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = create_payment_args(&env, &payment_id, &merchant_id, amount);
+    let _ = client.create_payment(&args);
+
+    let requester = Address::generate(&env);
+    let result = client.try_create_refund(&payment_id, &0, &String::from_str(&env, "test"), &requester);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_dispute_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_for_dispute");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = create_payment_args(&env, &payment_id, &merchant_id, amount);
+    let _ = client.create_payment(&args);
+
+    let disputer = Address::generate(&env);
+    let result = client.try_create_dispute(
+        &payment_id,
+        &0,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, "QmHash1234567890"),
+        &disputer,
+        &vec![&env],
+    );
+    assert!(result.is_err());
+}

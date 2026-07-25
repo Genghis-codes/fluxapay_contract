@@ -1,4 +1,5 @@
 use soroban_sdk::{contracterror, contracttype, vec, Address, Env, String, Symbol, Vec};
+use crate::merchant_registry::KycTier;
 
 // Role-based access control implementation
 pub fn role_admin(env: &Env) -> Symbol {
@@ -66,6 +67,14 @@ pub enum AdminAction {
     RevokeRole(Symbol, Address),
     TransferAdmin(Address),
     EmergencyRevokeRole(Symbol, Address),
+    /// Set the global dispute bond amount (in stablecoin stroops).
+    SetDisputeBond(i128),
+    /// Set the monthly volume cap for a specific KYC tier (in stablecoin stroops).
+    SetVolumeCap(KycTier, i128),
+    /// Set the refund fee in basis points (e.g. 100 = 1%).
+    SetRefundFeeBps(i128),
+    /// Set the global payment creation rate limit: window_secs and max_per_window.
+    SetRateLimit(u32, u64),
 }
 
 #[contracttype]
@@ -231,7 +240,7 @@ impl AccessControl {
         Ok(())
     }
 
-    pub fn execute_proposal(env: &Env, nonce: u64) -> Result<(), AccessControlError> {
+    pub fn execute_proposal(env: &Env, nonce: u64) -> Result<Option<AdminAction>, AccessControlError> {
         let (threshold, _) = Self::get_multisig_config(env);
         let proposal: AdminProposal = env
             .storage()
@@ -240,7 +249,7 @@ impl AccessControl {
             .ok_or(AccessControlError::ProposalNotFound)?;
 
         let now = env.ledger().timestamp();
-        let expiry = proposal.created_at + 7 * 24 * 60 * 60;
+        let expiry = proposal.created_at + 48 * 60 * 60; // 48-hour expiry
         if now > expiry {
             return Err(AccessControlError::ProposalExpired);
         }
@@ -249,24 +258,27 @@ impl AccessControl {
             return Err(AccessControlError::ProposalThresholdNotMet);
         }
 
-        match &proposal.action {
+        let remaining_action = match &proposal.action {
             AdminAction::GrantRole(role, account) => {
                 if Self::has_role(env, role, account) {
                     return Err(AccessControlError::RoleAlreadyGranted);
                 }
                 Self::grant_role_internal(env, role, account);
+                None
             }
             AdminAction::RevokeRole(role, account) => {
                 if !Self::has_role(env, role, account) {
                     return Err(AccessControlError::RoleNotGranted);
                 }
                 Self::revoke_role_internal(env, role, account);
+                None
             }
             AdminAction::EmergencyRevokeRole(role, account) => {
                 if !Self::has_role(env, role, account) {
                     return Err(AccessControlError::RoleNotGranted);
                 }
                 Self::revoke_role_internal(env, role, account);
+                None
             }
             AdminAction::TransferAdmin(new_admin) => {
                 let old_admin = Self::get_admin(env).unwrap();
@@ -275,16 +287,22 @@ impl AccessControl {
                 env.storage()
                     .persistent()
                     .set(&AccessControlDataKey::Admin, new_admin);
+                None
             }
-            AdminAction::SetGlobalPause(_, _) => {}
-            AdminAction::AllowToken(_) => {}
-        }
+            AdminAction::SetGlobalPause(_, _) => Some(proposal.action.clone()),
+            AdminAction::AllowToken(_) => Some(proposal.action.clone()),
+            // New parameter-change actions: return to caller for dispatch
+            AdminAction::SetDisputeBond(_) => Some(proposal.action.clone()),
+            AdminAction::SetVolumeCap(_, _) => Some(proposal.action.clone()),
+            AdminAction::SetRefundFeeBps(_) => Some(proposal.action.clone()),
+            AdminAction::SetRateLimit(_, _) => Some(proposal.action.clone()),
+        };
 
         env.storage()
             .persistent()
             .remove(&AccessControlDataKey::Proposal(nonce));
 
-        Ok(())
+        Ok(remaining_action)
     }
     
     pub fn get_proposal(env: &Env, nonce: u64) -> Option<AdminProposal> {

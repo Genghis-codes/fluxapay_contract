@@ -55,10 +55,13 @@ pub mod fx_oracle;
 pub mod merchant_auth;
 use access_control::{
     role_admin, role_merchant, role_oracle, role_settlement_operator, role_arbitrator, AccessControl,
+    AdminAction, AdminProposal,
 };
 // Re-export for tests
 #[allow(unused_imports)]
 pub use access_control::AccessControlDataKey;
+#[allow(unused_imports)]
+pub use access_control::{AdminAction, AdminProposal};
 pub use dex_router::{DexRouter, DexRouterClient};
 pub use fx_oracle::{FXOracle, FXOracleClient, FXOracleError};
 pub use merchant_auth::{
@@ -105,6 +108,11 @@ pub struct PaymentCharge {
     pub fx_rate_at: Option<u64>,
     /// Arbitrary key-value metadata supplied by the merchant at creation time (max 20 keys, 256 chars per value).
     pub metadata: Option<Map<String, String>>,
+    /// Optional per-payment fee waiver code set at `create_payment` time.
+    /// If this code is valid (exists in the admin-managed fee waiver registry,
+    /// has not expired, and still has remaining uses), `settle_payment`
+    /// waives the platform fee and decrements `max_uses`.
+    pub fee_waiver_code: Option<String>,
 }
 
 #[contracttype]
@@ -284,6 +292,8 @@ pub enum Error {
     MemoTooLong = 51,
     /// Issue #397: Id memo is not parseable as a u64.
     InvalidMemoId = 52,
+    /// Issue #516: Payer address is not on the merchant's customer whitelist.
+    PayerNotWhitelisted = 53,
 }
 
 #[contracttype]
@@ -303,6 +313,12 @@ pub struct CreatePaymentArgs {
     pub metadata_hash: Option<BytesN<32>>,
     /// Arbitrary key-value metadata (max 20 keys, 256 chars per value).
     pub metadata: Option<Map<String, String>>,
+    /// Optional per-payment fee waiver code. If valid during settlement, the
+    /// platform fee is waived. `None` means no per-payment waiver request.
+    pub fee_waiver_code: Option<String>,
+    /// Customer/payer address, checked against the merchant's whitelist when
+    /// `Merchant.whitelist_mode` is enabled (issue #516).
+    pub payer: Option<Address>,
 }
 
 #[contracttype]
@@ -557,31 +573,24 @@ pub struct FeeProposal {
     pub proposed_at: u64,
 }
 
-/// Summary of a single payment for reconciliation reports.
+/// Admin-managed reusable fee-waiver code for per-payment zero-fee campaigns.
+///
+/// Stored under `DataKey::FeeWaiverCode(code)`. The settlement flow checks
+/// `PaymentCharge.fee_waiver_code` against this registry during
+/// `settle_payment`. When both the code is valid and uses remain, the
+/// platform fee is waived and `remaining_uses` is atomically decremented.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PaymentSummary {
-    pub payment_id: String,
-    pub amount: i128,
-    pub fee: i128,
-    pub refund_amount: i128,
-    pub status: PaymentStatus,
-    pub settled_at: Option<u64>,
-}
-
-/// Reconciliation report for a merchant over a time period.
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReconciliationReport {
-    pub merchant_id: Address,
-    pub period_start: u64,
-    pub period_end: u64,
-    pub payments: Vec<PaymentSummary>,
-    pub total_gross: i128,
-    pub total_fees: i128,
-    pub total_refunds: i128,
-    pub total_net_settled: i128,
-    pub dispute_adjustments: i128,
+pub struct FeeWaiverCodeRecord {
+    /// The code string itself, e.g. "LAUNCH2026".
+    pub code: String,
+    /// Ledger timestamp after which this code is no longer honored.
+    pub expires_at: u64,
+    /// Maximum total uses for this code. Must be >= 1 when created.
+    pub max_uses: u32,
+    /// Number of uses remaining; starts equal to `max_uses`, decremented by
+    /// `settle_payment` on each successful consumption.
+    pub remaining_uses: u32,
 }
 
 struct ReentrancyGuard<'a> {
@@ -669,6 +678,15 @@ pub enum DataKey {
     ContractVersion,
     /// Configurable settlement fee rate in basis points (issue: settle_payment fee).
     SettlementFeeRate,
+    /// Configurable dispute bond amount in stablecoin stroops (overrides DISPUTE_BOND_AMOUNT const).
+    DisputeBondAmount,
+    /// Configurable monthly volume cap per KYC tier in stablecoin stroops (overrides TIER_CAP_* const).
+    TierVolumeCap(KycTier),
+    /// Configurable refund fee in basis points (overrides REFUND_FEE_BPS const).
+    RefundFeeBps,
+    /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
+    /// Keyed by the code string itself.
+    FeeWaiverCode(String),
 }
 
 /// Default initial contract version string.
@@ -890,8 +908,9 @@ impl RefundManager {
         Ok(())
     }
 
-    /// Issue #168: Configure fee split destinations for refund fees.
+    /// Issue #168: Configure fee split destinations for platform fees.
     /// Admin can set allocation ratios and destination addresses.
+    /// `treasury_bps + developer_bps` must be ≤ 10 000; any remainder goes to treasury.
     pub fn configure_fee_split(
         env: Env,
         admin: Address,
@@ -901,13 +920,12 @@ impl RefundManager {
         developer_address: Address,
     ) -> Result<(), Error> {
         admin.require_auth();
-        
+
         if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
             return Err(Error::Unauthorized);
         }
 
-        // Validate that splits add up to 100%
-        if treasury_bps + developer_bps != 10_000 {
+        if treasury_bps.saturating_add(developer_bps) > 10_000 {
             return Err(Error::InvalidAmount);
         }
 
@@ -925,6 +943,35 @@ impl RefundManager {
         env.events().publish(
             (Symbol::new(&env, "FEE_SPLIT"), Symbol::new(&env, "CONFIGURED")),
             (treasury_bps, developer_bps),
+        );
+
+        Ok(())
+    }
+
+    /// Struct-based setter for the platform fee split config (alias for `configure_fee_split`).
+    /// Admin only. `config.treasury_bps + config.developer_bps` must be ≤ 10 000.
+    pub fn set_fee_split_config(
+        env: Env,
+        admin: Address,
+        config: FeeSplitConfig,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if config.treasury_bps.saturating_add(config.developer_bps) > 10_000 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeSplitConfig, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "FEE_SPLIT"), Symbol::new(&env, "CONFIGURED")),
+            (config.treasury_bps, config.developer_bps),
         );
 
         Ok(())
@@ -1013,6 +1060,7 @@ impl RefundManager {
                 fx_rate: None,
                 fx_rate_at: None,
                 metadata: None,
+                fee_waiver_code: None,
             };
             env.storage()
                 .persistent()
@@ -3562,6 +3610,7 @@ impl RefundManager {
                 fx_rate: None,
                 fx_rate_at: None,
                 metadata: None,
+                fee_waiver_code: None,
             };
 
             env.storage()
@@ -3843,6 +3892,60 @@ impl PaymentProcessor {
             .persistent()
             .get(&DataKey::TreasuryBalance)
             .unwrap_or(0)
+    }
+
+    /// Admin-only: register a reusable fee-waiver code for per-payment zero-fee
+    /// promotions.
+    ///
+    /// The code can be consumed at settlement via the `fee_waiver_code` field
+    /// on `PaymentCharge`. Each successful consumption atomically decrements
+    /// `remaining_uses`; when the counter reaches zero or `expires_at` is in
+    /// the past, the code is treated as invalid and normal fees apply.
+    ///
+    /// To immediately revoke a live code without waiting for expiry, pass
+    /// `max_uses = 0` (which will set `remaining_uses = 0` on overwrite).
+    ///
+    /// # Arguments
+    /// * `admin` – Must hold the admin role.
+    /// * `code`  – Arbitrary case-sensitive code string (e.g. "LAUNCH2026").
+    /// * `expires_at` – Unix ledger timestamp after which the code is invalid.
+    /// * `max_uses` – Maximum total payments that may use this code. Must be `>= 1`
+    ///   when creating a new code; may be `0` when revoking an existing one.
+    pub fn add_fee_waiver_code(
+        env: Env,
+        admin: Address,
+        code: String,
+        expires_at: u64,
+        max_uses: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidExpiry);
+        }
+        if max_uses == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let record = FeeWaiverCodeRecord {
+            code: code.clone(),
+            expires_at,
+            max_uses,
+            remaining_uses: max_uses,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FeeWaiverCode(code.clone()), &record);
+
+        env.events().publish(
+            (Symbol::new(&env, "FEE_WAIVER"), Symbol::new(&env, "CODE_ADDED")),
+            (code, expires_at, max_uses),
+        );
+
+        Ok(())
     }
 
     pub fn set_global_rate_limit(
@@ -4489,6 +4592,15 @@ impl PaymentProcessor {
                     {
                         return Err(Error::Unauthorized);
                     }
+
+                    // Issue #516: Enforce merchant whitelist mode against the payer.
+                    if merchant.whitelist_mode {
+                        let payer = args.payer.clone().ok_or(Error::PayerNotWhitelisted)?;
+                        match registry_client.try_is_customer_whitelisted(&args.merchant_id, &payer) {
+                            Ok(Ok(true)) => {}
+                            _ => return Err(Error::PayerNotWhitelisted),
+                        }
+                    }
                 }
                 _ => {
                     // If registry lookup fails, reject the payment
@@ -4587,6 +4699,7 @@ impl PaymentProcessor {
             fx_rate: None,
             fx_rate_at: None,
             metadata: args.metadata.clone(),
+            fee_waiver_code: args.fee_waiver_code.clone(),
         };
 
         env.storage()
@@ -4807,6 +4920,7 @@ impl PaymentProcessor {
                 fx_rate: None,
                 fx_rate_at: None,
                 metadata: args.metadata.clone(),
+                fee_waiver_code: None,
             };
 
             env.storage()
@@ -5434,42 +5548,195 @@ impl PaymentProcessor {
                 .get::<DataKey, Address>(&DataKey::UsdcToken)
         });
 
+        // ── Configurable settlement fee split (treasury + developer) ─────────────
+        let now = env.ledger().timestamp();
+
+        // ── Fee-waiver evaluation (merchant time-based + per-payment code) ────────
+        // We resolve whether a fee waiver applies BEFORE computing any fee values
+        // so the same decision is honored by both settlement-fee and merchant-fee
+        // code paths. The `fee_waiver_reason` below doubles as the reason string
+        // emitted in the `PAYMENT/FEE_WAIVED` event; `None` means no waiver.
+        //
+        // Per-payment codes take precedence over (and are evaluated independently
+        // of) the merchant-level time-based waiver. If both are present only the
+        // code is consumed (since its remaining_uses must be decremented) and the
+        // event reason reflects the code source.
+        let fee_waiver_reason: Option<String> = {
+            // 1. Per-payment code path (stronger: consumes uses if valid)
+            if let Some(ref code) = payment.fee_waiver_code {
+                let key = DataKey::FeeWaiverCode(code.clone());
+                if let Some(mut record) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, FeeWaiverCodeRecord>(&key)
+                {
+                    if now < record.expires_at && record.remaining_uses > 0 {
+                        record.remaining_uses = record.remaining_uses.saturating_sub(1);
+                        env.storage().persistent().set(&key, &record);
+                        Some(String::from_str(&env, "code_waiver:").concat(&code))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                // 2. Merchant-level time-based waiver (cheaper, no uses to track)
+                let registry_addr_opt = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress);
+                match registry_addr_opt {
+                    Some(registry_addr) => {
+                        use crate::merchant_registry::MerchantRegistryClient;
+                        let registry_client = MerchantRegistryClient::new(&env, &registry_addr);
+                        let merchant = registry_client.get_merchant(&payment.merchant_id);
+                        match merchant.fee_waiver_expires_at {
+                            Some(ts) if now < ts => {
+                                Some(String::from_str(&env, "merchant_waiver"))
+                            }
+                            _ => None,
+                        }
+                    }
+                    None => None,
+                }
+            }
+        };
+
+        // If any waiver resolved as active, emit the canonical PAYMENT/FEE_WAIVED
+        // event once here (both settlement code paths read from this event).
+        if let Some(ref reason) = fee_waiver_reason {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT"),
+                    Symbol::new(&env, "FEE_WAIVED"),
+                    payment.merchant_id.clone(),
+                ),
+                (payment_id.clone(), reason.clone()),
+            );
+        }
+
         // ── Configurable settlement fee (accumulated in TreasuryBalance) ─────────
         // Read the settlement fee rate in basis points. 0 bps → no fee, no event.
+        // Waived: if any fee waiver is active, settlement_fee is forced to 0
+        // regardless of global rate.
         let settlement_fee_bps: i128 = env
             .storage()
             .persistent()
             .get::<DataKey, i128>(&DataKey::SettlementFeeRate)
             .unwrap_or(0);
 
-        let settlement_fee: i128 = if settlement_fee_bps > 0 {
+        let settlement_fee: i128 = if fee_waiver_reason.is_some() {
+            0
+        } else if settlement_fee_bps > 0 {
             payment.amount * settlement_fee_bps / 10_000
         } else {
             0
         };
 
         if settlement_fee > 0 {
-            // Accumulate fee in TreasuryBalance (not forwarded immediately)
-            let current_treasury: i128 = env
+            // Check whether a FeeSplitConfig has been configured.
+            let fee_split_config: Option<FeeSplitConfig> = env
                 .storage()
                 .persistent()
-                .get::<DataKey, i128>(&DataKey::TreasuryBalance)
-                .unwrap_or(0);
-            env.storage()
-                .persistent()
-                .set(&DataKey::TreasuryBalance, &current_treasury.saturating_add(settlement_fee));
+                .get(&DataKey::FeeSplitConfig);
 
-            env.events().publish(
-                (
-                    Symbol::new(&env, "PAYMENT"),
-                    Symbol::new(&env, "FEE_COLLECTED"),
-                ),
-                (payment_id.clone(), payment.merchant_id.clone(), settlement_fee),
-            );
+            if let Some(ref fsc) = fee_split_config {
+                // Split the fee between treasury and developer.
+                // dev_amount = fee * developer_bps / 10000; treasury gets the remainder
+                // (including any rounding dust) so no tokens are lost.
+                let dev_amount: i128 =
+                    settlement_fee * fsc.developer_bps as i128 / 10_000;
+
+                // Rounding dust goes to treasury.
+                let treasury_total = settlement_fee.saturating_sub(dev_amount);
+
+                if let Some(ref st) = settlement_token {
+                    let token_client = token::TokenClient::new(&env, st);
+                    let from = env.current_contract_address();
+                    if treasury_total > 0 {
+                        let _ = token_client.try_transfer(
+                            &from,
+                            &fsc.treasury_address,
+                            &treasury_total,
+                        );
+                    }
+                    if dev_amount > 0 {
+                        let _ = token_client.try_transfer(
+                            &from,
+                            &fsc.developer_address,
+                            &dev_amount,
+                        );
+                    }
+                }
+
+                // Emit PAYMENT/FEE_SPLIT
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "PAYMENT"),
+                        Symbol::new(&env, "FEE_SPLIT"),
+                    ),
+                    (payment_id.clone(), treasury_total, dev_amount),
+                );
+            } else {
+                // No FeeSplitConfig — accumulate entire fee in TreasuryBalance (legacy path).
+                let current_treasury: i128 = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, i128>(&DataKey::TreasuryBalance)
+                    .unwrap_or(0);
+                env.storage().persistent().set(
+                    &DataKey::TreasuryBalance,
+                    &current_treasury.saturating_add(settlement_fee),
+                );
+
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "PAYMENT"),
+                        Symbol::new(&env, "FEE_COLLECTED"),
+                    ),
+                    (payment_id.clone(), payment.merchant_id.clone(), settlement_fee),
+                );
+            }
         }
 
         // Net amount after settlement fee
         let net_after_settlement_fee = payment.amount.saturating_sub(settlement_fee);
+
+        // ── Pre-lookup merchant AnchorConfig (SEP-6 / SEP-24) for fiat offramp ──
+        // The anchor config itself lives in MerchantRegistry. We fetch it once
+        // here so both settlement code paths can reuse it. `None` means the
+        // merchant has not configured an anchor (on-chain-only settlement).
+        let anchor_info: Option<(
+            String, // anchor_domain
+            String, // sep6_endpoint
+            String, // sep24_endpoint
+            Vec<String>, // supported_currencies
+            Option<Address>, // merchant payout address
+        )> = {
+            let registry_addr_opt = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress);
+            match registry_addr_opt {
+                Some(registry_addr) => {
+                    use crate::merchant_registry::{MerchantRegistryClient, MaybeAnchorConfig};
+                    let registry_client = MerchantRegistryClient::new(&env, &registry_addr);
+                    let merchant = registry_client.get_merchant(&payment.merchant_id);
+                    match merchant.anchor_config {
+                        MaybeAnchorConfig::Some(ref ac) => Some((
+                            ac.anchor_domain.clone(),
+                            ac.sep6_endpoint.clone(),
+                            ac.sep24_endpoint.clone(),
+                            ac.supported_currencies.clone(),
+                            merchant.payout_address.clone(),
+                        )),
+                        MaybeAnchorConfig::None => None,
+                    }
+                }
+                None => None,
+            }
+        };
 
         // Check if merchant registry is configured and merchant has FeeConfig
         let registry_address = env
@@ -5490,7 +5757,11 @@ impl PaymentProcessor {
                     let total_merchant_fee = fee_bps_amount.saturating_add(fixed_fee);
 
                     // Ensure fee doesn't exceed amount
-                    let actual_fee = if total_merchant_fee >= net_after_settlement_fee {
+                    // Waived: if a fee waiver is active, the merchant-level fee
+                    // is forced to zero (no treasury, no custom recipient transfer).
+                    let actual_fee = if fee_waiver_reason.is_some() {
+                        0
+                    } else if total_merchant_fee >= net_after_settlement_fee {
                         net_after_settlement_fee
                     } else {
                         total_merchant_fee
@@ -5545,12 +5816,46 @@ impl PaymentProcessor {
                         .set(&DataKey::Payment(payment_id.clone()), &payment);
                     Self::bump_payment_ttl(&env, &payment_id, &payment.status);
 
+                    // If merchant has AnchorConfig set, emit the
+                    // SETTLEMENT_ANCHOR_WITHDRAW event so the off-chain
+                    // Settlement Service can call the anchor's SEP-6 API.
+                    if let Some((
+                        ref anchor_domain,
+                        ref sep6_endpoint,
+                        ref sep24_endpoint,
+                        ref supported_currencies,
+                        ref merchant_payout_addr,
+                    )) = anchor_info
+                    {
+                        let payout_addr = merchant_payout_addr
+                            .clone()
+                            .unwrap_or_else(|| payment.merchant_id.clone());
+                        env.events().publish(
+                            (
+                                Symbol::new(&env, "PAYMENT"),
+                                Symbol::new(&env, "ANCHOR_WITHDRAW"),
+                                payment.merchant_id.clone(),
+                                anchor_domain.clone(),
+                            ),
+                            (
+                                payment_id.clone(),
+                                net_merchant_amount,
+                                payment.currency.clone(),
+                                payout_addr,
+                                sep6_endpoint.clone(),
+                                sep24_endpoint.clone(),
+                                supported_currencies.clone(),
+                                env.ledger().timestamp(),
+                            ),
+                        );
+                    }
+
                     return Ok(());
             }
         }
 
         // Original split-based settlement logic (no FeeConfig or no registry)
-        let (platform_fee, fee_recipient) = if let Some(registry_address) = env
+        let (mut platform_fee, fee_recipient) = if let Some(registry_address) = env
             .storage()
             .persistent()
             .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
@@ -5561,6 +5866,13 @@ impl PaymentProcessor {
         } else {
             (0i128, env.current_contract_address())
         };
+
+        // Waived: if a fee waiver is active, zero out the split-based platform
+        // fee too (matches the settlement_fee zeroing and FeeConfig actual_fee
+        // zeroing above).
+        if fee_waiver_reason.is_some() {
+            platform_fee = 0i128;
+        }
 
         let net_amount = net_after_settlement_fee - platform_fee;
 
@@ -5618,6 +5930,41 @@ impl PaymentProcessor {
             ),
             (payment_id.clone(), payment.amount),
         );
+
+        // If merchant has AnchorConfig set, emit the SETTLEMENT_ANCHOR_WITHDRAW
+        // event so the off-chain Settlement Service can call the anchor's
+        // SEP-6 withdrawal API. Mirrors the same emission in the FeeConfig
+        // settlement path above.
+        if let Some((
+            ref anchor_domain,
+            ref sep6_endpoint,
+            ref sep24_endpoint,
+            ref supported_currencies,
+            ref merchant_payout_addr,
+        )) = anchor_info
+        {
+            let payout_addr = merchant_payout_addr
+                .clone()
+                .unwrap_or_else(|| payment.merchant_id.clone());
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT"),
+                    Symbol::new(&env, "ANCHOR_WITHDRAW"),
+                    payment.merchant_id.clone(),
+                    anchor_domain.clone(),
+                ),
+                (
+                    payment_id.clone(),
+                    net_amount,
+                    payment.currency.clone(),
+                    payout_addr,
+                    sep6_endpoint.clone(),
+                    sep24_endpoint.clone(),
+                    supported_currencies.clone(),
+                    env.ledger().timestamp(),
+                ),
+            );
+        }
 
         Ok(())
     }
@@ -5832,6 +6179,7 @@ impl PaymentProcessor {
         let create_args = CreatePaymentArgs {
             payment_id: args.payment_id.clone(),
             merchant_id: args.merchant_id,
+            payer: None,
             amount: args.amount,
             currency: args.currency,
             deposit_address: args.deposit_address.clone(),
@@ -5843,6 +6191,7 @@ impl PaymentProcessor {
             client_token: None,
             metadata_hash: None,
             metadata: None,
+            fee_waiver_code: None,
         };
 
         let mut payment = Self::create_payment(env.clone(), create_args)?;
@@ -6459,6 +6808,173 @@ impl PaymentProcessor {
         );
 
         Ok(())
+    }
+
+    // =========================================================================
+    // Multi-sig admin proposal functions
+    // =========================================================================
+
+    /// Configure the multi-sig threshold and signer set.
+    /// Only the current admin may call this.
+    pub fn set_multisig_config(
+        env: Env,
+        admin: Address,
+        threshold: u32,
+        signers: Vec<Address>,
+    ) -> Result<(), Error> {
+        AccessControl::set_multisig_config(&env, admin, threshold, signers)
+            .map_err(|_| Error::AccessControlError)
+    }
+
+    /// Returns the current multi-sig (threshold, signers) configuration.
+    pub fn get_multisig_config(env: Env) -> (u32, Vec<Address>) {
+        AccessControl::get_multisig_config(&env)
+    }
+
+    /// Create a new admin proposal for a contract parameter change.
+    /// The calling signer must be in the multisig signer set.
+    /// Returns the proposal nonce.
+    pub fn create_proposal(
+        env: Env,
+        signer: Address,
+        action: AdminAction,
+    ) -> Result<u64, Error> {
+        AccessControl::create_proposal(&env, signer, action)
+            .map_err(|_| Error::AccessControlError)
+    }
+
+    /// Vote to approve an existing proposal.
+    /// The calling signer must be in the multisig signer set and must not have
+    /// already voted on this proposal.
+    pub fn vote_proposal(env: Env, signer: Address, nonce: u64) -> Result<(), Error> {
+        AccessControl::vote_proposal(&env, signer, nonce)
+            .map_err(|_| Error::AccessControlError)
+    }
+
+    /// Execute a proposal once the multisig threshold is met.
+    ///
+    /// * Proposals expire after 48 hours if the threshold is not reached.
+    /// * For parameter-change actions (`SetDisputeBond`, `SetVolumeCap`,
+    ///   `SetRefundFeeBps`, `SetRateLimit`) the new value is written to
+    ///   persistent storage and a `ADMIN/PROPOSAL_EXECUTED` event is emitted.
+    pub fn execute_proposal(env: Env, executor: Address, nonce: u64) -> Result<(), Error> {
+        executor.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &executor) {
+            return Err(Error::Unauthorized);
+        }
+
+        let remaining = AccessControl::execute_proposal(&env, nonce)
+            .map_err(|_| Error::AccessControlError)?;
+
+        let action_tag = if let Some(ref action) = remaining {
+            match action {
+                AdminAction::SetDisputeBond(amount) => {
+                    if *amount < 0 {
+                        return Err(Error::InvalidAmount);
+                    }
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::DisputeBondAmount, amount);
+                    Symbol::new(&env, "SET_DISPUTE_BOND")
+                }
+                AdminAction::SetVolumeCap(tier, cap) => {
+                    if *cap < 0 {
+                        return Err(Error::InvalidAmount);
+                    }
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::TierVolumeCap(tier.clone()), cap);
+                    Symbol::new(&env, "SET_VOLUME_CAP")
+                }
+                AdminAction::SetRefundFeeBps(bps) => {
+                    if *bps < 0 || *bps > 10_000 {
+                        return Err(Error::InvalidAmount);
+                    }
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::RefundFeeBps, bps);
+                    Symbol::new(&env, "SET_REFUND_FEE")
+                }
+                AdminAction::SetRateLimit(max_per_window, window_secs) => {
+                    let config = RateLimitConfig {
+                        window_secs: *window_secs,
+                        max_per_window: *max_per_window,
+                    };
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::GlobalRateLimit, &config);
+                    Symbol::new(&env, "SET_RATE_LIMIT")
+                }
+                AdminAction::SetGlobalPause(paused, _reason) => {
+                    let empty = String::from_str(&env, "multisig_proposal");
+                    let state = PauseState {
+                        paused: *paused,
+                        reason: empty,
+                        admin: Some(executor.clone()),
+                        timestamp: env.ledger().timestamp(),
+                    };
+                    env.storage().persistent().set(&DataKey::Paused, &state);
+                    Symbol::new(&env, "SET_GLOBAL_PAUSE")
+                }
+                AdminAction::AllowToken(token) => {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::AllowedToken(token.clone()), &true);
+                    Symbol::new(&env, "ALLOW_TOKEN")
+                }
+                _ => Symbol::new(&env, "EXECUTED"),
+            }
+        } else {
+            Symbol::new(&env, "EXECUTED")
+        };
+
+        // Emit ADMIN/PROPOSAL_EXECUTED event
+        env.events().publish(
+            (Symbol::new(&env, "ADMIN"), Symbol::new(&env, "PROPOSAL_EXECUTED")),
+            (nonce, action_tag, executor),
+        );
+
+        Ok(())
+    }
+
+    /// Retrieve a pending proposal by nonce.
+    pub fn get_proposal(env: Env, nonce: u64) -> Option<AdminProposal> {
+        AccessControl::get_proposal(&env, nonce)
+    }
+
+    /// Read the effective dispute bond amount (configurable via multi-sig proposal).
+    /// Falls back to the compile-time constant if not set via proposal.
+    pub fn get_dispute_bond_amount(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::DisputeBondAmount)
+            .unwrap_or(DISPUTE_BOND_AMOUNT)
+    }
+
+    /// Read the effective monthly volume cap for a KYC tier.
+    /// Falls back to compile-time constants if not overridden by a proposal.
+    pub fn get_tier_volume_cap(env: Env, tier: KycTier) -> i128 {
+        if let Some(cap) = env.storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::TierVolumeCap(tier.clone()))
+        {
+            return cap;
+        }
+        match tier {
+            KycTier::Unverified => TIER_CAP_UNVERIFIED,
+            KycTier::Basic => TIER_CAP_BASIC,
+            KycTier::Full => TIER_CAP_FULL,
+            KycTier::Business => TIER_CAP_BUSINESS,
+        }
+    }
+
+    /// Read the effective refund fee in basis points.
+    /// Falls back to the compile-time constant if not overridden by a proposal.
+    pub fn get_refund_fee_bps(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, i128>(&DataKey::RefundFeeBps)
+            .unwrap_or(REFUND_FEE_BPS)
     }
 }
 

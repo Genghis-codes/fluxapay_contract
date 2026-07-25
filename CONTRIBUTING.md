@@ -108,6 +108,8 @@ Or via Makefile:
 cd fluxapay && make fmt && cargo clippy --all-targets --all-features
 ```
 
+CI runs `cargo deny check bans licenses advisories` automatically in the `Security Scan` job (see `.github/workflows/ci.yml`), gated by `deny.toml`, and it must pass before the build job runs.
+
 ### Linting GitHub Actions Workflows (actionlint)
 
 We use [actionlint](https://github.com/rhysd/actionlint) to statically check all `.github/workflows/*.yml` files.

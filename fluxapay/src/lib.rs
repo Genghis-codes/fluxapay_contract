@@ -3341,12 +3341,13 @@ impl RefundManager {
                 env.events().publish(
                     (
                         Symbol::new(&env, "SUBSCRIPTION"),
-                        Symbol::new(&env, "CANCELLED"),
+                        Symbol::new(&env, "CANCELLED_MAX_RETRIES"),
                     ),
                     (
                         subscription_id.clone(),
                         payer.clone(),
                         subscription.retry_count,
+                        SUBSCRIPTION_MAX_RETRIES,
                     ),
                 );
 
@@ -3370,6 +3371,7 @@ impl RefundManager {
                         subscription_id,
                         payer,
                         subscription.retry_count,
+                        SUBSCRIPTION_MAX_RETRIES,
                         next_retry,
                     ),
                 );
@@ -3437,6 +3439,49 @@ impl RefundManager {
         env.events().publish(
             (Symbol::new(&env, "SUBSCRIPTION"), Symbol::new(&env, "CANCELLED")),
             (subscription_id, payer),
+        );
+
+        Ok(())
+    }
+
+    /// Admin override to reactivate a subscription that was cancelled due to max retries.
+    /// Resets retry_count to 0 and reschedules the next payment.
+    pub fn admin_reactivate_subscription(
+        env: Env,
+        admin: Address,
+        subscription_id: String,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut subscription = Self::get_subscription_internal(&env, &subscription_id)?;
+
+        if subscription.status != SubscriptionStatus::Cancelled {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        let now = env.ledger().timestamp();
+        subscription.status = SubscriptionStatus::Active;
+        subscription.retry_count = 0;
+        subscription.next_retry_at = None;
+        subscription.next_payment_at = now.saturating_add(subscription.interval_secs);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+        // Issue #302: Add back to ActiveSubscriptions index
+        Self::add_active_subscription(&env, &subscription_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "SUBSCRIPTION"),
+                Symbol::new(&env, "REACTIVATED"),
+            ),
+            (subscription_id, subscription.payer_address.clone()),
         );
 
         Ok(())

@@ -337,6 +337,9 @@ impl PaymentLinkManager {
             fx_rate: None,
             fx_rate_at: None,
             metadata: link.metadata.clone(),
+            fee_waiver_code: None,
+            retry_of_payment_id: None,
+            payer_muxed_id: None,
         };
 
         // Store the payment charge

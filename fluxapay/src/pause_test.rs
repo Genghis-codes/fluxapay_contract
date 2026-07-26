@@ -51,6 +51,7 @@ fn test_global_pause_blocks_creation() {
     let res = client.try_create_payment(&CreatePaymentArgs {
         payment_id: String::from_str(&env, "p1"),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 100,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -60,6 +61,8 @@ fn test_global_pause_blocks_creation() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     });
 
     assert!(res.is_err());
@@ -95,6 +98,7 @@ fn test_creation_pause_blocks_only_creation() {
     let res = client.try_create_payment(&CreatePaymentArgs {
         payment_id: String::from_str(&env, "p1"),
         merchant_id: merchant.clone(),
+        payer: None,
         amount: 100,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -104,6 +108,8 @@ fn test_creation_pause_blocks_only_creation() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None, metadata: None,
+        fee_waiver_code: None,
     });
     assert!(res.is_err());
 
@@ -121,4 +127,102 @@ fn test_creation_pause_blocks_only_creation() {
     if let Err(Ok(crate::Error::ContractPaused)) = res_verify {
         panic!("Should not be blocked by pause");
     }
+}
+
+#[test]
+fn test_all_write_ops_blocked_when_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let merchant = Address::generate(&env);
+    let operator = Address::generate(&env);
+    let requester = Address::generate(&env);
+    let processor_id = env.register(crate::PaymentProcessor, ());
+    let client = PaymentProcessorClient::new(&env, &processor_id);
+    let admin = Address::generate(&env);
+
+    client.initialize_payment_processor(&admin);
+
+    // Grant roles
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+    client.grant_role(&admin, &Symbol::new(&env, "SETTLEMENT_OPERATOR"), &operator);
+
+    // Create a payment first (before pause)
+    let payment_id = String::from_str(&env, "pay1");
+    let deposit = Address::generate(&env);
+    let _ = client.create_payment(&CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 1000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit.clone(),
+        expires_at: None,
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    });
+
+    // Set global pause
+    let reason = String::from_str(&env, "Emergency pause");
+    client.set_global_pause(&admin, &true, &reason);
+
+    // Test settle_payment is blocked
+    let settle_res = client.try_settle_payment(
+        &operator,
+        &payment_id,
+        &vec![&env],
+    );
+    assert!(settle_res.is_err(), "settle_payment should be blocked by pause");
+
+    // Test process_refund is blocked (after creating a refund)
+    let _ = client.try_create_refund(
+        &requester,
+        &payment_id,
+        &100,
+        &String::from_str(&env, "Too much paid"),
+    );
+    let refund_id = String::from_str(&env, "ref1");
+    let process_res = client.try_process_refund(&operator, &refund_id);
+    assert!(process_res.is_err(), "process_refund should be blocked by pause");
+
+    // Test create_dispute is blocked
+    let dispute_res = client.try_create_dispute(
+        &payment_id,
+        &100,
+        &String::from_str(&env, "Disputed"),
+        &String::from_str(&env, "Evidence"),
+        &requester,
+        &vec![&env],
+    );
+    assert!(dispute_res.is_err(), "create_dispute should be blocked by pause");
+
+    // Test batch_expire_payments is blocked
+    let expire_res = client.try_batch_expire_payments(&vec![&env, &payment_id]);
+    assert!(expire_res.is_err(), "batch_expire_payments should be blocked by pause");
+
+    // Test swap_and_pay is blocked
+    let swap_res = client.try_swap_and_pay(&crate::SwapAndPayArgs {
+        payer: Address::generate(&env),
+        payment_id: String::from_str(&env, "pay2"),
+        merchant_id: merchant.clone(),
+        amount: 500,
+        amount_in: 600,
+        amount_out_min: 500,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit.clone(),
+        expires_at: None,
+        token_in: Address::generate(&env),
+        path: vec![&env],
+        dex_router: Address::generate(&env),
+        fx_oracle: None,
+        oracle_pair: None,
+        max_deviation_bps: 100,
+    });
+    assert!(swap_res.is_err(), "swap_and_pay should be blocked by pause");
 }

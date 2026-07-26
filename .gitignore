@@ -10,6 +10,9 @@ fluxapay/test_snapshots
 .soroban
 .stellar
 
+# Git worktrees (linked checkouts — never commit these)
+.worktrees/
+
 # Environment variables (do not commit secrets)
 .env
 .env.local
@@ -18,3 +21,6 @@ fluxapay/test_snapshots
 node_modules
 dist
 package-lock.json
+
+# actionlint binary (installed at CI runtime via rhysd/actionlint action)
+/actionlint

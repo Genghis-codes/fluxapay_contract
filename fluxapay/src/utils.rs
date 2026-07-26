@@ -1,4 +1,98 @@
-use soroban_sdk::{Bytes, Env, String};
+use soroban_sdk::{Bytes, Env, Map, String};
+
+/// Maximum number of key/value pairs allowed in payment/link metadata.
+pub const MAX_METADATA_KEYS: u32 = 20;
+/// Maximum length of a metadata key (characters).
+pub const MAX_METADATA_KEY_LEN: u32 = 64;
+/// Maximum length of a metadata value (characters).
+pub const MAX_METADATA_VALUE_LEN: u32 = 256;
+
+/// Validate metadata map size and key/value length limits.
+///
+/// Limits: ≤20 keys, each key ≤64 chars, each value ≤256 chars.
+pub fn validate_metadata(meta_map: &Map<String, String>) -> Result<(), crate::Error> {
+    if meta_map.len() > MAX_METADATA_KEYS {
+        return Err(crate::Error::MetadataTooLarge);
+    }
+    for (key, value) in meta_map.iter() {
+        if key.len() > MAX_METADATA_KEY_LEN || value.len() > MAX_METADATA_VALUE_LEN {
+            return Err(crate::Error::MetadataValueTooLong);
+        }
+    }
+    Ok(())
+}
+
+/// Validates that a string is a valid IPFS multihash (CIDv0 or CIDv1).
+///
+/// CIDv0: Base58-encoded SHA2-256 multihash, always starts with "Qm" and is 46 chars.
+/// CIDv1: Multibase-encoded, typically starts with "bafy" (base32 SHA2-256) and is ≥ 59 chars.
+///
+/// This performs a lightweight structural check (prefix + length) without
+/// a full base58/base32 decode, which is not feasible in `no_std` without
+/// additional crates.
+pub fn validate_ipfs_multihash(s: &String) -> bool {
+    let len = s.len() as usize;
+
+    // Need at least 4 bytes to check prefix
+    if len < 4 {
+        return false;
+    }
+
+    let mut buf = [0u8; 64];
+    let read_len = len.min(64);
+    s.copy_into_slice(&mut buf[..read_len]);
+
+    // CIDv0: starts with "Qm" and is exactly 46 characters
+    if buf[0] == b'Q' && buf[1] == b'm' {
+        return len == 46;
+    }
+
+    // CIDv1 base32 (most common): starts with "bafy" and is at least 59 characters
+    if buf[0] == b'b'
+        && buf[1] == b'a'
+        && buf[2] == b'f'
+        && buf[3] == b'y'
+    {
+        return len >= 59;
+    }
+
+    // CIDv1 base32 upper: starts with "BAFY"
+    if buf[0] == b'B'
+        && buf[1] == b'A'
+        && buf[2] == b'F'
+        && buf[3] == b'Y'
+    {
+        return len >= 59;
+    }
+
+    // CIDv1 base16 (hex): starts with "f" followed by hex digits, at least 34 chars
+    if buf[0] == b'f' && len >= 34 {
+        return true;
+    }
+
+    false
+}
+
+/// Validates a user-supplied ID (payment_id, dispute_id, etc.).
+///
+/// Rules (issue #404):
+/// - Length: 3–64 characters (inclusive)
+/// - Allowed characters: ASCII alphanumeric, `-`, `_`
+pub fn validate_id(s: &String) -> bool {
+    let len = s.len() as usize;
+    if len < 3 || len > 64 {
+        return false;
+    }
+    let mut buf = [0u8; 64];
+    s.copy_into_slice(&mut buf[..len]);
+    for b in buf[..len].iter() {
+        let valid = b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_';
+        if !valid {
+            return false;
+        }
+    }
+    true
+}
 
 /// Converts a `u64` counter to a Soroban `String` with the given prefix.
 ///
@@ -30,6 +124,23 @@ pub fn format_id(env: &Env, prefix: &str, n: u64) -> String {
     // Copy into a fixed-size slice and convert to Soroban String
     let mut arr = [0u8; 64];
     let final_len = result.len().min(64);
+    for i in 0..final_len {
+        arr[i as usize] = result.get(i).unwrap();
+    }
+    String::from_bytes(env, &arr[..final_len as usize])
+}
+
+/// Concatenate Soroban strings (used for shareable payment URLs).
+pub fn concat_strings(env: &Env, parts: &[String]) -> String {
+    let mut result = Bytes::new(env);
+    for part in parts {
+        let bytes = part.to_bytes();
+        for i in 0..bytes.len() {
+            result.push_back(bytes.get(i).unwrap());
+        }
+    }
+    let final_len = result.len().min(512);
+    let mut arr = [0u8; 512];
     for i in 0..final_len {
         arr[i as usize] = result.get(i).unwrap();
     }

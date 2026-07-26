@@ -4,6 +4,8 @@
 fluxapay/src/access_control.rs   @MetroLogic/security-reviewers
 fluxapay/src/lib.rs              @MetroLogic/security-reviewers
 fluxapay/src/merchant_registry.rs @MetroLogic/security-reviewers
+audits/                            @MetroLogic/security-reviewers
+SECURITY.md                        @MetroLogic/security-reviewers
 
 # Catch-all for other files
 *                                @MetroLogic/core-maintainers

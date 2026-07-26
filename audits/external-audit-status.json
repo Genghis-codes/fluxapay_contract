@@ -1,0 +1,17 @@
+{
+  "external_audit": {
+    "status": "pending_engagement",
+    "auditor": null,
+    "engagement_signed": false,
+    "scope_document": "audits/SCOPE.md",
+    "audit_start_date": null,
+    "audit_complete": false,
+    "report_published": false,
+    "report_url": null,
+    "critical_findings_resolved": false,
+    "high_findings_resolved": false,
+    "bug_bounty_launched": false,
+    "bug_bounty_url": null,
+    "notes": "Update this file when engagement is signed and again when the audit completes. Mainnet CD is blocked until audit_complete, critical_findings_resolved, and high_findings_resolved are all true."
+  }
+}

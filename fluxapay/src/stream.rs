@@ -1,10 +1,37 @@
 use soroban_sdk::{
-    contracterror, contracttype, token, Address, Env, String, Symbol, Vec,
+    contract, contractimpl, contracterror, contracttype, token, Address, Env, String, Symbol, Vec,
 };
 
 use crate::PaymentProcessor;
 
 // ─── Data types ───────────────────────────────────────────────────────────────
+
+/// Pure accrual computation (lazy formula with saturating arithmetic).
+///
+/// `total = min(deposit, checkpoint + (now - last_checkpoint) * rate)`
+pub fn compute_total_accrued(
+    accrued_at_checkpoint: i128,
+    last_checkpoint_at: u64,
+    now: u64,
+    rate_per_second: i128,
+    remaining_deposit: i128,
+) -> i128 {
+    let rate = rate_per_second.max(0);
+    let deposit = remaining_deposit.max(0);
+    let elapsed = now.saturating_sub(last_checkpoint_at);
+    let newly_accrued = (elapsed as i128).saturating_mul(rate);
+    accrued_at_checkpoint
+        .saturating_add(newly_accrued)
+        .min(deposit)
+        .max(0)
+}
+
+/// Remaining deposit after a withdrawal; never negative.
+pub fn compute_remaining_after_withdraw(remaining_deposit: i128, withdraw_amount: i128) -> i128 {
+    remaining_deposit
+        .saturating_sub(withdraw_amount.max(0))
+        .max(0)
+}
 
 /// Status of a payment stream.
 #[contracttype]
@@ -16,6 +43,8 @@ pub enum StreamStatus {
     Cancelled,
     /// Deposit was fully drained; stream reached its natural end.
     Exhausted,
+    /// Stream is temporarily paused; accrual is frozen until resumed.
+    Paused,
 }
 
 /// A continuous payment stream from `sender` to `receiver`.
@@ -39,6 +68,8 @@ pub struct PaymentStream {
     pub token: Address,
     /// Current flow rate in the smallest token unit per second.
     pub rate_per_second: i128,
+    /// Minimum allowed rate per second for this stream; prevents rate from falling below this.
+    pub min_rate_per_second: i128,
     /// Total deposit locked in this contract on behalf of the stream.
     pub remaining_deposit: i128,
     /// Ledger timestamp of the last checkpoint.
@@ -53,12 +84,16 @@ pub struct PaymentStream {
     /// When false, distributions (withdrawals) are locked until the sender
     /// explicitly approves milestones for this stream.
     pub milestones_approved: bool,
+    /// Floor for [`PaymentStreaming::decrease_rate_per_second`]; defaults to
+    /// `0` (no minimum) unless set via `set_stream_min_rate`.
+    pub min_rate_per_second: i128,
 }
 
 /// Storage key for a [`PaymentStream`].
 #[contracttype]
 pub enum StreamDataKey {
     Stream(String),
+    StreamFeeBps,
 }
 
 #[contracttype]
@@ -97,6 +132,12 @@ pub enum StreamError {
     MilestoneNotApproved = 10,
     /// Withdrawal already in progress (reentrancy guard).
     WithdrawalInProgress = 11,
+    /// The new rate is below the minimum allowed rate for this stream.
+    RateBelowMinimum = 12,
+    /// Stream is not paused.
+    StreamNotPaused = 13,
+    /// Receiver address cannot be the same as sender address.
+    InvalidReceiver = 14,
 }
 
 /// Storage key for the per-stream withdrawal reentrancy lock.
@@ -125,6 +166,22 @@ fn require_not_paused(env: &Env) -> Result<(), StreamError> {
         return Err(StreamError::ContractPaused);
     }
     Ok(())
+}
+
+fn get_stream_fee_bps(env: &Env) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&StreamDataKey::StreamFeeBps)
+        .unwrap_or(0i128)
+}
+
+/// Compute fee and net amounts: returns (fee, net).
+fn apply_fee(amount: i128, fee_bps: i128) -> (i128, i128) {
+    if fee_bps <= 0 {
+        return (0, amount);
+    }
+    let fee = amount * fee_bps / 10_000;
+    (fee, amount - fee)
 }
 
 fn get_sender_stream_count(env: &Env, sender: &Address) -> u32 {
@@ -179,15 +236,33 @@ fn get_recipient_stream_id(env: &Env, recipient: &Address, idx: u32) -> Option<S
 
 // ─── Implementation ───────────────────────────────────────────────────────────
 // PaymentStreaming is an internal helper called by PaymentProcessor.
-// It is NOT a standalone #[contract] — that would duplicate exported symbols.
+// #[contract] marks it so testutils can register it; #[contractimpl] is
+// conditional to avoid duplicate exported symbols in the PaymentProcessor WASM.
 
+#[contract]
 pub struct PaymentStreaming;
 
+#[cfg_attr(
+    any(not(target_arch = "wasm32"), feature = "contract-payment-streaming"),
+    contractimpl
+)]
 #[allow(deprecated)] // events::publish — migrate to #[contractevent] in a follow-up
 impl PaymentStreaming {
     /// Contract version bump helper.
     pub fn version() -> u32 {
         1
+    }
+
+    /// Set the platform fee in basis points applied to stream withdrawals.
+    /// Admin auth is enforced by the caller (PaymentProcessor).
+    pub fn set_stream_fee_bps(env: Env, fee_bps: i128) {
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::StreamFeeBps, &fee_bps);
+    }
+
+    pub fn get_stream_fee_bps(env: Env) -> i128 {
+        get_stream_fee_bps(&env)
     }
 
     // ─── Stream creation ──────────────────────────────────────────────────────
@@ -212,8 +287,12 @@ impl PaymentStreaming {
         rate_per_second: i128,
         deposit: i128,
         stream_id: String,
+        min_rate: Option<i128>,
     ) -> Result<PaymentStream, StreamError> {
         sender.require_auth();
+        if sender == receiver {
+            return Err(StreamError::InvalidReceiver);
+        }
 
         if rate_per_second <= 0 {
             return Err(StreamError::InvalidRate);
@@ -230,6 +309,7 @@ impl PaymentStreaming {
         }
 
         let now = env.ledger().timestamp();
+        let min_rate_per_second = min_rate.unwrap_or(1);
         let stream = PaymentStream {
             stream_id: stream_id.clone(),
             sender,
@@ -237,11 +317,14 @@ impl PaymentStreaming {
             destination: None,
             token: token.clone(),
             rate_per_second,
+            min_rate_per_second,
             remaining_deposit: deposit,
             last_checkpoint_at: now,
             accrued_at_checkpoint: 0,
             status: StreamStatus::Active,
             milestones_approved: false,
+            min_rate_per_second: 0,
+            milestones_approved: true,
         };
 
         // Persist state before interaction (reentrancy protection)
@@ -256,12 +339,8 @@ impl PaymentStreaming {
         token_client.transfer(&stream.sender, env.current_contract_address(), &deposit);
 
         env.events().publish(
-            (
-                Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "CREATED"),
-                stream_id.clone(),
-            ),
-            (stream.sender.clone(), stream.receiver.clone(), deposit),
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CREATED")),
+            (stream_id.clone(), stream.sender.clone(), stream.receiver.clone(), deposit),
         );
 
         Ok(stream)
@@ -295,6 +374,9 @@ impl PaymentStreaming {
         if stream.status != StreamStatus::Active {
             return Err(StreamError::StreamNotActive);
         }
+        if stream.sender == destination {
+            return Err(StreamError::InvalidReceiver);
+        }
 
         stream.destination = Some(destination.clone());
 
@@ -303,12 +385,8 @@ impl PaymentStreaming {
             .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
 
         env.events().publish(
-            (
-                Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "DESTINATION_SET"),
-                stream_id,
-            ),
-            (recipient, destination),
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "DESTINATION_SET")),
+            (stream_id, recipient, destination),
         );
 
         Ok(())
@@ -338,13 +416,77 @@ impl PaymentStreaming {
             .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
 
         env.events().publish(
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "MILESTONE_APPROVED")),
+            (stream_id, sender),
+        );
+
+        Ok(())
+    }
+
+    /// Sender revokes a previous milestone approval, re-locking distributions
+    /// until `approve_stream_milestone` is called again.
+    pub fn revoke_stream_milestone(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+
+        stream.milestones_approved = false;
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        env.events().publish(
             (
                 Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "MILESTONE_APPROVED"),
+                Symbol::new(&env, "MILESTONE_REVOKED"),
                 stream_id,
             ),
             (sender,),
         );
+
+        Ok(())
+    }
+
+    /// Sender sets a floor below which [`Self::decrease_rate_per_second`] will
+    /// refuse to lower the stream's rate.
+    pub fn set_stream_min_rate(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        min_rate_per_second: i128,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        if min_rate_per_second < 0 {
+            return Err(StreamError::InvalidRate);
+        }
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+
+        stream.min_rate_per_second = min_rate_per_second;
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
 
         Ok(())
     }
@@ -396,6 +538,10 @@ impl PaymentStreaming {
         }
         if new_rate >= stream.rate_per_second {
             return Err(StreamError::RateNotDecreased);
+        }
+        if new_rate < stream.min_rate_per_second {
+            return Err(StreamError::InvalidRate);
+            return Err(StreamError::RateBelowMinimum);
         }
 
         let now = env.ledger().timestamp();
@@ -456,12 +602,8 @@ impl PaymentStreaming {
 
         // ── Step 3: Emit RateDecreased event ─────────────────────────────────
         env.events().publish(
-            (
-                Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "RATE_DECREASED"),
-                stream_id,
-            ),
-            (sender, old_rate, new_rate, surplus),
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "RATE_DECREASED")),
+            (stream_id, sender, old_rate, new_rate, surplus),
         );
 
         Ok(())
@@ -492,14 +634,13 @@ impl PaymentStreaming {
         }
 
         let now = env.ledger().timestamp();
-        let elapsed = now.saturating_sub(stream.last_checkpoint_at);
-        let newly_accrued = (elapsed as i128).saturating_mul(stream.rate_per_second);
-        let total = stream
-            .accrued_at_checkpoint
-            .saturating_add(newly_accrued)
-            .min(stream.remaining_deposit);
-
-        Ok(total)
+        Ok(compute_total_accrued(
+            stream.accrued_at_checkpoint,
+            stream.last_checkpoint_at,
+            now,
+            stream.rate_per_second,
+            stream.remaining_deposit,
+        ))
     }
 
     /// Query streams created by the given sender.
@@ -599,16 +740,19 @@ impl PaymentStreaming {
                 // Reentrancy guard: lock acquired after state is persisted
                 acquire_lock(&env, &stream_id)?;
                 let token_client = token::Client::new(&env, &stream.token);
-                token_client.transfer(&env.current_contract_address(), &recipient, &withdrawable);
+                let fee_bps = get_stream_fee_bps(&env);
+                let (fee, net) = apply_fee(withdrawable, fee_bps);
+                if fee > 0 {
+                    if let Some(admin) = crate::access_control::AccessControl::get_admin(&env) {
+                        token_client.transfer(&env.current_contract_address(), &admin, &fee);
+                    }
+                }
+                token_client.transfer(&env.current_contract_address(), &recipient, &net);
                 release_lock(&env, &stream_id);
 
                 env.events().publish(
-                    (
-                        Symbol::new(&env, "STREAM"),
-                        Symbol::new(&env, "WITHDRAWN"),
-                        stream_id.clone(),
-                    ),
-                    (recipient.clone(), recipient.clone(), withdrawable),
+                    (Symbol::new(&env, "STREAM"), Symbol::new(&env, "WITHDRAWN")),
+                    (stream_id.clone(), recipient.clone(), recipient.clone(), withdrawable, stream.remaining_deposit),
                 );
 
                 processed.push_back(stream_id);
@@ -679,17 +823,20 @@ impl PaymentStreaming {
             .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
 
         let token_client = token::Client::new(&env, &stream.token);
-        token_client.transfer(&env.current_contract_address(), &destination, &withdrawable);
+        let fee_bps = get_stream_fee_bps(&env);
+        let (fee, net) = apply_fee(withdrawable, fee_bps);
+        if fee > 0 {
+            if let Some(admin) = crate::access_control::AccessControl::get_admin(&env) {
+                token_client.transfer(&env.current_contract_address(), &admin, &fee);
+            }
+        }
+        token_client.transfer(&env.current_contract_address(), &destination, &net);
 
         release_lock(&env, &stream_id);
 
         env.events().publish(
-            (
-                Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "WITHDRAWN"),
-                stream_id.clone(),
-            ),
-            (stream.receiver.clone(), destination.clone(), withdrawable),
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "WITHDRAWN")),
+            (stream_id.clone(), stream.receiver.clone(), destination.clone(), withdrawable, stream.remaining_deposit),
         );
 
         Ok(stream_id)
@@ -711,45 +858,59 @@ impl PaymentStreaming {
 
         for top_up in top_ups.iter() {
             let (stream_id, amount) = top_up;
-            if amount <= 0 {
-                return Err(StreamError::InvalidDeposit);
-            }
-
-            let mut stream: PaymentStream = env
-                .storage()
-                .persistent()
-                .get(&StreamDataKey::Stream(stream_id.clone()))
-                .ok_or(StreamError::StreamNotFound)?;
-
-            if stream.sender != sender {
-                return Err(StreamError::Unauthorized);
-            }
-            if stream.status != StreamStatus::Active {
-                return Err(StreamError::StreamNotActive);
-            }
-
-            // Effects
-            stream.remaining_deposit = stream.remaining_deposit.saturating_add(amount);
-
-            // Persist state before interaction
-            env.storage()
-                .persistent()
-                .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
-
-            // Interaction
-            let token_client = token::Client::new(&env, &stream.token);
-            token_client.transfer(&sender, env.current_contract_address(), &amount);
-
-            // Event
-            env.events().publish(
-                (
-                    Symbol::new(&env, "STREAM"),
-                    Symbol::new(&env, "TOPPED_UP"),
-                    stream_id,
-                ),
-                (sender.clone(), amount),
-            );
+            Self::top_up_stream_internal(&env, &sender, &stream_id, amount)?;
         }
+
+        Ok(())
+    }
+
+    pub fn top_up_stream(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        amount: i128,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        Self::top_up_stream_internal(&env, &sender, &stream_id, amount)
+    }
+
+    fn top_up_stream_internal(
+        env: &Env,
+        sender: &Address,
+        stream_id: &String,
+        amount: i128,
+    ) -> Result<(), StreamError> {
+        if amount <= 0 {
+            return Err(StreamError::InvalidDeposit);
+        }
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != *sender {
+            return Err(StreamError::Unauthorized);
+        }
+        if stream.status != StreamStatus::Active {
+            return Err(StreamError::StreamNotActive);
+        }
+
+        stream.remaining_deposit = stream.remaining_deposit.saturating_add(amount);
+
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        let token_client = token::Client::new(env, &stream.token);
+        token_client.transfer(sender, env.current_contract_address(), &amount);
+
+        env.events().publish(
+            (Symbol::new(env, "STREAM"), Symbol::new(env, "TOPPED_UP")),
+            (stream_id.clone(), sender.clone(), amount),
+        );
 
         Ok(())
     }
@@ -810,12 +971,95 @@ impl PaymentStreaming {
         }
 
         env.events().publish(
-            (
-                Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "CANCELLED"),
-                stream_id,
-            ),
-            (sender, accrued, refund),
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CANCELLED")),
+            (stream_id, sender, accrued, refund),
+        );
+
+        Ok(())
+    }
+
+    /// Pause an active stream, freezing accrual until resumed.
+    ///
+    /// Accrued tokens are check-pointed at the current timestamp so that
+    /// earnings up to this moment are preserved. Only the stream sender may
+    /// pause.
+    ///
+    /// # Parameters
+    /// * `sender`    – Must be the original stream sender; must sign.
+    /// * `stream_id` – Stream to pause.
+    pub fn pause_stream(env: Env, sender: Address, stream_id: String) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+        if stream.status != StreamStatus::Active {
+            return Err(StreamError::StreamNotActive);
+        }
+
+        // Checkpoint accrued amount up to now before freezing.
+        let now = env.ledger().timestamp();
+        let elapsed = now.saturating_sub(stream.last_checkpoint_at);
+        let newly_accrued = (elapsed as i128)
+            .saturating_mul(stream.rate_per_second)
+            .min(stream.remaining_deposit - stream.accrued_at_checkpoint);
+        stream.accrued_at_checkpoint = stream.accrued_at_checkpoint.saturating_add(newly_accrued);
+        stream.last_checkpoint_at = now;
+
+        stream.status = StreamStatus::Paused;
+
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        env.events().publish(
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "PAUSED")),
+            (stream_id, sender),
+        );
+
+        Ok(())
+    }
+
+    /// Resume a paused stream, restarting accrual from the current timestamp.
+    ///
+    /// Only the stream sender may resume.
+    ///
+    /// # Parameters
+    /// * `sender`    – Must be the original stream sender; must sign.
+    /// * `stream_id` – Stream to resume.
+    pub fn resume_stream(env: Env, sender: Address, stream_id: String) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+        if stream.status != StreamStatus::Paused {
+            return Err(StreamError::StreamNotPaused);
+        }
+
+        // Reset checkpoint to now so accrual restarts from this moment.
+        stream.last_checkpoint_at = env.ledger().timestamp();
+        stream.status = StreamStatus::Active;
+
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        env.events().publish(
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "RESUMED")),
+            (stream_id, sender),
         );
 
         Ok(())
@@ -880,12 +1124,8 @@ impl PaymentStreaming {
             }
 
             env.events().publish(
-                (
-                    Symbol::new(&env, "STREAM"),
-                    Symbol::new(&env, "CANCELLED"),
-                    stream_id.clone(),
-                ),
-                (sender.clone(), accrued, refund),
+                (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CANCELLED")),
+                (stream_id.clone(), sender.clone(), accrued, refund),
             );
 
             cancelled.push_back(stream_id);
@@ -977,12 +1217,8 @@ impl PaymentStreaming {
         }
 
         env.events().publish(
-            (
-                Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "RATE_UPDATED"),
-                stream_id,
-            ),
-            (sender, old_rate, new_rate, surplus),
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "RATE_UPDATED")),
+            (stream_id, sender, old_rate, new_rate, surplus),
         );
 
         Ok(())
@@ -1026,15 +1262,13 @@ impl PaymentStreaming {
             .remove(&StreamDataKey::Stream(stream_id.clone()));
 
         env.events().publish(
-            (
-                Symbol::new(&env, "STREAM"),
-                Symbol::new(&env, "CLOSED"),
-                stream_id,
-            ),
-            (stream.sender, stream.receiver, residual),
+            (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CLOSED")),
+            (stream_id, stream.sender, stream.receiver, residual),
         );
 
         Ok(())
+    }
+
     /// Cancel up to `MAX_BATCH_CANCEL` streams in a single transaction, skipping
     /// streams that are not active or not owned by `sender` instead of aborting.
     /// Returns the list of successfully cancelled stream IDs.
@@ -1092,12 +1326,8 @@ impl PaymentStreaming {
             }
 
             env.events().publish(
-                (
-                    Symbol::new(&env, "STREAM"),
-                    Symbol::new(&env, "CANCELLED"),
-                    stream_id.clone(),
-                ),
-                (sender.clone(), accrued, refund),
+                (Symbol::new(&env, "STREAM"), Symbol::new(&env, "CANCELLED")),
+                (stream_id.clone(), sender.clone(), accrued, refund),
             );
 
             cancelled.push_back(stream_id);
@@ -1174,19 +1404,22 @@ impl PaymentStreaming {
 
             // Interaction
             let token_client = token::Client::new(&env, &stream.token);
+            let fee_bps = get_stream_fee_bps(&env);
+            let (fee, net) = apply_fee(withdrawable, fee_bps);
+            if fee > 0 {
+                if let Some(admin) = crate::access_control::AccessControl::get_admin(&env) {
+                    token_client.transfer(&env.current_contract_address(), &admin, &fee);
+                }
+            }
             token_client.transfer(
                 &env.current_contract_address(),
                 &w.destination,
-                &withdrawable,
+                &net,
             );
 
             env.events().publish(
-                (
-                    Symbol::new(&env, "STREAM"),
-                    Symbol::new(&env, "WITHDRAWN"),
-                    w.stream_id.clone(),
-                ),
-                (recipient.clone(), w.destination.clone(), withdrawable),
+                (Symbol::new(&env, "STREAM"), Symbol::new(&env, "WITHDRAWN")),
+                (w.stream_id.clone(), recipient.clone(), w.destination.clone(), withdrawable, stream.remaining_deposit),
             );
 
             processed.push_back(w.stream_id.clone());

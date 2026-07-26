@@ -237,6 +237,14 @@ impl MerchantPreAuth {
                 .period_start
                 .saturating_add(periods_elapsed * auth.period_secs);
             auth.pulled_this_period = 0;
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "MERCHANT_AUTH"),
+                    Symbol::new(&env, "PERIOD_RESET"),
+                ),
+                (customer.clone(), merchant.clone(), auth.period_start),
+            );
         }
 
         // ── Limit check ───────────────────────────────────────────────────────
@@ -314,5 +322,126 @@ impl MerchantPreAuth {
         };
 
         Ok(auth.limit_per_period.saturating_sub(pulled).max(0))
+    }
+}
+
+#[cfg(test)]
+mod period_reset_tests {
+    use crate::{PaymentProcessor, PaymentProcessorClient};
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _, Ledger as _},
+        token, Address, Env,
+    };
+
+    fn setup(env: &Env) -> (Address, PaymentProcessorClient<'_>) {
+        let contract_id = env.register(PaymentProcessor, ());
+        let client = PaymentProcessorClient::new(env, &contract_id);
+        let admin = Address::generate(env);
+        client.initialize_payment_processor(&admin);
+        (admin, client)
+    }
+
+    fn setup_authorization(
+        env: &Env,
+        client: &PaymentProcessorClient<'_>,
+        limit_per_period: i128,
+        period_secs: u64,
+    ) -> (Address, Address, Address) {
+        let customer = Address::generate(env);
+        let merchant = Address::generate(env);
+        let token_admin = Address::generate(env);
+        let token = env
+            .register_stellar_asset_contract_v2(token_admin)
+            .address();
+
+        token::StellarAssetClient::new(env, &token).mint(&customer, &1_000_000_000i128);
+
+        client.pre_authorize_merchant(
+            &customer,
+            &merchant,
+            &token,
+            &limit_per_period,
+            &period_secs,
+        );
+
+        (customer, merchant, token)
+    }
+
+    #[test]
+    fn test_period_reset_on_first_pull_of_new_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+        let (customer, merchant, _token) = setup_authorization(&env, &client, 1_000i128, 100u64);
+
+        client.pull_payment(&merchant, &customer, &1_000i128);
+        // Fully spent for this period.
+        let result = client.try_pull_payment(&merchant, &customer, &1i128);
+        assert!(result.is_err());
+
+        // Advance past the period boundary — the first pull of the new
+        // period must reset `pulled_this_period` before applying the limit.
+        env.ledger().with_mut(|li| li.timestamp += 101);
+        let pulled = client.pull_payment(&merchant, &customer, &500i128);
+        assert_eq!(pulled, 500i128);
+
+        let auth = client.get_merchant_authorization(&customer, &merchant);
+        assert_eq!(auth.pulled_this_period, 500i128);
+    }
+
+    #[test]
+    fn test_limit_enforced_within_period() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+        let (customer, merchant, _token) = setup_authorization(&env, &client, 1_000i128, 100u64);
+
+        client.pull_payment(&merchant, &customer, &700i128);
+        let result = client.try_pull_payment(&merchant, &customer, &400i128);
+        assert_eq!(
+            result,
+            Err(Ok(crate::merchant_auth::MerchantAuthError::LimitExceeded))
+        );
+
+        // Remaining budget in the same period is still pullable.
+        let pulled = client.pull_payment(&merchant, &customer, &300i128);
+        assert_eq!(pulled, 1_000i128);
+    }
+
+    #[test]
+    fn test_multi_period_pulls_all_succeed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+        let (customer, merchant, _token) = setup_authorization(&env, &client, 1_000i128, 100u64);
+
+        for _ in 0..3 {
+            let pulled = client.pull_payment(&merchant, &customer, &1_000i128);
+            assert_eq!(pulled, 1_000i128);
+            env.ledger().with_mut(|li| li.timestamp += 101);
+        }
+    }
+
+    #[test]
+    fn test_period_reset_event_emitted_on_rollover() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup(&env);
+        let (customer, merchant, _token) = setup_authorization(&env, &client, 1_000i128, 100u64);
+
+        // Pull within the same period — no reset, no PERIOD_RESET event.
+        client.pull_payment(&merchant, &customer, &500i128);
+        let events_before = env.events().all().len();
+
+        // Roll over into a new period — this pull must emit PERIOD_RESET
+        // in addition to the usual CHARGED event.
+        env.ledger().with_mut(|li| li.timestamp += 101);
+        client.pull_payment(&merchant, &customer, &200i128);
+        let events_after = env.events().all().len();
+
+        assert!(
+            events_after > events_before + 1,
+            "expected an extra MERCHANT_AUTH/PERIOD_RESET event on period rollover"
+        );
     }
 }

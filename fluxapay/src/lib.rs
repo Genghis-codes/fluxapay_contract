@@ -366,6 +366,8 @@ pub enum Error {
     MaxRetriesExceeded = 54,
     /// Issue #505: Invalid payment status transition attempted.
     InvalidStatusTransition = 54,
+    /// Issue #450: Customer called `claim_refund` before an operator approved it.
+    RefundNotApproved = 56,
     /// Issue #437: DEX router is not in the allowed routers list.
     RouterNotAllowed = 56,
     /// Issue #436: Aggregate route output is less than minimum output amount.
@@ -2062,6 +2064,30 @@ impl RefundManager {
         Ok(())
     }
 
+    /// Issue #450: Customer self-serves an operator-approved refund.
+    ///
+    /// Callable only by the original refund requester, and only once an
+    /// operator has called `approve_refund`. `process_refund` remains
+    /// available for operators/oracles who need to execute a refund
+    /// directly without waiting for the customer to claim it.
+    pub fn claim_refund(env: Env, requester: Address, refund_id: String) -> Result<(), Error> {
+        requester.require_auth();
+        Self::require_not_paused(&env)?;
+        Self::require_not_blacklisted(&env, &requester)?;
+
+        let refund = Self::get_refund_internal(&env, &refund_id)?;
+
+        if refund.requester != requester {
+            return Err(Error::Unauthorized);
+        }
+        if refund.status != RefundStatus::Pending {
+            return Err(Error::RefundAlreadyProcessed);
+        }
+        if !refund.approved {
+            return Err(Error::RefundNotApproved);
+        }
+
+        Self::process_refund_internal(&env, &requester, refund_id)
     /// Admin-configurable refund expiry window in seconds (Issue #170).
     /// Applies to refunds created after this call.
     pub fn set_refund_expiry(env: Env, admin: Address, secs: u64) -> Result<(), Error> {

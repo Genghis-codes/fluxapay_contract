@@ -186,6 +186,32 @@ export interface RegisterMerchantParams {
   feeConfig?: FeeConfig;
 }
 
+/**
+ * A customer's pre-authorization for a merchant to pull recurring payments,
+ * mirroring `MerchantAuthorization` in `fluxapay/src/merchant_auth.rs`.
+ */
+export interface MerchantAuthorization {
+  customer: string;
+  merchant: string;
+  token: string;
+  limit_per_period: bigint;
+  period_secs: bigint;
+  period_start: bigint;
+  pulled_this_period: bigint;
+  active: boolean;
+  created_at: bigint;
+}
+
+/** Error codes from `fluxapay/src/merchant_auth.rs::MerchantAuthError`. */
+export const MerchantAuthError = {
+  1: { message: "AuthorizationNotFound" },
+  2: { message: "AuthorizationInactive" },
+  3: { message: "LimitExceeded" },
+  4: { message: "InvalidAmount" },
+  5: { message: "Unauthorized" },
+  6: { message: "AuthorizationAlreadyExists" },
+} as const;
+
 export interface UpdateMerchantParams {
   merchantId: string;
   businessName?: string;
@@ -702,6 +728,100 @@ export class FluxapayClient {
         refund_id: refundId,
       }),
     );
+  }
+
+  // ── Merchant pre-authorization (pull billing, #454) ─────────────────────────
+  //
+  // These delegate to `pre_authorize_merchant` / `pull_payment` /
+  // `revoke_merchant_authorization` / `get_merchant_authorization`, entry
+  // points already exposed on `PaymentProcessor` (see
+  // `fluxapay/src/lib.rs`). They're invoked via a loose cast because the
+  // checked-in `contracts/fluxapay` bindings predate these entry points;
+  // regenerating bindings with `npm run generate` (see `scripts/generate-sdk.sh`)
+  // against a freshly built contract will pick up proper typings, at which
+  // point the `as any` casts below can be removed.
+
+  /**
+   * Customer grants a merchant permission to pull up to `limitPerPeriod`
+   * tokens per `periodSecs`-second billing window.
+   */
+  async preAuthorizeMerchant(params: {
+    customer: string;
+    merchant: string;
+    token: string;
+    limitPerPeriod: bigint;
+    periodSecs: bigint;
+  }): Promise<MerchantAuthorization> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).pre_authorize_merchant({
+        customer: params.customer,
+        merchant: params.merchant,
+        token: params.token,
+        limit_per_period: params.limitPerPeriod,
+        period_secs: params.periodSecs,
+      });
+      return tx.result;
+    });
+  }
+
+  /**
+   * Merchant pulls `amount` tokens from `customer` against an existing
+   * pre-authorization. Returns the cumulative amount pulled this period.
+   */
+  async pullFromAuthorization(
+    merchant: string,
+    customer: string,
+    amount: bigint,
+  ): Promise<bigint> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).pull_payment({
+        merchant,
+        customer,
+        amount,
+      });
+      return tx.result;
+    });
+  }
+
+  /**
+   * Customer revokes a previously granted merchant authorization.
+   */
+  async revokeAuthorization(customer: string, merchant: string): Promise<void> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).revoke_merchant_authorization({
+        customer,
+        merchant,
+      });
+      return tx.result;
+    });
+  }
+
+  /**
+   * Fetch the stored authorization for a (customer, merchant) pair, or
+   * `null` if none exists.
+   */
+  async getAuthorization(
+    customer: string,
+    merchant: string,
+  ): Promise<MerchantAuthorization | null> {
+    try {
+      return await withMappedContractError(async () => {
+        const tx = await (this.contract as any).get_merchant_authorization({
+          customer,
+          merchant,
+        });
+        return tx.result;
+      });
+    } catch (error) {
+      // Note: `FLUXAPAY_CONTRACT_ERROR_MAP` only covers the main `Error`
+      // enum, whose code space overlaps with `MerchantAuthError`'s — code 1
+      // means `AuthorizationNotFound` here, not the mapped "Unauthorized"
+      // name (see docs/error-codes.md). Check the raw code, not the name.
+      if (error instanceof FluxapayError && error.code === 1) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   /**

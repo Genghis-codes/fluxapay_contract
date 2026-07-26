@@ -596,6 +596,25 @@ pub struct FeeWaiverCodeRecord {
     pub remaining_uses: u32,
 }
 
+/// Customer profile for CRM features and repeat-customer identification.
+/// Auto-created and updated during verify_payment.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CustomerProfile {
+    /// Customer/payer address.
+    pub customer_id: Address,
+    /// Merchant that this customer has paid.
+    pub merchant_id: Address,
+    /// Optional hash of customer email for privacy (merchants can pass a hash).
+    pub email_hash: Option<BytesN<32>>,
+    /// Ledger timestamp when customer first interacted.
+    pub created_at: u64,
+    /// Number of confirmed payments from this customer.
+    pub payment_count: u32,
+    /// Total amount spent across all confirmed payments (in smallest denomination).
+    pub total_spent: i128,
+}
+
 struct ReentrancyGuard<'a> {
     env: &'a Env,
 }
@@ -692,6 +711,14 @@ pub enum DataKey {
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
+    /// Minimum payment duration in seconds (default: CREATE_PAYMENT_WINDOW_SECS = 60).
+    MinPaymentDurationSecs,
+    /// Maximum payment duration in seconds (default: 30 days).
+    MaxPaymentDurationSecs,
+    /// Issue #489: Reverse index from metadata_hash to payment_id for order reconciliation.
+    MetadataHashPayment(BytesN<32>),
+    /// Issue #492: Customer profile keyed by (merchant_id, customer_id) for CRM features.
+    CustomerProfile(Address, Address),
 }
 
 /// Default initial contract version string.
@@ -3346,12 +3373,13 @@ impl RefundManager {
                 env.events().publish(
                     (
                         Symbol::new(&env, "SUBSCRIPTION"),
-                        Symbol::new(&env, "CANCELLED"),
+                        Symbol::new(&env, "CANCELLED_MAX_RETRIES"),
                     ),
                     (
                         subscription_id.clone(),
                         payer.clone(),
                         subscription.retry_count,
+                        SUBSCRIPTION_MAX_RETRIES,
                     ),
                 );
 
@@ -3375,6 +3403,7 @@ impl RefundManager {
                         subscription_id,
                         payer,
                         subscription.retry_count,
+                        SUBSCRIPTION_MAX_RETRIES,
                         next_retry,
                     ),
                 );
@@ -3442,6 +3471,49 @@ impl RefundManager {
         env.events().publish(
             (Symbol::new(&env, "SUBSCRIPTION"), Symbol::new(&env, "CANCELLED")),
             (subscription_id, payer),
+        );
+
+        Ok(())
+    }
+
+    /// Admin override to reactivate a subscription that was cancelled due to max retries.
+    /// Resets retry_count to 0 and reschedules the next payment.
+    pub fn admin_reactivate_subscription(
+        env: Env,
+        admin: Address,
+        subscription_id: String,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut subscription = Self::get_subscription_internal(&env, &subscription_id)?;
+
+        if subscription.status != SubscriptionStatus::Cancelled {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        let now = env.ledger().timestamp();
+        subscription.status = SubscriptionStatus::Active;
+        subscription.retry_count = 0;
+        subscription.next_retry_at = None;
+        subscription.next_payment_at = now.saturating_add(subscription.interval_secs);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+        // Issue #302: Add back to ActiveSubscriptions index
+        Self::add_active_subscription(&env, &subscription_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "SUBSCRIPTION"),
+                Symbol::new(&env, "REACTIVATED"),
+            ),
+            (subscription_id, subscription.payer_address.clone()),
         );
 
         Ok(())
@@ -3892,6 +3964,40 @@ impl PaymentProcessor {
         env.storage()
             .persistent()
             .set(&DataKey::SettlementFeeRate, &bps);
+        Ok(())
+    }
+
+    pub fn set_min_payment_duration_secs(env: Env, admin: Address, min_secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if min_secs < CREATE_PAYMENT_WINDOW_SECS {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinPaymentDurationSecs, &min_secs);
+        Ok(())
+    }
+
+    pub fn set_max_payment_duration_secs(env: Env, admin: Address, max_secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if max_secs > 30 * 24 * 3600 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxPaymentDurationSecs, &max_secs);
         Ok(())
     }
 
@@ -4656,6 +4762,17 @@ impl PaymentProcessor {
             return Err(Error::PaymentAlreadyExists);
         }
 
+        // Issue #489: Validate metadata_hash uniqueness
+        if let Some(ref hash) = args.metadata_hash {
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::MetadataHashPayment(hash.clone()))
+            {
+                return Err(Error::DuplicateIdempotencyKey);
+            }
+        }
+
         if !utils::validate_id(&args.payment_id) {
             return Err(Error::InvalidPaymentId);
         }
@@ -4678,13 +4795,34 @@ impl PaymentProcessor {
         Self::enforce_create_payment_rate_limit(&env, &args.merchant_id)?;
 
         let now = env.ledger().timestamp();
+        let min_duration = env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MinPaymentDurationSecs)
+            .unwrap_or(CREATE_PAYMENT_WINDOW_SECS);
+        let max_duration = env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MaxPaymentDurationSecs)
+            .unwrap_or(30 * 24 * 3600);
+
         let resolved_expires_at = match args.expires_at {
-            Some(ts) => ts,
-            None => now.saturating_add(args.duration_secs.unwrap_or(DEFAULT_PAYMENT_DURATION_SECS)),
+            Some(ts) => {
+                if ts <= now {
+                    return Err(Error::InvalidExpiry);
+                }
+                let duration = ts.saturating_sub(now);
+                if duration < min_duration || duration > max_duration {
+                    return Err(Error::InvalidExpiry);
+                }
+                ts
+            }
+            None => {
+                let duration = args.duration_secs.unwrap_or(DEFAULT_PAYMENT_DURATION_SECS);
+                if duration < min_duration || duration > max_duration {
+                    return Err(Error::InvalidExpiry);
+                }
+                now.saturating_add(duration)
+            }
         };
-        if resolved_expires_at <= now {
-            return Err(Error::InvalidExpiry);
-        }
 
         let payment = PaymentCharge {
             payment_id: args.payment_id.clone(),
@@ -4715,6 +4853,15 @@ impl PaymentProcessor {
             .persistent()
             .set(&DataKey::Payment(args.payment_id.clone()), &payment);
         Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
+
+        // Issue #489: Store reverse index for metadata_hash → payment_id lookup
+        if let Some(ref hash) = args.metadata_hash {
+            let key = DataKey::MetadataHashPayment(hash.clone());
+            env.storage()
+                .persistent()
+                .set(&key, &args.payment_id);
+            Self::bump_ttl(&env, &key, LONG_LIVE_TTL);
+        }
 
         let mut merchant_payments = Self::get_merchant_payments_internal(&env, &args.merchant_id);
         merchant_payments.push_back(args.payment_id.clone());
@@ -4875,6 +5022,17 @@ impl PaymentProcessor {
                 return Err(Error::PaymentAlreadyExists);
             }
 
+            // Issue #489: Validate metadata_hash uniqueness in batch
+            if let Some(ref hash) = args.metadata_hash {
+                if env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::MetadataHashPayment(hash.clone()))
+                {
+                    return Err(Error::DuplicateIdempotencyKey);
+                }
+            }
+
             if args.payment_id.is_empty() {
                 return Err(Error::InvalidPaymentId);
             }
@@ -4935,19 +5093,28 @@ impl PaymentProcessor {
                 memo: args.memo.clone(),
                 memo_type: args.memo_type.clone(),
                 token_address: args.token_address.clone(),
-                metadata_hash: None,
+                metadata_hash: args.metadata_hash.clone(),
                 original_token: None,
                 swap_path: None,
                 fx_rate: None,
                 fx_rate_at: None,
                 metadata: args.metadata.clone(),
-                fee_waiver_code: None,
+                fee_waiver_code: args.fee_waiver_code.clone(),
             };
 
             env.storage()
                 .persistent()
                 .set(&DataKey::Payment(args.payment_id.clone()), &payment);
             Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
+
+            // Issue #489: Store reverse index for metadata_hash → payment_id lookup in batch
+            if let Some(ref hash) = args.metadata_hash {
+                let key = DataKey::MetadataHashPayment(hash.clone());
+                env.storage()
+                    .persistent()
+                    .set(&key, &args.payment_id);
+                Self::bump_ttl(&env, &key, LONG_LIVE_TTL);
+            }
 
             let mut merchant_payments = Self::get_merchant_payments_internal(&env, &args.merchant_id);
             merchant_payments.push_back(args.payment_id.clone());
@@ -5218,6 +5385,27 @@ impl PaymentProcessor {
             }
         }
 
+        // Issue #492: Auto-create or update customer profile on confirmed payment
+        if new_status == PaymentStatus::Confirmed || new_status == PaymentStatus::Overpaid {
+            let customer_key = DataKey::CustomerProfile(payment.merchant_id.clone(), payer_address.clone());
+            let mut customer_profile = if let Some(existing) = env.storage().persistent().get::<DataKey, CustomerProfile>(&customer_key) {
+                existing
+            } else {
+                CustomerProfile {
+                    customer_id: payer_address.clone(),
+                    merchant_id: payment.merchant_id.clone(),
+                    email_hash: None,
+                    created_at: env.ledger().timestamp(),
+                    payment_count: 0,
+                    total_spent: 0,
+                }
+            };
+            customer_profile.payment_count += 1;
+            customer_profile.total_spent += amount_received;
+            env.storage().persistent().set(&customer_key, &customer_profile);
+            Self::bump_ttl(&env, &customer_key, LONG_LIVE_TTL);
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::Payment(payment_id.clone()), &payment);
@@ -5240,7 +5428,99 @@ impl PaymentProcessor {
     }
 
     pub fn get_payment(env: Env, payment_id: String) -> Result<PaymentCharge, Error> {
-        Self::get_payment_internal(&env, &payment_id)
+        let payment = Self::get_payment_internal(&env, &payment_id)?;
+        Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+        Ok(payment)
+    }
+
+    /// Issue #489: Reverse lookup payment by metadata_hash for order reconciliation.
+    pub fn get_payment_by_metadata_hash(env: Env, metadata_hash: BytesN<32>) -> Result<PaymentCharge, Error> {
+        let payment_id = env
+            .storage()
+            .persistent()
+            .get::<DataKey, String>(&DataKey::MetadataHashPayment(metadata_hash.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+        Self::get_payment(&env, payment_id)
+    }
+
+    /// Issue #492: Get customer profile for merchant and customer pair.
+    pub fn get_customer(env: Env, merchant_id: Address, customer_id: Address) -> Result<CustomerProfile, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CustomerProfile(merchant_id, customer_id))
+            .ok_or(Error::PaymentNotFound)
+    }
+
+    /// Issue #492: Get top customers for a merchant sorted by total_spent (descending).
+    pub fn get_top_customers(env: Env, merchant_id: Address, limit: u32) -> Vec<CustomerProfile> {
+        let all_payments = Self::get_merchant_payments_internal(&env, &merchant_id);
+        let mut customers: Map<Address, CustomerProfile> = map![&env];
+
+        for payment_id in all_payments.iter() {
+            if let Ok(payment) = Self::get_payment_internal(&env, &payment_id) {
+                if payment.status == PaymentStatus::Confirmed || payment.status == PaymentStatus::Overpaid {
+                    if let Some(payer) = payment.payer_address {
+                        if let Ok(profile) = Self::get_customer(&env, merchant_id.clone(), payer.clone()) {
+                            customers.set(payer, profile);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut sorted: Vec<CustomerProfile> = vec![&env];
+        for (_, profile) in customers.iter() {
+            sorted.push_back(profile);
+        }
+
+        let mut i = 0;
+        while i < sorted.len() {
+            let mut j = i + 1;
+            while j < sorted.len() {
+                if let (Some(profile_i), Some(profile_j)) = (sorted.get(i), sorted.get(j)) {
+                    if profile_j.total_spent > profile_i.total_spent {
+                        sorted.set(i, profile_j.clone());
+                        sorted.set(j, profile_i.clone());
+                    }
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+
+        let capped_limit = if limit == 0 { sorted.len() as u32 } else { (limit as usize).min(sorted.len()) as u32 };
+        let mut result = vec![&env];
+        let mut idx = 0;
+        while idx < capped_limit {
+            if let Some(profile) = sorted.get(idx as usize) {
+                result.push_back(profile);
+            }
+            idx += 1;
+        }
+        result
+    }
+
+    /// Issue #488: Permissionless public entry point for TTL maintenance.
+    pub fn bump_payment_ttl_public(env: Env, payment_id: String) -> Result<(), Error> {
+        let payment = Self::get_payment_internal(&env, &payment_id)?;
+        Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+        Ok(())
+    }
+
+    /// Issue #488: Bulk bump payment TTLs for efficient maintenance sweeps (max 50).
+    pub fn bulk_bump_payment_ttls(env: Env, payment_ids: Vec<String>) -> Result<u32, Error> {
+        if payment_ids.len() > 50 {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut bumped = 0u32;
+        for payment_id in payment_ids.iter() {
+            if let Ok(payment) = Self::get_payment_internal(&env, &payment_id) {
+                Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+                bumped += 1;
+            }
+        }
+        Ok(bumped)
     }
 
     pub fn get_merchant_payments(env: Env, merchant_id: Address) -> Vec<String> {

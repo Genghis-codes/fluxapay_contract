@@ -74,6 +74,8 @@ Fluxapay solves this by enabling _USDC-in → fiat-out_ payments with a merchant
 - Fetch payment status
 - Issue refunds (where supported)
 - Manage customers & metadata
+  - **Metadata limits:** ≤20 keys; each key ≤64 chars; each value ≤256 chars
+  - Violations return `MetadataTooLarge` / `MetadataValueTooLong`
   •⁠ ⁠*Webhooks*
 - ⁠ payment.created ⁠, ⁠ payment.pending ⁠, ⁠ payment.confirmed ⁠, ⁠ payment.failed ⁠, ⁠ payment.settled ⁠
 
@@ -82,6 +84,7 @@ Fluxapay solves this by enabling _USDC-in → fiat-out_ payments with a merchant
 •⁠ ⁠*Payment Links*
 
 - Shareable links for quick checkout (social commerce, WhatsApp, Instagram, etc.)
+- Optional `base_url` builds `{base_url}/pay/{link_id}` as `shareable_url` (QR-ready)
   •⁠ ⁠*Invoices*
 - Generate invoices with payment links and track payment status
 - Perfect for freelancers, agencies, and B2B billing

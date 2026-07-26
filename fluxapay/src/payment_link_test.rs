@@ -38,6 +38,7 @@ fn test_create_link() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     assert_eq!(id, link_id);
@@ -68,6 +69,7 @@ fn test_use_link_fixed_amount() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     let payment_id = client.use_link(&payer, &link_id, &amount, &None);
@@ -97,6 +99,7 @@ fn test_use_link_wrong_amount() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     client.use_link(&payer, &link_id, &500i128, &None);
@@ -121,6 +124,7 @@ fn test_use_link_open_amount() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     client.use_link(&payer, &link_id, &1500i128, &None);
@@ -146,6 +150,7 @@ fn test_deactivate_link() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     client.deactivate_link(&merchant, &link_id);
@@ -174,6 +179,7 @@ fn test_link_expired() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     env.ledger().set_timestamp(expiry + 1);
@@ -200,6 +206,7 @@ fn test_verify_batch_returns_status_for_active_links() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
     client.create_link(
         &merchant,
@@ -212,6 +219,7 @@ fn test_verify_batch_returns_status_for_active_links() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     let results = client.verify_batch(&vec![&env, link_id1.clone(), link_id2.clone()]);
@@ -240,6 +248,7 @@ fn test_verify_batch_handles_missing_links() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     let results = client.verify_batch(&vec![&env, existing_link.clone(), missing_link.clone()]);
@@ -266,6 +275,7 @@ fn test_verify_batch_returns_inactive_for_deactivated_link() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     client.deactivate_link(&merchant, &link_id);
@@ -305,6 +315,7 @@ fn test_max_uses() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     client.use_link(&payer, &link_id, &100i128, &None);
@@ -344,6 +355,7 @@ fn test_direct_transfer_link_transfers_to_merchant() {
         &true,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     let link = client.get_link(&link_id);
@@ -379,6 +391,7 @@ fn test_direct_transfer_without_token_address_fails() {
         &true,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     // Should fail because usdc_token is None but direct_transfer is true
@@ -415,6 +428,7 @@ fn test_metadata_too_large_21_keys() {
         &false,
         &Some(metadata),
         &MaybeFiatConfig::None,
+        &None,
     );
 }
 
@@ -441,6 +455,7 @@ fn test_metadata_value_too_long_257_chars() {
         &false,
         &Some(metadata),
         &MaybeFiatConfig::None,
+        &None,
     );
 }
 
@@ -472,6 +487,7 @@ fn test_metadata_20_keys_256_char_values_succeeds() {
         &false,
         &Some(metadata),
         &MaybeFiatConfig::None,
+        &None,
     );
 
     assert_eq!(id, link_id);
@@ -497,6 +513,7 @@ fn test_metadata_none_succeeds() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     assert_eq!(id, link_id);
@@ -543,6 +560,7 @@ fn test_create_fiat_link_and_use_with_rate() {
         &false,
         &None,
         &MaybeFiatConfig::Some(fiat),
+        &None,
     );
 
     assert_eq!(id, link_id);
@@ -589,6 +607,7 @@ fn test_use_fiat_link_requires_correct_usdc() {
         &false,
         &None,
         &MaybeFiatConfig::Some(fiat),
+        &None,
     );
 
     // Should succeed with correct USDC equivalent (50 * 10^7 / 2_0000000 = 25)
@@ -634,6 +653,7 @@ fn test_use_fiat_link_rejects_wrong_usdc() {
         &false,
         &None,
         &MaybeFiatConfig::Some(fiat),
+        &None,
     );
 
     // 50 USDC is wrong when fiat_amount=100 at rate=1
@@ -660,6 +680,7 @@ fn test_record_link_view_increments_view_count() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     // Initially zero views
@@ -695,6 +716,7 @@ fn test_use_link_accumulates_revenue() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     // Initially zero revenue
@@ -733,6 +755,7 @@ fn test_get_link_analytics_conversion_rate() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     // Record 10 views
@@ -771,6 +794,7 @@ fn test_get_link_analytics_zero_views() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     // Use the link without any views
@@ -804,6 +828,7 @@ fn test_get_link_analytics_full_conversion() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     // 4 views, 4 uses → 100% conversion = 10000 bps
@@ -839,6 +864,7 @@ fn test_record_link_view_rejects_inactive_link() {
         &false,
         &None,
         &MaybeFiatConfig::None,
+        &None,
     );
 
     client.deactivate_link(&merchant, &link_id);
@@ -855,6 +881,126 @@ fn test_get_link_analytics_not_found() {
 
     let nonexistent = String::from_str(&env, "does_not_exist");
     client.get_link_analytics(&nonexistent);
+}
+
+#[test]
+fn test_create_link_with_base_url_sets_shareable_url() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "share_link");
+    let base = String::from_str(&env, "https://pay.fluxapay.app");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Shareable"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &Some(base),
+    );
+
+    let expected = String::from_str(&env, "https://pay.fluxapay.app/pay/share_link");
+    let link = client.get_link(&link_id);
+    assert_eq!(link.shareable_url, Some(expected.clone()));
+    assert_eq!(client.get_link_url(&link_id), Some(expected));
+}
+
+#[test]
+fn test_create_link_without_base_url_returns_none() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "no_base_link");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "No Base"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    let link = client.get_link(&link_id);
+    assert!(link.shareable_url.is_none());
+    assert!(client.get_link_url(&link_id).is_none());
+}
+
+#[test]
+fn test_set_payment_base_url_used_as_default() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register(PaymentLinkManager, ());
+    let client = PaymentLinkManagerClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    let merchant = Address::generate(&env);
+    let base = String::from_str(&env, "https://checkout.example.com");
+    client.set_payment_base_url(&admin, &base);
+
+    let link_id = String::from_str(&env, "default_base");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(500i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Default Base"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    assert_eq!(
+        client.get_link_url(&link_id),
+        Some(String::from_str(
+            &env,
+            "https://checkout.example.com/pay/default_base"
+        ))
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #47)")]
+fn test_create_link_metadata_key_too_long() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let long_key = String::from_str(
+        &env,
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    );
+    let mut metadata: Map<String, String> = Map::new(&env);
+    metadata.set(long_key, String::from_str(&env, "v"));
+
+    client.create_link(
+        &merchant,
+        &String::from_str(&env, "meta_key_long"),
+        &None,
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Meta Key"),
+        &None,
+        &None,
+        &false,
+        &Some(metadata),
+        &MaybeFiatConfig::None,
+        &None,
+    );
 }
 
 

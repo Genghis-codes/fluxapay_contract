@@ -21,8 +21,14 @@ export interface PaymentLink {
   active: boolean;
   /** USDC token contract address */
   usdc_token: string;
-  /** Arbitrary key/value metadata attached to the link */
+  /**
+   * Arbitrary key/value metadata attached to the link.
+   *
+   * Limits (enforced on-chain): ≤20 keys, key ≤64 chars, value ≤256 chars.
+   */
   metadata?: Record<string, string>;
+  /** Canonical shareable checkout URL (`{base_url}/pay/{link_id}`), if configured */
+  shareable_url?: string;
 }
 
 /**
@@ -43,8 +49,6 @@ export interface LinkAnalytics {
   conversion_rate: number;
 }
 
-
-
 /**
  * Parameters for creating a new payment link.
  */
@@ -55,8 +59,34 @@ export interface CreateLinkParams {
   amount?: bigint;
   /** USDC token contract address */
   usdcToken: string;
-  /** Arbitrary metadata (e.g. product info, order reference) */
+  /**
+   * Arbitrary metadata (e.g. product info, order reference).
+   *
+   * Limits (enforced on-chain): ≤20 keys, key ≤64 chars, value ≤256 chars.
+   */
   metadata?: Record<string, string>;
+  /**
+   * Optional checkout base URL. When provided (or when admin has set a default
+   * via `set_payment_base_url`), the link stores `{baseUrl}/pay/{linkId}` as
+   * `shareable_url`.
+   */
+  baseUrl?: string;
+  /** Optional link ID; when omitted the contract/caller supplies one */
+  linkId?: string;
+  currency?: string;
+  description?: string;
+}
+
+/** Result of `createPaymentLink`, including QR-ready payload. */
+export interface CreatePaymentLinkResult {
+  linkId: string;
+  /** Canonical shareable URL when a base URL was available; otherwise null */
+  shareableUrl: string | null;
+  /**
+   * String suitable for QR code generation (the shareable URL when present,
+   * otherwise the raw link ID).
+   */
+  qrCodeData: string;
 }
 
 /**
@@ -115,10 +145,57 @@ export class PaymentLinkManagerClient {
     return withMappedContractError(() =>
       this.getContract().create_link({
         merchant: params.merchant,
+        link_id: params.linkId,
         amount: params.amount,
+        currency: params.currency ?? "USDC",
+        description: params.description ?? "",
+        expires_at: undefined,
+        max_uses: undefined,
+        direct_transfer: false,
         usdc_token: params.usdcToken,
         metadata: params.metadata,
+        base_url: params.baseUrl,
       }),
+    );
+  }
+
+  /**
+   * Create a payment link and return shareable URL + QR payload.
+   *
+   * @param params - Link creation parameters (include `baseUrl` for a shareable URL)
+   * @returns linkId, shareableUrl, and qrCodeData for invoice/QR embedding
+   */
+  async createPaymentLink(params: CreateLinkParams): Promise<CreatePaymentLinkResult> {
+    const linkId = await this.createLink(params);
+    let shareableUrl: string | null = null;
+    try {
+      shareableUrl = (await this.getLinkUrl(linkId)) ?? null;
+    } catch {
+      shareableUrl = params.baseUrl ? `${params.baseUrl.replace(/\/$/, "")}/pay/${linkId}` : null;
+    }
+    return {
+      linkId,
+      shareableUrl,
+      qrCodeData: shareableUrl ?? linkId,
+    };
+  }
+
+  /**
+   * Query the on-chain shareable URL for a link.
+   */
+  async getLinkUrl(linkId: string): Promise<string | null> {
+    return withMappedContractError(async () => {
+      const url = await this.getContract().get_link_url({ link_id: linkId });
+      return url ?? null;
+    });
+  }
+
+  /**
+   * Admin: set the default payment base URL used when create_link omits base_url.
+   */
+  async setPaymentBaseUrl(admin: string, url: string): Promise<void> {
+    return withMappedContractError(() =>
+      this.getContract().set_payment_base_url({ admin, url }),
     );
   }
 
@@ -217,6 +294,3 @@ export class PaymentLinkManagerClient {
     );
   }
 }
-
-
-

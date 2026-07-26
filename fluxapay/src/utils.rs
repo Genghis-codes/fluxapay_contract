@@ -1,4 +1,26 @@
-use soroban_sdk::{Bytes, Env, String};
+use soroban_sdk::{Bytes, Env, Map, String};
+
+/// Maximum number of key/value pairs allowed in payment/link metadata.
+pub const MAX_METADATA_KEYS: u32 = 20;
+/// Maximum length of a metadata key (characters).
+pub const MAX_METADATA_KEY_LEN: u32 = 64;
+/// Maximum length of a metadata value (characters).
+pub const MAX_METADATA_VALUE_LEN: u32 = 256;
+
+/// Validate metadata map size and key/value length limits.
+///
+/// Limits: ≤20 keys, each key ≤64 chars, each value ≤256 chars.
+pub fn validate_metadata(meta_map: &Map<String, String>) -> Result<(), crate::Error> {
+    if meta_map.len() > MAX_METADATA_KEYS {
+        return Err(crate::Error::MetadataTooLarge);
+    }
+    for (key, value) in meta_map.iter() {
+        if key.len() > MAX_METADATA_KEY_LEN || value.len() > MAX_METADATA_VALUE_LEN {
+            return Err(crate::Error::MetadataValueTooLong);
+        }
+    }
+    Ok(())
+}
 
 /// Validates that a string is a valid IPFS multihash (CIDv0 or CIDv1).
 ///
@@ -102,6 +124,23 @@ pub fn format_id(env: &Env, prefix: &str, n: u64) -> String {
     // Copy into a fixed-size slice and convert to Soroban String
     let mut arr = [0u8; 64];
     let final_len = result.len().min(64);
+    for i in 0..final_len {
+        arr[i as usize] = result.get(i).unwrap();
+    }
+    String::from_bytes(env, &arr[..final_len as usize])
+}
+
+/// Concatenate Soroban strings (used for shareable payment URLs).
+pub fn concat_strings(env: &Env, parts: &[String]) -> String {
+    let mut result = Bytes::new(env);
+    for part in parts {
+        let bytes = part.to_bytes();
+        for i in 0..bytes.len() {
+            result.push_back(bytes.get(i).unwrap());
+        }
+    }
+    let final_len = result.len().min(512);
+    let mut arr = [0u8; 512];
     for i in 0..final_len {
         arr[i as usize] = result.get(i).unwrap();
     }

@@ -2668,7 +2668,7 @@ fn test_cancelled_subscription_removed_from_active_index() {
     let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
 
     // Cancel the subscription
-    client.cancel_subscription(&payer, &sub_id);
+    client.cancel_subscription(&payer, &sub_id, &false);
 
     // Advance time past due date
     env.ledger()

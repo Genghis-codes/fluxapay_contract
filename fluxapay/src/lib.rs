@@ -687,6 +687,8 @@ pub enum DataKey {
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
+    /// When true, `cancel_subscription` may create a prorated pending refund.
+    AllowProratedRefunds,
 }
 
 /// Default initial contract version string.
@@ -3409,10 +3411,16 @@ impl RefundManager {
         Ok(())
     }
 
+    /// Cancel a subscription and optionally create a prorated pending refund.
+    ///
+    /// When `refund_remaining` is true, a payment was made in the current billing
+    /// period, and the admin policy `allow_prorated_refunds` is enabled, a pending
+    /// refund is created for the unused portion of the period (by whole days).
     pub fn cancel_subscription(
         env: Env,
         payer: Address,
         subscription_id: String,
+        refund_remaining: bool,
     ) -> Result<(), Error> {
         payer.require_auth();
 
@@ -3422,12 +3430,49 @@ impl RefundManager {
             return Err(Error::Unauthorized);
         }
 
+        if subscription.status == SubscriptionStatus::Cancelled {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        let now = env.ledger().timestamp();
+        let allow_proration: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllowProratedRefunds)
+            .unwrap_or(false);
+
+        if refund_remaining && allow_proration {
+            if let Some(last_paid) = subscription.last_payment_at {
+                // Payment must fall within the current open period.
+                if last_paid < subscription.next_payment_at && now < subscription.next_payment_at {
+                    let secs_remaining = subscription.next_payment_at.saturating_sub(now);
+                    let days_remaining = secs_remaining / 86_400;
+                    let period_days = core::cmp::max(1, subscription.interval_secs / 86_400);
+
+                    if days_remaining > 0 {
+                        let prorated = subscription
+                            .amount
+                            .saturating_mul(days_remaining as i128)
+                            / (period_days as i128);
+
+                        if prorated > 0 {
+                            Self::create_subscription_prorated_refund(
+                                &env,
+                                &subscription,
+                                prorated,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+
         subscription.status = SubscriptionStatus::Cancelled;
         env.storage()
             .persistent()
             .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
 
-        // Issue #302: Remove from ActiveSubscriptions index
+        // Stop future tick billing
         Self::remove_active_subscription(&env, &subscription_id);
 
         env.events().publish(
@@ -3436,6 +3481,116 @@ impl RefundManager {
         );
 
         Ok(())
+    }
+
+    /// Admin policy: enable or disable prorated refunds on subscription cancel.
+    pub fn set_allow_prorated_refunds(
+        env: Env,
+        admin: Address,
+        allow: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllowProratedRefunds, &allow);
+        Ok(())
+    }
+
+    /// Query whether prorated subscription refunds are allowed.
+    pub fn get_allow_prorated_refunds(env: Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowProratedRefunds)
+            .unwrap_or(false)
+    }
+
+    /// Create a pending refund backed by a synthetic confirmed payment for the
+    /// last subscription billing period. Emits `REFUND/AUTO_CREATED`.
+    fn create_subscription_prorated_refund(
+        env: &Env,
+        subscription: &Subscription,
+        refund_amount: i128,
+    ) -> Result<String, Error> {
+        let tick_id = Self::get_next_subscription_tick_id(env);
+        let payment_id = format_id(env, "sub_pr_", tick_id);
+        let now = env.ledger().timestamp();
+        let last_paid = subscription.last_payment_at.unwrap_or(now);
+
+        let payment = PaymentCharge {
+            payment_id: payment_id.clone(),
+            merchant_id: subscription.merchant_id.clone(),
+            amount: subscription.amount,
+            currency: subscription.currency.clone(),
+            deposit_address: env.current_contract_address(),
+            status: PaymentStatus::Confirmed,
+            payer_address: Some(subscription.payer_address.clone()),
+            transaction_hash: None,
+            created_at: last_paid,
+            confirmed_at: Some(last_paid),
+            expires_at: subscription.next_payment_at,
+            amount_received: Some(subscription.amount),
+            memo: None,
+            memo_type: None,
+            token_address: None,
+            metadata_hash: None,
+            original_token: None,
+            swap_path: None,
+            fx_rate: None,
+            fx_rate_at: None,
+            metadata: None,
+            fee_waiver_code: None,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+        Self::bump_payment_ttl(env, &payment_id, &payment.status);
+
+        let counter = Self::get_next_refund_id(env);
+        let refund_id = format_id(env, "refund_", counter);
+        let reason = String::from_str(env, "Prorated subscription cancellation");
+
+        let refund = Refund {
+            refund_id: refund_id.clone(),
+            payment_id: payment_id.clone(),
+            amount: refund_amount,
+            reason,
+            status: RefundStatus::Pending,
+            requester: subscription.payer_address.clone(),
+            created_at: now,
+            processed_at: None,
+            approved: false,
+            receipt_hash: None,
+            expiry_at: now + REFUND_EXPIRY_SECS,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id.clone()), &refund);
+
+        let mut payment_refunds = Self::get_payment_refunds_internal(env, &payment_id);
+        payment_refunds.push_back(refund_id.clone());
+        env.storage().persistent().set(
+            &DataKey::PaymentRefunds(payment_id.clone()),
+            &payment_refunds,
+        );
+        Self::bump_ttl(env, &DataKey::PaymentRefunds(payment_id.clone()), LONG_LIVE_TTL);
+        Self::bump_refund_ttl(env, &refund_id, &refund.status);
+
+        env.events().publish(
+            (Symbol::new(env, "REFUND"), Symbol::new(env, "AUTO_CREATED")),
+            (
+                payment_id,
+                refund_id.clone(),
+                refund_amount,
+                subscription.subscription_id.clone(),
+            ),
+        );
+
+        Ok(refund_id)
     }
 
     /// Submit usage metrics for a metered subscription.
@@ -4651,16 +4806,9 @@ impl PaymentProcessor {
             return Err(Error::InvalidPaymentId);
         }
 
-        // Issue #286: Validate metadata constraints
+        // Validate metadata key count and key/value length limits.
         if let Some(ref meta_map) = args.metadata {
-            if meta_map.len() > 20 {
-                return Err(Error::MetadataTooLarge);
-            }
-            for (_, value) in meta_map.iter() {
-                if value.len() > 256 {
-                    return Err(Error::MetadataValueTooLong);
-                }
-            }
+            utils::validate_metadata(meta_map)?;
         }
 
         // Issue #397: Validate Stellar memo type constraints.
@@ -4858,16 +5006,9 @@ impl PaymentProcessor {
                 return Err(Error::InvalidPaymentId);
             }
 
-            // Issue #286: Validate metadata constraints
+            // Validate metadata key count and key/value length limits.
             if let Some(ref meta_map) = args.metadata {
-                if meta_map.len() > 20 {
-                    return Err(Error::MetadataTooLarge);
-                }
-                for (_, value) in meta_map.iter() {
-                    if value.len() > 256 {
-                        return Err(Error::MetadataValueTooLong);
-                    }
-                }
+                utils::validate_metadata(meta_map)?;
             }
 
             // Check idempotency
@@ -5573,7 +5714,10 @@ impl PaymentProcessor {
                     if now < record.expires_at && record.remaining_uses > 0 {
                         record.remaining_uses = record.remaining_uses.saturating_sub(1);
                         env.storage().persistent().set(&key, &record);
-                        Some(String::from_str(&env, "code_waiver:").concat(&code))
+                        Some(crate::utils::concat_strings(
+                            &env,
+                            &[String::from_str(&env, "code_waiver:"), code.clone()],
+                        ))
                     } else {
                         None
                     }
@@ -7084,7 +7228,8 @@ mod payment_link;
 #[cfg(test)]
 mod proptests;
 pub use payment_link::{
-    FiatConfig, MaybeFiatConfig, PaymentLink, PaymentLinkManager, PaymentLinkManagerClient,
+    FiatConfig, LinkAnalytics, MaybeFiatConfig, PaymentLink, PaymentLinkManager,
+    PaymentLinkManagerClient,
 };
 #[cfg(test)]
 mod memo_test;

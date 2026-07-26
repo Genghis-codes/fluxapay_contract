@@ -362,3 +362,16 @@ Full SEP-6 / SEP-24 protocol integration details, request payloads, anchor statu
 - **Arbitration Voting**: Stake-locked voting with threshold ensures fair dispute resolution
 - **Two-Step Admin Transfer**: Prevents accidental admin loss via `pending_admin` + `claim_admin()`
 - **Metadata Validation**: Payment links enforce max key count (20) and value length (256 chars)
+
+## Error Codes
+
+Every `#[contracterror]` enum across all contracts (`Error`, `AccessControlError`,
+`StreamError`, `FXOracleError`, `MerchantError`, `MerchantAuthError`,
+`DexRouterError`, `AccountAbstractionError`) is documented in a single
+reference table, including common causes and remediation: see
+[error-codes.md](error-codes.md).
+
+## Architecture Decision Records
+
+- [ADR-0001: Access Control Split](ADR-0001-access-control-split.md)
+- [ADR-0002: Payment Stream Design](ADR-0002-payment-stream-design.md)

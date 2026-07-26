@@ -22,7 +22,17 @@ import {
   prepareForOfflineSigning,
   restoreFromOfflinePayload,
 } from "./offline-signer.js";
-import { NetworkProfileSwitcher, NetworkEnvironment, NetworkProfiles, NetworkProfile } from "./network-profiles.js";
+import {
+  NetworkProfileSwitcher,
+  NetworkEnvironment,
+  NetworkProfiles,
+  NetworkProfile,
+  FLUXAPAY_CONTRACT_IDS,
+  UNSET_CONTRACT_ID,
+} from "./network-profiles.js";
+
+export { FLUXAPAY_CONTRACT_IDS, UNSET_CONTRACT_ID } from "./network-profiles.js";
+export type { FluxapayContractIds } from "./network-profiles.js";
 import { FxOracleClient } from "./contracts/fx-oracle.js";
 import { MerchantRegistryClient } from "./contracts/merchant-registry.js";
 import {
@@ -40,7 +50,11 @@ import { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10Authenticate
 export interface FluxapayConfig {
   network: NetworkEnvironment;
   rpcUrl?: string;
-  contractId: string;
+  /**
+   * PaymentProcessor contract ID. Optional — falls back to
+   * `FLUXAPAY_CONTRACT_IDS[network].paymentProcessor` when omitted.
+   */
+  contractId?: string;
   /** FX Oracle contract ID for multi-currency rate queries. */
   oracleContractId?: string;
   /** MerchantRegistry contract ID for merchant management operations. */
@@ -100,6 +114,23 @@ export interface UpdateMerchantParams {
   feeConfig?: FeeConfig;
 }
 
+/**
+ * Maps numeric contract error codes to their name, for the main `Error` enum
+ * shared by the `PaymentProcessor` and `RefundManager` contracts
+ * (`fluxapay/src/lib.rs`).
+ *
+ * Other contracts (`AccessControlError`, `StreamError`, `FXOracleError`,
+ * `MerchantError`, `MerchantAuthError`, `DexRouterError`,
+ * `AccountAbstractionError`) each define their own independent, overlapping
+ * code space, so a single flat `code -> name` map cannot disambiguate them —
+ * see `docs/error-codes.md` for the full per-contract reference.
+ *
+ * Codes `46` and `54` are ambiguous even within this enum: multiple variants
+ * share the same discriminant in the Rust source (a known issue tracked in
+ * `docs/error-codes.md`). The lower/first-declared variant name is used
+ * here; `scripts/check-error-map-sync.ts` flags this file if it drifts from
+ * `fluxapay/src/lib.rs` again.
+ */
 export const FLUXAPAY_CONTRACT_ERROR_MAP: Record<number, string> = {
   1: "Unauthorized",
   2: "PaymentAlreadyExists",
@@ -129,13 +160,27 @@ export const FLUXAPAY_CONTRACT_ERROR_MAP: Record<number, string> = {
   32: "InvalidResumeTimestamp",
   33: "MerchantAuthError",
   34: "TierVolumeLimitExceeded",
-  35: "RefundExpired",
-  36: "InsufficientArbitrators",
-  37: "ArbitrationVotingThresholdNotMet",
-  38: "FeeProposalNotReady",
-  39: "NoFeeProposal",
+  35: "BatchTooLarge",
+  36: "RefundExpired",
+  37: "InsufficientArbitrators",
+  38: "ArbitrationVotingThresholdNotMet",
+  39: "FeeProposalNotReady",
+  40: "InvalidEvidenceFormat",
+  41: "InvalidSettlementSignature",
+  42: "RefundCooldownNotElapsed",
+  43: "Reentrancy",
+  44: "NoFeeProposal",
+  45: "StaleOracleRate",
+  46: "LinkExpired", // ambiguous: also InsufficientTreasuryBalance = 46
   47: "MetadataValueTooLong",
+  48: "UpgradeFailed",
   49: "MetadataTooLarge",
+  50: "InvalidMemoType",
+  51: "MemoTooLong",
+  52: "InvalidMemoId",
+  53: "PayerNotWhitelisted",
+  54: "DisputeRateLimitExceeded", // ambiguous: also LinkMaxUsesReached, DirectTransferNotDisputable, MaxRetriesExceeded, InvalidStatusTransition = 54
+  55: "RateDeviationExceeded",
   404: "PaymentNotFound",
   405: "RefundNotFound",
   406: "InvalidAmount",
@@ -231,6 +276,22 @@ function toCreatePaymentArgs(params: CreatePaymentParams): CreatePaymentArgs {
   };
 }
 
+/**
+ * Resolve a contract ID: prefer the explicit override, otherwise fall back
+ * to the per-environment default. Throws if neither is set to a real
+ * (non-placeholder) address, so misconfiguration fails fast with a clear
+ * message instead of an opaque RPC error at call time.
+ */
+function resolveContractId(explicit: string | undefined, fallback: string, label: string): string {
+  const contractId = explicit || fallback;
+  if (!contractId || contractId === UNSET_CONTRACT_ID) {
+    throw new Error(
+      `${label} is required: pass it explicitly in FluxapayConfig, or deploy the contract and populate FLUXAPAY_CONTRACT_IDS.`,
+    );
+  }
+  return contractId;
+}
+
 export class FluxapayClient {
   public contract: ContractClient;
   public networkSwitcher: NetworkProfileSwitcher;
@@ -245,27 +306,32 @@ export class FluxapayClient {
     this.networkSwitcher = new NetworkProfileSwitcher(config.network);
 
     const rpcUrl = config.rpcUrl || this.networkSwitcher.getProfile().rpcUrl;
+    const contractId = resolveContractId(
+      config.contractId,
+      FLUXAPAY_CONTRACT_IDS[config.network].paymentProcessor,
+      "contractId (PaymentProcessor)",
+    );
 
     this.contract = new ContractClient({
       networkPassphrase: this.networkSwitcher.getProfile().networkPassphrase,
       rpcUrl: rpcUrl,
-      contractId: config.contractId,
+      contractId,
     });
   }
 
   private getMerchantRegistry(): MerchantRegistryClient {
-    if (!this.config.merchantRegistryContractId) {
-      throw new Error(
-        "merchantRegistryContractId is required in FluxapayConfig for merchant registry operations",
-      );
-    }
+    const contractId = resolveContractId(
+      this.config.merchantRegistryContractId,
+      FLUXAPAY_CONTRACT_IDS[this.config.network].merchantRegistry,
+      "merchantRegistryContractId",
+    );
 
     if (!this.merchantRegistryClient) {
       const profile = this.networkSwitcher.getProfile();
       this.merchantRegistryClient = new MerchantRegistryClient({
         network: profile.environment,
         rpcUrl: this.config.rpcUrl || profile.rpcUrl,
-        contractId: this.config.merchantRegistryContractId,
+        contractId,
       });
     }
 
@@ -273,21 +339,22 @@ export class FluxapayClient {
   }
 
   /**
-   * Get an FX Oracle client when `oracleContractId` was provided in config.
+   * Get an FX Oracle client, using `oracleContractId` from config when
+   * provided, falling back to `FLUXAPAY_CONTRACT_IDS[network].fxOracle`.
    */
   fxOracle(): FxOracleClient {
-    if (!this.config.oracleContractId) {
-      throw new Error(
-        "oracleContractId is required in FluxapayConfig to use the FX Oracle client",
-      );
-    }
+    const oracleContractId = resolveContractId(
+      this.config.oracleContractId,
+      FLUXAPAY_CONTRACT_IDS[this.config.network].fxOracle,
+      "oracleContractId",
+    );
 
     if (!this.fxOracleClient) {
       const profile = this.networkSwitcher.getProfile();
       this.fxOracleClient = new FxOracleClient({
         network: profile.environment,
         rpcUrl: this.config.rpcUrl || profile.rpcUrl,
-        oracleContractId: this.config.oracleContractId,
+        oracleContractId,
       });
     }
 
@@ -707,18 +774,18 @@ export class FluxapayClient {
   }
 
   private getPaymentLinkManager(): PaymentLinkManagerClient {
-    if (!this.config.paymentLinkContractId) {
-      throw new Error(
-        "paymentLinkContractId is required in FluxapayConfig for payment link operations",
-      );
-    }
+    const contractId = resolveContractId(
+      this.config.paymentLinkContractId,
+      FLUXAPAY_CONTRACT_IDS[this.config.network].paymentLinkManager,
+      "paymentLinkContractId",
+    );
 
     if (!this.paymentLinkManagerClient) {
       const profile = this.networkSwitcher.getProfile();
       this.paymentLinkManagerClient = new PaymentLinkManagerClient({
         network: profile.environment,
         rpcUrl: this.config.rpcUrl || profile.rpcUrl,
-        contractId: this.config.paymentLinkContractId,
+        contractId,
       });
     }
 

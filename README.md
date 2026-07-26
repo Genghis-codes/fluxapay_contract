@@ -271,6 +271,10 @@ FluxaPay emits the following on-chain events for refund lifecycle tracking:
 
 For a detailed understanding of the contract structure, cross-contract interactions, role model, and payment lifecycle, see [docs/architecture.md](docs/architecture.md).
 
+## Error Codes
+
+For a unified reference of every contract error code (`PaymentProcessor`, `RefundManager`, `AccessControl`, `Stream`, `FXOracle`, `MerchantRegistry`, `MerchantAuth`, `DexRouter`, `AccountAbstraction`) with common causes and remediation steps, see [docs/error-codes.md](docs/error-codes.md).
+
 ## Telegram link
 
 <https://t.me/+m23gN14007w0ZmQ0>

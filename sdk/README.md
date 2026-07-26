@@ -48,6 +48,42 @@ async function main() {
 }
 ```
 
+## Contract IDs
+
+Every network environment (`mainnet`, `testnet`, `standalone`) has a canonical
+set of deployed contract addresses exported as `FLUXAPAY_CONTRACT_IDS`:
+
+```typescript
+import { FLUXAPAY_CONTRACT_IDS } from "@fluxapay/sdk";
+
+FLUXAPAY_CONTRACT_IDS.testnet.paymentProcessor;
+FLUXAPAY_CONTRACT_IDS.testnet.refundManager;
+FLUXAPAY_CONTRACT_IDS.testnet.merchantRegistry;
+FLUXAPAY_CONTRACT_IDS.testnet.fxOracle;
+FLUXAPAY_CONTRACT_IDS.testnet.paymentLinkManager;
+```
+
+`FluxapayClient` reads from this map automatically whenever a `*ContractId`
+field is omitted from its config, so you only need to pass explicit contract
+IDs when overriding the default deployment (e.g. testing against a locally
+deployed contract):
+
+```typescript
+// Uses FLUXAPAY_CONTRACT_IDS.testnet.paymentProcessor automatically —
+// no contractId needed.
+const client = new FluxapayClient({ network: "testnet" });
+```
+
+Until the mainnet contracts are deployed, every `FLUXAPAY_CONTRACT_IDS.mainnet.*`
+entry is set to the `UNSET_CONTRACT_ID` placeholder; constructing a client (or
+calling `fxOracle()` / merchant-registry / payment-link methods) against
+`mainnet` without an explicit override throws a clear configuration error
+rather than making an RPC call to a nonsense address. CI runs
+`scripts/check-mainnet-contract-ids.js` on every build, which prints a warning
+(without failing the build) listing any mainnet fields still left as
+placeholders — a reminder to update `sdk/src/network-profiles.ts` once the
+mainnet deployment lands.
+
 ## Features
 
 - **High-level Wrapper**: `FluxapayClient`, `RefundManagerClient`, `MerchantRegistryClient`, and `FxOracleClient` simplify complex contract interactions.

@@ -342,7 +342,7 @@ jobs:
             ${{ runner.os }}-proptest-regressions-
 
       - name: Run bounded property tests
-        run: PROPTEST_CASES=64 cargo test -p fluxapay proptests:: --all-features -- --test-threads=1
+        run: PROPTEST_CASES=256 cargo test -p fluxapay proptests:: --all-features -- --test-threads=1
 
       - name: Upload proptest regression cases
         if: failure()
@@ -459,6 +459,13 @@ jobs:
       - name: Test SDK
         working-directory: sdk
         run: npm test
+
+      - name: Check error map is in sync with contract source
+        working-directory: sdk
+        run: npm run check-error-map-sync
+
+      - name: Check mainnet contract IDs
+        run: node scripts/check-mainnet-contract-ids.js
 
   # Job 7: Lint GitHub Actions workflows with actionlint
   actionlint:

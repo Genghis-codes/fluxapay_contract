@@ -244,7 +244,7 @@ impl PaymentLinkManager {
 
         if let Some(expires_at) = link.expires_at {
             if env.ledger().timestamp() > expires_at {
-                return Err(crate::Error::PaymentExpired);
+                return Err(crate::Error::LinkExpired);
             }
         }
 
@@ -448,15 +448,91 @@ impl PaymentLinkManager {
         Ok(())
     }
 
+    /// Permissionless entry point that deactivates an expired payment link.
+    /// If the link has not expired or is already inactive, the call is idempotent
+    /// (succeeds without changing state). Emits LINK/EXPIRED on actual deactivation.
+    pub fn expire_link(env: Env, link_id: String) -> Result<(), crate::Error> {
+        let mut link = match Self::get_link_internal(&env, &link_id) {
+            Ok(link) => link,
+            Err(_) => return Ok(()), // Idempotent: missing link is not an error.
+        };
+
+        if !link.active {
+            return Ok(()); // Already inactive — nothing to do.
+        }
+
+        let expired = link
+            .expires_at
+            .map_or(false, |exp| env.ledger().timestamp() > exp);
+
+        if !expired {
+            return Ok(()); // Not expired — nothing to do.
+        }
+
+        link.active = false;
+        env.storage()
+            .persistent()
+            .set(&LinkDataKey::Link(link_id.clone()), &link);
+
+        env.events().publish(
+            (Symbol::new(&env, "LINK"), Symbol::new(&env, "EXPIRED")),
+            link_id,
+        );
+
+        Ok(())
+    }
+
+    /// Batch deactivate expired payment links (max 20 per call).
+    /// Iterates over the provided link IDs and calls expire_link for each.
+    /// Returns the count of links that were actually deactivated.
+    pub fn batch_expire_links(env: Env, link_ids: Vec<String>) -> Result<u32, crate::Error> {
+        if link_ids.len() > 20 {
+            return Err(crate::Error::BatchTooLarge);
+        }
+
+        let mut deactivated: u32 = 0;
+        for link_id in link_ids.iter() {
+            // Use expire_link directly to emit individual events.
+            if let Ok(()) = Self::expire_link(env.clone(), link_id.clone()) {
+                // Check if the link was actually deactivated by reading it back.
+                if let Ok(link) = Self::get_link_internal(&env, &link_id) {
+                    if !link.active && link.expires_at.map_or(false, |exp| env.ledger().timestamp() > exp) {
+                        deactivated += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(deactivated)
+    }
+
     pub fn get_link(env: Env, link_id: String) -> Result<PaymentLink, crate::Error> {
         Self::get_link_internal(&env, &link_id)
     }
 
+    /// Retrieve a payment link, automatically deactivating it if expired.
+    /// Returns the link with `active: false` when the expiry timestamp has passed,
+    /// even if `expire_link` has not been called explicitly.
     fn get_link_internal(env: &Env, link_id: &String) -> Result<PaymentLink, crate::Error> {
-        env.storage()
+        let mut link: PaymentLink = env
+            .storage()
             .persistent()
             .get(&LinkDataKey::Link(link_id.clone()))
-            .ok_or(crate::Error::PaymentNotFound)
+            .ok_or(crate::Error::PaymentNotFound)?;
+
+        // Auto-deactivate expired links on read.
+        if link.active {
+            if let Some(expires_at) = link.expires_at {
+                if env.ledger().timestamp() > expires_at {
+                    link.active = false;
+                    env.storage()
+                        .persistent()
+                        .set(&LinkDataKey::Link(link_id.clone()), &link);
+                }
+            }
+        }
+
+        Ok(link)
     }
 
     /// Retrieve analytics for a payment link.

@@ -932,5 +932,259 @@ fn test_get_link_analytics_not_found() {
     client.get_link_analytics(&nonexistent);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Issue #476: Payment link expiry auto-deactivation                  */
+/* ------------------------------------------------------------------ */
 
+#[test]
+fn test_use_link_expired_rejects() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "expired_link");
+    let now = env.ledger().timestamp();
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Expiring link"),
+        &Some(now - 1), // Already expired
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    let result = client.try_use_link(&payer, &link_id, &1000, &None);
+    assert_eq!(result, Err(Ok(crate::Error::LinkExpired)));
+}
+
+#[test]
+fn test_use_link_non_expired_accepts() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "valid_link");
+    let now = env.ledger().timestamp();
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Valid link"),
+        &Some(now + 3600), // Expires in future
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    let result = client.try_use_link(&payer, &link_id, &1000, &None);
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_expire_link_deactivates() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "deactivate_me");
+    let now = env.ledger().timestamp();
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "To deactivate"),
+        &Some(now - 100), // Already expired
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    client.expire_link(&link_id);
+
+    let link = client.get_link(&link_id);
+    assert!(!link.active);
+}
+
+#[test]
+fn test_expire_link_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "idempotent_link");
+    let now = env.ledger().timestamp();
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Idempotent"),
+        &Some(now - 100),
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    // Calling expire_link twice should succeed both times.
+    assert!(client.try_expire_link(&link_id).is_ok());
+    assert!(client.try_expire_link(&link_id).is_ok());
+
+    let link = client.get_link(&link_id);
+    assert!(!link.active);
+}
+
+#[test]
+fn test_expire_link_non_expired_skips() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "still_valid");
+    let now = env.ledger().timestamp();
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Still valid"),
+        &Some(now + 3600),
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    client.expire_link(&link_id);
+    let link = client.get_link(&link_id);
+    assert!(link.active); // Should still be active
+}
+
+#[test]
+fn test_get_link_auto_deactivates_expired() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "auto_deactivate");
+    let now = env.ledger().timestamp();
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Auto deactivate"),
+        &Some(now - 100),
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    // get_link should return active: false for expired links.
+    let link = client.get_link(&link_id);
+    assert!(!link.active);
+}
+
+#[test]
+fn test_batch_expire_links_sweep() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let now = env.ledger().timestamp();
+
+    let mut link_ids = soroban_sdk::vec![&env];
+    for i in 0..3 {
+        let lid = String::from_str(&env, &format!("batch_{}", i));
+        client.create_link(
+            &merchant,
+            &lid,
+            &Some(1000i128),
+            &Symbol::new(&env, "USDC"),
+            &String::from_str(&env, "Batch"),
+            &Some(now - 100),
+            &None,
+            &false,
+            &None,
+            &MaybeFiatConfig::None,
+        );
+        link_ids.push_back(lid);
+    }
+
+    let count = client.batch_expire_links(&link_ids);
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn test_batch_expire_links_max_20() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let mut oversized = soroban_sdk::vec![&env];
+    for i in 0..21 {
+        oversized.push_back(String::from_str(&env, &format!("ovr_{}", i)));
+    }
+
+    let result = client.try_batch_expire_links(&oversized);
+    assert_eq!(result, Err(Ok(crate::Error::BatchTooLarge)));
+}
+
+#[test]
+fn test_expire_link_missing_is_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_merchant, client) = setup_payment_link(&env);
+
+    let result = client.try_expire_link(&String::from_str(&env, "nonexistent"));
+    assert!(result.is_ok());
+}
+
+#[test]
+fn test_link_expired_event_emitted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+
+    let link_id = String::from_str(&env, "event_link");
+    let now = env.ledger().timestamp();
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Event test"),
+        &Some(now - 100),
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    client.expire_link(&link_id);
+
+    let has_expired_event = env
+        .events()
+        .all()
+        .iter()
+        .any(|e| {
+            let topics = e.0.clone();
+            topics.len() >= 2
+                && topics.get(0).and_then(|t| t.try_into_val::<Symbol>(&env).ok())
+                    == Some(Symbol::new(&env, "LINK"))
+                && topics.get(1).and_then(|t| t.try_into_val::<Symbol>(&env).ok())
+                    == Some(Symbol::new(&env, "EXPIRED"))
+        });
+    assert!(has_expired_event);
+}
 

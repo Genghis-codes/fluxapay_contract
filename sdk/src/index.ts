@@ -32,6 +32,7 @@ import {
   type LinkAnalytics,
   type CreateLinkParams,
 } from "./contracts/payment-link-manager.js";
+import { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
 
 
 
@@ -222,6 +223,7 @@ export class FluxapayClient {
   private fxOracleClient?: FxOracleClient;
   private merchantRegistryClient?: MerchantRegistryClient;
   private paymentLinkManagerClient?: PaymentLinkManagerClient;
+  private sep10Authenticator?: SEP10Authenticator;
   private readonly config: FluxapayConfig;
 
   constructor(config: FluxapayConfig) {
@@ -295,6 +297,44 @@ export class FluxapayClient {
     this.fxOracleClient = undefined;
     this.merchantRegistryClient = undefined;
     this.paymentLinkManagerClient = undefined;
+    this.sep10Authenticator = undefined;
+  }
+
+  /**
+   * Issue #490: Initialize SEP-10 authenticator for merchant authentication.
+   * Must be called before using SEP-10 authentication methods.
+   */
+  public initSEP10(serverPublicKey: string, homeDomain?: string): void {
+    const profile = this.networkSwitcher.getProfile();
+    this.sep10Authenticator = new SEP10Authenticator(
+      serverPublicKey,
+      profile.networkPassphrase,
+      homeDomain,
+    );
+  }
+
+  /**
+   * Issue #490: Generate a SEP-10 challenge for a merchant keypair.
+   */
+  public generateSEP10Challenge(merchantPublicKey: string): SEP10ChallengeResponse {
+    if (!this.sep10Authenticator) {
+      throw new Error("SEP10 authenticator not initialized. Call initSEP10() first.");
+    }
+    return this.sep10Authenticator.generateChallenge(merchantPublicKey);
+  }
+
+  /**
+   * Issue #490: Verify a signed SEP-10 challenge and return JWT for API access.
+   */
+  public authorizeSEP10(
+    challengeXdr: string,
+    signedXdr: string,
+    merchantPublicKey: string,
+  ): SEP10AuthenticatedResponse {
+    if (!this.sep10Authenticator) {
+      throw new Error("SEP10 authenticator not initialized. Call initSEP10() first.");
+    }
+    return this.sep10Authenticator.authenticate(challengeXdr, signedXdr, merchantPublicKey);
   }
 
   /**
@@ -606,6 +646,52 @@ export class FluxapayClient {
     );
   }
 
+  /**
+   * Issue #489: Get payment by metadata_hash for order reconciliation.
+   * Performs reverse lookup using the merchant-supplied metadata hash.
+   */
+  async getPaymentByMetadataHash(metadataHash: Buffer) {
+    return withMappedContractError(() =>
+      this.contract.get_payment_by_metadata_hash({ metadata_hash: metadataHash }),
+    );
+  }
+
+  /**
+   * Issue #492: Get customer profile for a merchant.
+   */
+  async getCustomer(merchantId: string, customerId: string) {
+    return withMappedContractError(() =>
+      this.contract.get_customer({ merchant_id: merchantId, customer_id: customerId }),
+    );
+  }
+
+  /**
+   * Issue #492: Get top customers for a merchant sorted by total spending.
+   */
+  async getTopCustomers(merchantId: string, limit: number) {
+    return withMappedContractError(() =>
+      this.contract.get_top_customers({ merchant_id: merchantId, limit }),
+    );
+  }
+
+  /**
+   * Issue #488: Public TTL bump for a single payment (permissionless).
+   */
+  async bumpPaymentTTL(paymentId: string) {
+    return withMappedContractError(() =>
+      this.contract.bump_payment_ttl_public({ payment_id: paymentId }),
+    );
+  }
+
+  /**
+   * Issue #488: Bulk bump TTLs for payment maintenance (max 50 per call).
+   */
+  async bulkBumpPaymentTTLs(paymentIds: string[]) {
+    return withMappedContractError(() =>
+      this.contract.bulk_bump_payment_ttls({ payment_ids: paymentIds }),
+    );
+  }
+
   private getPaymentLinkManager(): PaymentLinkManagerClient {
     if (!this.config.paymentLinkContractId) {
       throw new Error(
@@ -759,6 +845,7 @@ export {
   type LinkAnalytics,
   type CreateLinkParams,
 } from "./contracts/payment-link-manager.js";
+export { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
 
 
 

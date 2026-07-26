@@ -48,6 +48,42 @@ async function main() {
 }
 ```
 
+## Contract IDs
+
+Every network environment (`mainnet`, `testnet`, `standalone`) has a canonical
+set of deployed contract addresses exported as `FLUXAPAY_CONTRACT_IDS`:
+
+```typescript
+import { FLUXAPAY_CONTRACT_IDS } from "@fluxapay/sdk";
+
+FLUXAPAY_CONTRACT_IDS.testnet.paymentProcessor;
+FLUXAPAY_CONTRACT_IDS.testnet.refundManager;
+FLUXAPAY_CONTRACT_IDS.testnet.merchantRegistry;
+FLUXAPAY_CONTRACT_IDS.testnet.fxOracle;
+FLUXAPAY_CONTRACT_IDS.testnet.paymentLinkManager;
+```
+
+`FluxapayClient` reads from this map automatically whenever a `*ContractId`
+field is omitted from its config, so you only need to pass explicit contract
+IDs when overriding the default deployment (e.g. testing against a locally
+deployed contract):
+
+```typescript
+// Uses FLUXAPAY_CONTRACT_IDS.testnet.paymentProcessor automatically —
+// no contractId needed.
+const client = new FluxapayClient({ network: "testnet" });
+```
+
+Until the mainnet contracts are deployed, every `FLUXAPAY_CONTRACT_IDS.mainnet.*`
+entry is set to the `UNSET_CONTRACT_ID` placeholder; constructing a client (or
+calling `fxOracle()` / merchant-registry / payment-link methods) against
+`mainnet` without an explicit override throws a clear configuration error
+rather than making an RPC call to a nonsense address. CI runs
+`scripts/check-mainnet-contract-ids.js` on every build, which prints a warning
+(without failing the build) listing any mainnet fields still left as
+placeholders — a reminder to update `sdk/src/network-profiles.ts` once the
+mainnet deployment lands.
+
 ## Features
 
 - **High-level Wrapper**: `FluxapayClient`, `RefundManagerClient`, `MerchantRegistryClient`, and `FxOracleClient` simplify complex contract interactions.
@@ -429,6 +465,81 @@ await linkClient.useLink("G_payer...", linkId, 10_000_000n, "C...");
 await linkClient.deactivateLink("G_merchant...", linkId);
 const active = await linkClient.verifyBatch([linkId]);
 ```
+
+## Payment Streams
+
+`FluxapayClient` exposes wrappers for continuous payment streaming (`PaymentProcessor.create_stream` and related on-chain methods).
+
+```typescript
+const stream = await client.createStream({
+  sender: "G_SENDER...",
+  receiver: "G_RECEIVER...",
+  token: "C_USDC_TOKEN...",
+  ratePerSecond: 100n,
+  deposit: 1_000_000n,
+  streamId: "stream_001",
+});
+
+await client.topUpStream("G_SENDER...", "stream_001", 500_000n);
+await client.pauseStream("G_SENDER...", "stream_001");
+await client.resumeStream("G_SENDER...", "stream_001");
+
+// Withdraw everything accrued so far to the receiver
+await client.withdrawStream("G_RECEIVER...", "stream_001");
+
+const details = await client.getStream("stream_001");
+const senderStreams = await client.getSenderStreams("G_SENDER...");
+
+await client.cancelStream("G_SENDER...", "stream_001");
+```
+
+## Gas Estimation
+
+`GasEstimatorClient` queries the on-chain `GasEstimator` contract for predicted Soroban resource costs (instructions, ledger reads/writes, events, and resource fee in stroops) before submitting a transaction.
+
+```typescript
+import { GasEstimatorClient } from "@fluxapay/sdk";
+
+const gasEstimator = new GasEstimatorClient({
+  network: "testnet",
+  gasEstimatorContractId: "C...", // GasEstimator contract ID
+});
+
+const estimate = await gasEstimator.estimate("CreatePayment");
+console.log(estimate.resourceFeeStroops);
+
+const allEstimates = await gasEstimator.estimateAll();
+```
+
+## Offline / Hardware Wallet Signing
+
+`FluxapayClient.offlineSigner()` returns a `FluxapayOfflineSigner` that builds unsigned transaction payloads (XDR + JSON snapshot + required signers) for offline or hardware-wallet signing workflows, without submitting them.
+
+Supported operations: `create_payment`, `verify_payment`, `create_refund`, and (for backend billing services) `charge_subscription` and `pull_payment`.
+
+```typescript
+const signer = client.offlineSigner();
+
+// Pre-build a subscription tick for batch submission or hardware-wallet signing.
+const tickPayload = await signer.buildSubscriptionTick({
+  operator: "G_OPERATOR...",
+  subscriptionId: "sub_123",
+  token: "C_USDC_TOKEN...",
+});
+
+// Pre-build a pre-authorized pull payment.
+const pullPayload = await signer.buildPullAuthorization({
+  merchant: "G_MERCHANT...",
+  customer: "G_CUSTOMER...",
+  amount: 5_000_000n,
+});
+
+// Each payload contains `unsignedXdr`, `hash`, `json`, and `requiredAuthSigners`.
+// Sign `unsignedXdr` offline, then restore + submit:
+const restored = signer.restore(tickPayload);
+```
+
+You can also use the standalone builder functions directly: `buildSubscriptionTickPayload`, `buildPullAuthorizationPayload`, `buildCreatePaymentPayload`, `buildVerifyPaymentPayload`, `buildCreateRefundPayload`.
 
 ## License
 

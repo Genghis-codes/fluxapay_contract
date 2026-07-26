@@ -337,7 +337,6 @@ impl FXOracle {
             .set(&OracleDataKey::StalenessThreshold, &threshold);
         Ok(())
     }
-}
 
     /// Issue #478: Set maximum allowed rate deviation per currency pair in basis points.
     /// Example: 1000 = 10% max allowed deviation.

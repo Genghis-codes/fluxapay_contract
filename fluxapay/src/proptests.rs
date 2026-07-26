@@ -1,3 +1,21 @@
+//! Property-based tests (proptest) for invariants that are hard to fully
+//! enumerate with discrete unit tests.
+//!
+//! CI runs this module with `PROPTEST_CASES=256` (see `.github/workflows/ci.yml`,
+//! "Run bounded property tests") so each property below is fuzzed with 256
+//! random inputs per run.
+//!
+//! ## Refund sum invariant (added for #463)
+//! - `proptest_refund_sum_never_exceeds_payment` — fuzzes a random
+//!   `payment_amount` and a random sequence of partial refund amounts against
+//!   `RefundManager::create_refund`, asserting that the running total of
+//!   non-rejected refunds never exceeds the payment amount, and that any
+//!   rejected request would indeed have caused an overage.
+//! - `proptest_concurrent_refund_creation` — same invariant, but with each
+//!   refund request in the sequence coming from a distinct requester address
+//!   against the same `payment_id`, modeling multiple parties racing to
+//!   refund one payment before any request is approved or rejected.
+
 extern crate alloc;
 use alloc::format;
 use crate::format_id;
@@ -10,7 +28,8 @@ use soroban_sdk::{
 
 use crate::{
     access_control::{role_merchant, role_oracle},
-    Error, PaymentProcessor, PaymentProcessorClient, PaymentStatus, PAYMENT_TOLERANCE,
+    Error, PaymentProcessor, PaymentProcessorClient, PaymentStatus, RefundManager,
+    RefundManagerClient, RefundStatus, PAYMENT_TOLERANCE,
 };
 
 fn setup_payment_processor(env: &Env) -> (Address, PaymentProcessorClient<'_>) {
@@ -18,6 +37,25 @@ fn setup_payment_processor(env: &Env) -> (Address, PaymentProcessorClient<'_>) {
     let client = PaymentProcessorClient::new(env, &contract_id);
     let admin = Address::generate(env);
     client.initialize_payment_processor(&admin);
+    (admin, client)
+}
+
+fn setup_refund_manager(env: &Env) -> (Address, RefundManagerClient<'_>) {
+    use soroban_sdk::token;
+
+    let contract_id = env.register(RefundManager, ());
+    let client = RefundManagerClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+
+    let token_admin = Address::generate(env);
+    let usdc_token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    client.initialize_refund_manager(&admin, &usdc_token);
+
+    let token_admin_client = token::StellarAssetClient::new(env, &usdc_token);
+    token_admin_client.mint(&contract_id, &1_000_000_000_000_000i128);
+
     (admin, client)
 }
 
@@ -269,5 +307,119 @@ proptest! {
         let after = compute_remaining_after_withdraw(remaining, withdraw);
         prop_assert!(after >= 0);
         prop_assert!(after <= remaining.max(0));
+    }
+
+    /// The sum of all non-rejected refunds for a payment must never exceed
+    /// the original payment amount, no matter what sequence of (possibly
+    /// oversized) partial refund amounts is requested against it.
+    #[test]
+    fn proptest_refund_sum_never_exceeds_payment(
+        payment_amount in 1i128..=i128::MAX / 2,
+        refund_amounts in prop::collection::vec(1i128..=1_000_000_000i128, 1..8),
+        nonce in 0u64..u64::MAX,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup_refund_manager(&env);
+
+        let payment_id = format_id(&env, "refund_inv_", nonce);
+        let merchant_id = Address::generate(&env);
+        let requester = Address::generate(&env);
+
+        client.register_payment(
+            &payment_id,
+            &merchant_id,
+            &payment_amount,
+            &Symbol::new(&env, "USDC"),
+        );
+
+        let mut accepted_total: i128 = 0;
+
+        for &amount in refund_amounts.iter() {
+            let reason = soroban_sdk::String::from_str(&env, "prop refund");
+            let result = client.try_create_refund(&payment_id, &amount, &reason, &requester);
+
+            match result {
+                Ok(_) => {
+                    accepted_total += amount;
+                    prop_assert!(
+                        accepted_total <= payment_amount,
+                        "accepted refund total {} exceeded payment amount {}",
+                        accepted_total,
+                        payment_amount
+                    );
+                }
+                Err(Ok(Error::RefundExceedsPayment)) => {
+                    prop_assert!(
+                        accepted_total + amount > payment_amount,
+                        "refund of {} was rejected but total {} + {} would not have exceeded {}",
+                        amount,
+                        accepted_total,
+                        amount,
+                        payment_amount
+                    );
+                }
+                other => prop_assert!(false, "unexpected result: {:?}", other),
+            }
+        }
+
+        // Cross-check the invariant against contract-tracked refund state directly.
+        let refunds = client.get_payment_refunds(&payment_id);
+        let mut tracked_total: i128 = 0;
+        for r in refunds.iter() {
+            if r.status != RefundStatus::Rejected {
+                tracked_total += r.amount;
+            }
+        }
+        prop_assert_eq!(tracked_total, accepted_total);
+        prop_assert!(tracked_total <= payment_amount);
+    }
+
+    /// Simulates several requesters racing to refund the same payment: even
+    /// when refund requests for the same `payment_id` are interleaved across
+    /// different requester addresses (no single requester "owns" the order),
+    /// the cumulative non-rejected refund total must still never exceed the
+    /// payment amount.
+    #[test]
+    fn proptest_concurrent_refund_creation(
+        payment_amount in 1i128..=1_000_000_000i128,
+        refund_amounts in prop::collection::vec(1i128..=500_000_000i128, 2..8),
+        nonce in 0u64..u64::MAX,
+    ) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_admin, client) = setup_refund_manager(&env);
+
+        let payment_id = format_id(&env, "refund_race_", nonce);
+        let merchant_id = Address::generate(&env);
+
+        client.register_payment(
+            &payment_id,
+            &merchant_id,
+            &payment_amount,
+            &Symbol::new(&env, "USDC"),
+        );
+
+        // Each "concurrent" request comes from a distinct requester address,
+        // all targeting the same payment_id before any are approved/rejected.
+        let mut accepted_total: i128 = 0;
+        for &amount in refund_amounts.iter() {
+            let requester = Address::generate(&env);
+            let reason = soroban_sdk::String::from_str(&env, "concurrent refund");
+            let result = client.try_create_refund(&payment_id, &amount, &reason, &requester);
+
+            if result.is_ok() {
+                accepted_total += amount;
+            }
+            prop_assert!(accepted_total <= payment_amount);
+        }
+
+        let refunds = client.get_payment_refunds(&payment_id);
+        let tracked_total: i128 = refunds
+            .iter()
+            .filter(|r| r.status != RefundStatus::Rejected)
+            .map(|r| r.amount)
+            .sum();
+        prop_assert!(tracked_total <= payment_amount);
     }
 }

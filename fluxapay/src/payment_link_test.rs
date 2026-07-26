@@ -966,19 +966,6 @@ fn test_create_link_with_base_url_sets_shareable_url() {
 
     let link_id = String::from_str(&env, "share_link");
     let base = String::from_str(&env, "https://pay.fluxapay.app");
-/* ------------------------------------------------------------------ */
-/*  Issue #476: Payment link expiry auto-deactivation                  */
-/* ------------------------------------------------------------------ */
-
-#[test]
-fn test_use_link_expired_rejects() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (merchant, client) = setup_payment_link(&env);
-    let payer = Address::generate(&env);
-
-    let link_id = String::from_str(&env, "expired_link");
-    let now = env.ledger().timestamp();
     client.create_link(
         &merchant,
         &link_id,
@@ -986,8 +973,8 @@ fn test_use_link_expired_rejects() {
         &Symbol::new(&env, "USDC"),
         &String::from_str(&env, "Shareable"),
         &None,
-        &String::from_str(&env, "Expiring link"),
-        &Some(now - 1), // Already expired
+        &None,
+        &None,
         &None,
         &false,
         &None,
@@ -1008,10 +995,25 @@ fn test_create_link_without_base_url_returns_none() {
     let (merchant, client) = setup_payment_link(&env);
 
     let link_id = String::from_str(&env, "no_base_link");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "No Base"),
+        &None,
+        &String::from_str(&env, "Valid link"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
     );
 
-    let result = client.try_use_link(&payer, &link_id, &1000, &None);
-    assert_eq!(result, Err(Ok(crate::Error::LinkExpired)));
+    let link = client.get_link(&link_id);
+    assert!(link.shareable_url.is_none());
+    assert!(client.get_link_url(&link_id).is_none());
 }
 
 #[test]
@@ -1131,10 +1133,26 @@ fn test_create_link_metadata_key_too_long() {
     );
 }
 
+#[test]
+fn test_expire_link_deactivates_manual() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let link_id = String::from_str(&env, "manual_link");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(1000i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Manual"),
+        &None,
+        &None,
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
     );
-
     client.expire_link(&link_id);
-
     let link = client.get_link(&link_id);
     assert!(!link.active);
 }

@@ -153,16 +153,7 @@ pub struct Merchant {
     pub fee_config: MaybeFeeConfig,
     /// IPFS hash for content-addressable merchant metadata (issue #208)
     pub metadata_hash: Option<String>,
-    /// Merchant settlement schedule configuration (issue #480).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SettlementSchedule {
-    Daily,
-    Weekly,
-    Manual,
-}
-
-/// Multi-currency payout addresses mapping (issue #216)
+    /// Multi-currency payout addresses mapping (issue #216)
     pub currency_payout_addresses: Map<String, Address>,
     /// Whitelist of approved payout addresses (issue #210)
     pub payout_whitelist: Vec<Address>,
@@ -184,6 +175,14 @@ pub enum SettlementSchedule {
     pub dispute_count: u32,
     /// Issue #481: Count of disputes resolved against this merchant (incremented on unfavorable resolution).
     pub resolved_against_merchant_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettlementSchedule {
+    Daily,
+    Weekly,
+    Manual,
 }
 
 #[contracttype]
@@ -1490,9 +1489,6 @@ impl MerchantRegistry {
                 Symbol::new(&env, "MERCHANT"),
                 Symbol::new(&env, "ANCHOR_UPDATED"),
             ),
-            (merchant_id, domain_for_event),
-        );
-
             (merchant_id, domain),
         );
         Ok(())
@@ -1678,6 +1674,16 @@ impl MerchantRegistry {
         env.storage()
             .persistent()
             .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "SETTLEMENT_SCHEDULE_UPDATED"),
+            ),
+            (merchant_id, schedule),
+        );
+        Ok(())
+    }
+
     /// Issue #481: Set the global dispute threshold for auto-suspension.
     /// When a merchant's resolved_against_merchant_count reaches or exceeds this,
     /// the merchant is automatically suspended.
@@ -1705,9 +1711,6 @@ impl MerchantRegistry {
         env.events().publish(
             (
                 Symbol::new(&env, "MERCHANT"),
-                Symbol::new(&env, "SETTLEMENT_SCHEDULE_UPDATED"),
-            ),
-            (merchant_id, schedule),
                 Symbol::new(&env, "DISPUTE_THRESHOLD_SET"),
             ),
             threshold,

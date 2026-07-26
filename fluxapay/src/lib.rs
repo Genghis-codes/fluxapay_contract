@@ -34,6 +34,9 @@ const REFUND_FEE_BPS_BASIC: i128 = 100;     // 1.0% for Basic tier
 const REFUND_FEE_BPS_FULL: i128 = 80;       // 0.8% for Full tier
 const REFUND_FEE_BPS_BUSINESS: i128 = 50;   // 0.5% for Business tier
 
+/// Default window (Issue #170) during which a pending refund may be processed,
+/// measured from `Refund::created_at`. Configurable via `set_refund_expiry`.
+pub const DEFAULT_REFUND_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
 // Issue #63: Monthly processing volume caps per KYC tier (in USDC stroops, 7 decimals)
 // Unverified: $500, Basic: $10,000, Full: $100,000, Business: unlimited (i128::MAX)
 const TIER_CAP_UNVERIFIED: i128 = 5_000_000_000;       // $500
@@ -61,6 +64,7 @@ pub mod fx_oracle;
 pub mod merchant_auth;
 mod payment_state_machine;
 use access_control::{
+    role_admin, role_arbitrator, role_merchant, role_oracle, role_settlement_operator, AccessControl,
     role_admin, role_merchant, role_oracle, role_settlement_operator, role_arbitrator, AccessControl,
     AdminAction, AdminProposal,
 };
@@ -105,6 +109,10 @@ pub struct PaymentCharge {
     pub token_address: Option<Address>,
     /// Optional 32-byte hash merchants can use to tie a payment to an order ID or customer ID.
     pub metadata_hash: Option<BytesN<32>>,
+    /// Issue #304: FX rate snapshot captured during verify_payment.
+    pub fx_rate: Option<i128>,
+    /// Issue #304: Timestamp when the FX rate was captured.
+    pub fx_rate_at: Option<u64>,
     /// Issue #173: Original token address used by payer (for swap_and_pay refunds).
     pub original_token: Option<Address>,
     /// Issue #173: Swap path used in swap_and_pay (for refund routing).
@@ -158,6 +166,8 @@ pub struct Refund {
     pub requester: Address,
     pub created_at: u64,
     pub processed_at: Option<u64>,
+    /// Cryptographic proof hash of return agreement for off-chain verification (Issue #176).
+    pub receipt_hash: Option<BytesN<32>>,
     /// Issue #168: Approved by operator, allowing customer to claim.
     pub approved: bool,
     /// Cryptographic proof hash of return agreement for off-chain verification (Issue #176).
@@ -296,6 +306,14 @@ pub enum Error {
     InvalidResumeTimestamp = 32,
     /// Merchant authorization error (see MerchantAuthError for details).
     MerchantAuthError = 33,
+    /// Dispute payout_splits amounts don't sum to the dispute amount (Issue #446).
+    InvalidSplitSum = 34,
+    /// Refund policy requires a receipt_hash but none was provided (Issue #176).
+    MissingReceiptHash = 35,
+    /// Refund's `expiry_at` deadline has passed (Issue #170).
+    RefundExpired = 34,
+    /// Arbitrator has already cast a vote on this dispute.
+    AlreadyVoted = 35,
     /// Merchant has exceeded their KYC tier monthly processing volume cap.
     TierVolumeLimitExceeded = 34,
     /// Refund requested before cooldown period elapsed.
@@ -346,12 +364,14 @@ pub enum Error {
     DirectTransferNotDisputable = 54,
     /// Issue #482: Maximum retry chain depth (3) exceeded for payment retry.
     MaxRetriesExceeded = 54,
-    /// Issue #478: FX oracle rate deviation exceeds configured limit.
-    RateDeviationExceeded = 55,
     /// Issue #505: Invalid payment status transition attempted.
     InvalidStatusTransition = 54,
     /// Issue #450: Customer called `claim_refund` before an operator approved it.
     RefundNotApproved = 56,
+    /// Issue #437: DEX router is not in the allowed routers list.
+    RouterNotAllowed = 56,
+    /// Issue #436: Aggregate route output is less than minimum output amount.
+    RouteOutputInsufficient = 57,
 }
 
 #[contracttype]
@@ -429,6 +449,15 @@ pub struct SwapAndPayArgs {
     pub max_deviation_bps: u32,
 }
 
+/// Issue #436: Single route for multi-DEX route splitting / aggregation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapRoute {
+    pub router: Address,
+    pub path: Vec<Address>,
+    pub amount_in: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PauseState {
@@ -496,6 +525,25 @@ pub struct VoteTally {
     pub vote_count: u32,
 }
 
+/// Number of `ARBITRATOR`-role votes (either direction) required to
+/// auto-execute a dispute resolution via [`FluxaPayContract::vote_dispute`].
+pub const ARBITRATOR_VOTING_THRESHOLD: u32 = 3;
+
+/// Vote choice for the simple `ARBITRATOR`-role voting flow (as opposed to
+/// the stake-weighted [`VoteChoice`] flow above).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArbitratorVoteChoice {
+    Approve,
+    Reject,
+}
+
+/// Accumulated vote counts for the `ARBITRATOR`-role voting flow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorVoteTally {
+    pub approve_count: u32,
+    pub reject_count: u32,
 /// Record of a single admin treasury withdrawal.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -802,6 +850,19 @@ pub enum DataKey {
     DisputeVote(String, Address),
     /// Tally of votes for a dispute
     DisputeVoteTally(String),
+    /// Cross-contract address of the configured FX oracle (Issue #304).
+    FxOracleAddress,
+    /// Whether `process_refund` requires a `receipt_hash` on refunds (Issue #176).
+    RequireReceiptHash,
+    /// Cross-contract address of the configured DEX router (Issue #173).
+    DexRouterAddress,
+    /// Configurable refund expiry window in seconds (Issue #170).
+    RefundExpirySecs,
+    /// Vote cast by an arbitrator under the simple ARBITRATOR-role voting
+    /// flow: (dispute_id, arbitrator) → ArbitratorVoteChoice.
+    ArbitratorVote(String, Address),
+    /// Tally of ARBITRATOR-role votes for a dispute.
+    ArbitratorVoteTally(String),
     /// Issue #168: Fee split configuration (treasury_bps, developer_bps, treasury_addr, developer_addr)
     FeeSplitConfig,
     /// Monthly volume tracker: (merchant_id, month_epoch) → i128 cumulative amount
@@ -884,6 +945,12 @@ pub enum DataKey {
     MetadataHashPayment(BytesN<32>),
     /// Issue #492: Customer profile keyed by (merchant_id, customer_id) for CRM features.
     CustomerProfile(Address, Address),
+    /// Issue #437: Allowlisted DEX router address
+    AllowedRouter(Address),
+    /// Issue #437: List of allowlisted DEX router addresses
+    AllowedRoutersList,
+    /// Issue #434: Wrapped XLM (WXLM) token contract address
+    WrappedXlmContract,
 }
 
 /// Default initial contract version string.
@@ -944,6 +1011,40 @@ impl RefundManager {
         env.storage()
             .persistent()
             .set(&DataKey::UsdcToken, &usdc_token_address);
+        Ok(())
+    }
+
+    /// Admin: configure the DEX router used to route swap_and_pay refunds
+    /// back to the payer's original token (Issue #173).
+    pub fn set_dex_router_address(
+        env: Env,
+        admin: Address,
+        dex_router: Address,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::DexRouterAddress, &dex_router);
+        Ok(())
+    }
+
+    /// Admin: require a `receipt_hash` on every refund before `process_refund`
+    /// will execute it (Issue #176).
+    pub fn set_refund_policy(
+        env: Env,
+        admin: Address,
+        require_receipt_hash: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::RequireReceiptHash, &require_receipt_hash);
         Ok(())
     }
 
@@ -1112,6 +1213,79 @@ impl RefundManager {
             .get::<DataKey, bool>(&DataKey::Blacklisted(address.clone()))
             .unwrap_or(false)
         {
+            let payment = PaymentCharge {
+                payment_id: payment_id.clone(),
+                merchant_id,
+                amount,
+                currency,
+                deposit_address: env.current_contract_address(),
+                status: PaymentStatus::Confirmed,
+                payer_address: None,
+                transaction_hash: None,
+                created_at: env.ledger().timestamp(),
+                confirmed_at: None,
+                expires_at: 0,
+                amount_received: None,
+                memo: None,
+                memo_type: None,
+                token_address: None,
+                metadata_hash: None,
+                fx_rate: None,
+                fx_rate_at: None,
+                original_token: None,
+                swap_path: None,
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(payment_id.clone()), &payment);
+            Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+        }
+    }
+
+    /// Like `register_payment`, but also records the original token and swap
+    /// path used by a `swap_and_pay` payment, so `process_refund` can route
+    /// the refund back through the DEX to the payer's original token
+    /// (Issue #173).
+    pub fn register_swap_payment(
+        env: Env,
+        payment_id: String,
+        merchant_id: Address,
+        amount: i128,
+        currency: Symbol,
+        original_token: Address,
+        swap_path: Vec<Address>,
+    ) {
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Payment(payment_id.clone()))
+        {
+            let payment = PaymentCharge {
+                payment_id: payment_id.clone(),
+                merchant_id,
+                amount,
+                currency,
+                deposit_address: env.current_contract_address(),
+                status: PaymentStatus::Confirmed,
+                payer_address: None,
+                transaction_hash: None,
+                created_at: env.ledger().timestamp(),
+                confirmed_at: None,
+                expires_at: 0,
+                amount_received: None,
+                memo: None,
+                memo_type: None,
+                token_address: None,
+                metadata_hash: None,
+                fx_rate: None,
+                fx_rate_at: None,
+                original_token: Some(original_token),
+                swap_path: Some(swap_path),
+            };
+            env.storage()
+                .persistent()
+                .set(&DataKey::Payment(payment_id.clone()), &payment);
+            Self::bump_payment_ttl(&env, &payment_id, &payment.status);
             return Err(Error::Unauthorized);
         }
         Ok(())
@@ -1122,6 +1296,15 @@ impl RefundManager {
     /// `treasury_bps + developer_bps` must be ≤ 10 000; any remainder goes to treasury.
     pub fn configure_fee_split(
         env: Env,
+        payment_id: String,
+        refund_amount: i128,
+        reason: String,
+        requester: Address,
+        receipt_hash: Option<BytesN<32>>,
+    ) -> Result<String, Error> {
+        requester.require_auth();
+        Self::create_refund_internal(&env, payment_id, refund_amount, reason, requester, receipt_hash)
+    }
         admin: Address,
         treasury_bps: u32,
         developer_bps: u32,
@@ -1406,6 +1589,7 @@ impl RefundManager {
         // we use a match statement for common cases
         let refund_id = format_id(env, "refund_", counter);
 
+        let created_at = env.ledger().timestamp();
         // Issue #170: Set expiry timestamp (30 days from now)
         let expiry_at = now + REFUND_EXPIRY_SECS;
 
@@ -1416,8 +1600,10 @@ impl RefundManager {
             reason,
             status: RefundStatus::Pending,
             requester,
-            created_at: env.ledger().timestamp(),
+            created_at,
             processed_at: None,
+            receipt_hash,
+            expiry_at: created_at.saturating_add(Self::get_refund_expiry_secs(env)),
             approved: false,
             receipt_hash,
             expiry_at,
@@ -1611,6 +1797,14 @@ impl RefundManager {
             return Err(Error::RefundAlreadyProcessed);
         }
 
+        let require_receipt_hash: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RequireReceiptHash)
+            .unwrap_or(false);
+        if require_receipt_hash && refund.receipt_hash.is_none() {
+            return Err(Error::MissingReceiptHash);
+        if env.ledger().timestamp() > refund.expiry_at {
         // Issue #170: Check refund expiration
         let now = env.ledger().timestamp();
         if now > refund.expiry_at {
@@ -1716,6 +1910,52 @@ impl RefundManager {
             .set(&DataKey::Refund(refund_id.clone()), &refund);
         Self::bump_refund_ttl(env, &refund_id, &refund.status);
 
+        // Issue #173: route the refund back through the DEX to the payer's
+        // original token when the payment was made via swap_and_pay.
+        let mut routed_via_dex = false;
+        if let (Some(original_token), Some(swap_path)) =
+            (&payment.original_token, &payment.swap_path)
+        {
+            if let Some(dex_router) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::DexRouterAddress)
+            {
+                let mut reversed_path = swap_path.clone();
+                reversed_path.reverse();
+                if !reversed_path.is_empty() {
+                    let dex_client = crate::dex_router::DexRouterClient::new(env, &dex_router);
+                    let deadline = env.ledger().timestamp().saturating_add(3_600);
+                    match dex_client.try_swap_exact_tokens_for_tokens(
+                        &net_amount,
+                        &1i128,
+                        &reversed_path,
+                        &refund.requester,
+                        &deadline,
+                    ) {
+                        Ok(Ok(_amounts)) => {
+                            routed_via_dex = true;
+                            env.events().publish(
+                                (Symbol::new(env, "REFUND"), Symbol::new(env, "SWAP_ROUTED")),
+                                (refund.payment_id.clone(), refund_id.clone(), original_token.clone()),
+                            );
+                        }
+                        _ => {
+                            env.events().publish(
+                                (Symbol::new(env, "REFUND"), Symbol::new(env, "SWAP_FALLBACK")),
+                                (refund.payment_id.clone(), refund_id.clone()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Interaction: Transfer net amount to requester (in USDC, unless already
+        // routed back to the original token via the DEX above).
+        if !routed_via_dex && token_client.try_transfer(&from, &to, &net_amount).is_err() {
+            // If transfer fails, we currently return Ok(()) but state is already updated.
+            // In a more robust system we might want to revert or handle failures differently.
         // Interaction: Transfer net amount to requester
         if token_client.try_transfer(&from, &to, &refund_amount_final).is_err() {
             return Ok(());
@@ -1731,8 +1971,15 @@ impl RefundManager {
         
         env.events().publish(
             (Symbol::new(env, "REFUND"), Symbol::new(env, "COMPLETED")),
-            (refund.payment_id, refund_id, refund.amount),
+            (refund.payment_id.clone(), refund_id.clone(), refund.amount),
         );
+
+        if refund.receipt_hash.is_some() {
+            env.events().publish(
+                (Symbol::new(env, "REFUND"), Symbol::new(env, "HASH_VERIFIED")),
+                (refund.payment_id, refund_id),
+            );
+        }
 
         Ok(())
     }
@@ -1771,6 +2018,11 @@ impl RefundManager {
         Ok(())
     }
 
+    /// Clean up a pending refund that has passed its `expiry_at` deadline
+    /// (Issue #170). Marks it `Rejected` so it no longer blocks the
+    /// payment's refundable balance. Callable by the same roles as
+    /// `process_refund`/`reject_refund`.
+    pub fn expire_refund(env: Env, operator: Address, refund_id: String) -> Result<(), Error> {
     /// Issue #171: Approve a pending refund, allowing customer to claim it.
     /// Operator marks the refund as approved without processing it immediately.
     /// Customer can then call process_refund to claim the approved refund.
@@ -1790,6 +2042,12 @@ impl RefundManager {
             return Err(Error::RefundAlreadyProcessed);
         }
 
+        if env.ledger().timestamp() <= refund.expiry_at {
+            return Err(Error::RefundExpired);
+        }
+
+        refund.status = RefundStatus::Rejected;
+        refund.processed_at = Some(env.ledger().timestamp());
         refund.approved = true;
 
         env.storage()
@@ -1798,6 +2056,7 @@ impl RefundManager {
         Self::bump_refund_ttl(&env, &refund_id, &refund.status);
 
         env.events().publish(
+            (Symbol::new(&env, "REFUND"), Symbol::new(&env, "EXPIRED")),
             (Symbol::new(&env, "REFUND"), Symbol::new(&env, "APPROVED")),
             (refund.payment_id, refund_id, refund.amount),
         );
@@ -1829,6 +2088,29 @@ impl RefundManager {
         }
 
         Self::process_refund_internal(&env, &requester, refund_id)
+    /// Admin-configurable refund expiry window in seconds (Issue #170).
+    /// Applies to refunds created after this call.
+    pub fn set_refund_expiry(env: Env, admin: Address, secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if secs == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RefundExpirySecs, &secs);
+
+        Ok(())
+    }
+
+    fn get_refund_expiry_secs(env: &Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RefundExpirySecs)
+            .unwrap_or(DEFAULT_REFUND_EXPIRY_SECS)
     }
 
     /// Cancel a pending refund. Caller must be the refund requester (merchant) or contract admin.
@@ -2230,6 +2512,7 @@ impl RefundManager {
             resolution_notes: None,
             review_deadline: None,
             escalated: false,
+            payout_splits: Vec::new(&env),
             computed_deadline_secs: Some(deadline_secs),
             payout_splits,
         };
@@ -2551,6 +2834,46 @@ impl RefundManager {
         Ok(())
     }
 
+    /// Operator: configure multi-party payout splits for a marketplace dispute.
+    /// Splits must sum to exactly `dispute.amount`; validated again at
+    /// resolution time in case the dispute amount changes. (Issue #446)
+    pub fn set_dispute_payout_splits(
+        env: Env,
+        operator: Address,
+        dispute_id: String,
+        splits: Vec<SettlementSplit>,
+    ) -> Result<(), Error> {
+        operator.require_auth();
+
+        let has_settlement =
+            AccessControl::has_role(&env, &role_settlement_operator(&env), &operator);
+        let has_oracle = AccessControl::has_role(&env, &role_oracle(&env), &operator);
+        if !has_settlement && !has_oracle {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        let mut total: i128 = 0;
+        for split in splits.iter() {
+            total = total.saturating_add(split.amount);
+        }
+        if total != dispute.amount {
+            return Err(Error::InvalidSplitSum);
+        }
+
+        dispute.payout_splits = splits;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+        Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+
+        Ok(())
+    }
+
     fn maybe_escalate_dispute_due_to_deadline(
         env: &Env,
         dispute_id: &String,
@@ -2630,6 +2953,56 @@ impl RefundManager {
 
         if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
             return Err(Error::DisputeAlreadyResolved);
+        }
+
+        // Issue #446: if payout_splits are configured, distribute funds to
+        // each recipient directly instead of issuing a single-recipient
+        // refund.
+        if !dispute.payout_splits.is_empty() {
+            let mut total: i128 = 0;
+            for split in dispute.payout_splits.iter() {
+                total = total.saturating_add(split.amount);
+            }
+            if total != dispute.amount {
+                return Err(Error::InvalidSplitSum);
+            }
+
+            let usdc_token_address: Address = env
+                .storage()
+                .persistent()
+                .get(&DataKey::UsdcToken)
+                .ok_or(Error::Unauthorized)?;
+            let token_client = token::TokenClient::new(&env, &usdc_token_address);
+            let from = env.current_contract_address();
+
+            for split in dispute.payout_splits.iter() {
+                token_client.transfer(&from, &split.recipient, &split.amount);
+            }
+
+            let now = env.ledger().timestamp();
+            dispute.status = DisputeStatus::Resolved;
+            dispute.resolved_at = Some(now);
+            dispute.resolution_notes = Some(resolution_notes.clone());
+
+            env.storage()
+                .persistent()
+                .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+            Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+
+            env.events().publish(
+                (
+                    Symbol::new(&env, "DISPUTE"),
+                    Symbol::new(&env, "SPLIT_RESOLVED"),
+                ),
+                (
+                    dispute_id.clone(),
+                    dispute.payment_id.clone(),
+                    dispute.payout_splits.len(),
+                    dispute.amount,
+                ),
+            );
+
+            return Ok(dispute_id);
         }
 
         // Create refund for the disputed amount
@@ -3273,6 +3646,120 @@ impl RefundManager {
                 tally.against_weight,
                 favour_wins,
             ),
+        );
+
+        Ok(())
+    }
+
+    /// Cast a role-gated vote on a dispute. Unlike [`Self::cast_vote`] (which
+    /// is stake-weighted), this flow simply counts one vote per
+    /// `ARBITRATOR`-role address and auto-executes the resolution as soon as
+    /// either side reaches [`ARBITRATOR_VOTING_THRESHOLD`].
+    ///
+    /// # Parameters
+    /// * `arbitrator` – Must hold the `ARBITRATOR` role; must sign.
+    /// * `dispute_id` – Dispute to vote on; must currently be `UnderReview`.
+    /// * `choice`     – `ArbitratorVoteChoice::Approve` or `::Reject`.
+    pub fn vote_dispute(
+        env: Env,
+        arbitrator: Address,
+        dispute_id: String,
+        choice: ArbitratorVoteChoice,
+    ) -> Result<(), Error> {
+        arbitrator.require_auth();
+
+        if !AccessControl::has_role(&env, &role_arbitrator(&env), &arbitrator) {
+            return Err(Error::Unauthorized);
+        }
+
+        let dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+        if dispute.status != DisputeStatus::UnderReview {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        let vote_key = DataKey::ArbitratorVote(dispute_id.clone(), arbitrator.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(Error::AlreadyVoted);
+        }
+
+        env.storage().persistent().set(&vote_key, &choice);
+        Self::bump_ttl(&env, &vote_key, LONG_LIVE_TTL);
+
+        let tally_key = DataKey::ArbitratorVoteTally(dispute_id.clone());
+        let mut tally: ArbitratorVoteTally = env
+            .storage()
+            .persistent()
+            .get(&tally_key)
+            .unwrap_or(ArbitratorVoteTally {
+                approve_count: 0,
+                reject_count: 0,
+            });
+
+        match choice {
+            ArbitratorVoteChoice::Approve => {
+                tally.approve_count = tally.approve_count.saturating_add(1)
+            }
+            ArbitratorVoteChoice::Reject => {
+                tally.reject_count = tally.reject_count.saturating_add(1)
+            }
+        }
+
+        env.storage().persistent().set(&tally_key, &tally);
+        Self::bump_ttl(&env, &tally_key, LONG_LIVE_TTL);
+
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "VOTE_CAST")),
+            (dispute_id.clone(), arbitrator),
+        );
+
+        if tally.approve_count >= ARBITRATOR_VOTING_THRESHOLD {
+            Self::auto_resolve_dispute(&env, &dispute_id, true)?;
+        } else if tally.reject_count >= ARBITRATOR_VOTING_THRESHOLD {
+            Self::auto_resolve_dispute(&env, &dispute_id, false)?;
+        }
+
+        Ok(())
+    }
+
+    /// Finalize a dispute once ARBITRATOR-role voting has reached
+    /// [`ARBITRATOR_VOTING_THRESHOLD`] in either direction. `approved` issues
+    /// a refund and marks the dispute `Resolved`; otherwise it's `Rejected`.
+    fn auto_resolve_dispute(env: &Env, dispute_id: &String, approved: bool) -> Result<(), Error> {
+        let mut dispute = Self::get_dispute_internal(env, dispute_id)?;
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Ok(());
+        }
+
+        if approved {
+            let refund_reason = String::from_str(env, "Auto-resolved by arbitrator vote");
+            if let Some(admin) = AccessControl::get_admin(env) {
+                if let Ok(refund_id) = Self::create_refund_internal(
+                    env,
+                    dispute.payment_id.clone(),
+                    dispute.amount,
+                    refund_reason,
+                    dispute.disputer.clone(),
+                ) {
+                    let _ = Self::process_refund_internal(env, &admin, refund_id);
+                }
+            }
+            dispute.status = DisputeStatus::Resolved;
+        } else {
+            dispute.status = DisputeStatus::Rejected;
+        }
+        dispute.resolved_at = Some(env.ledger().timestamp());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+        Self::bump_dispute_ttl(env, dispute_id, &dispute.status);
+
+        env.events().publish(
+            (
+                Symbol::new(env, "DISPUTE"),
+                Symbol::new(env, "AUTO_RESOLVED"),
+            ),
+            (dispute_id.clone(), approved),
         );
 
         Ok(())
@@ -4123,6 +4610,8 @@ impl RefundManager {
         );
 
         Ok(refund_id)
+    }
+
     /// Admin override to reactivate a subscription that was cancelled due to max retries.
     /// Resets retry_count to 0 and reschedules the next payment.
     pub fn admin_reactivate_subscription(
@@ -4591,6 +5080,9 @@ impl PaymentProcessor {
         Ok(())
     }
 
+    /// Admin: configure the FX oracle used to snapshot rates during
+    /// `verify_payment` (Issue #304).
+    pub fn set_fx_oracle(env: Env, admin: Address, fx_oracle: Address) -> Result<(), Error> {
     /// Set the settlement fee rate (in basis points) deducted from each payment
     /// during `settle_payment` and accumulated in `TreasuryBalance`.
     ///
@@ -4606,6 +5098,9 @@ impl PaymentProcessor {
             return Err(Error::Unauthorized);
         }
 
+        env.storage()
+            .persistent()
+            .set(&DataKey::FxOracleAddress, &fx_oracle);
         if bps < 0 || bps > 10_000 {
             return Err(Error::InvalidAmount);
         }
@@ -4641,6 +5136,8 @@ impl PaymentProcessor {
             .persistent()
             .get(&DataKey::AutoRefundOverpayment)
             .unwrap_or(true)
+    }
+
     /// Return the accumulated treasury balance collected via settlement fees
     /// and platform fees (when no custom fee_recipient).
     pub fn set_min_payment_duration_secs(env: Env, admin: Address, min_secs: u64) -> Result<(), Error> {
@@ -6082,6 +6579,43 @@ impl PaymentProcessor {
             PaymentStatus::PartiallyPaid
         };
 
+        payment.status = new_status.clone();
+
+        // Issue #304: snapshot the FX rate at verification time, if an oracle
+        // is configured for this contract.
+        if let Some(fx_oracle) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::FxOracleAddress)
+        {
+            let oracle_client = FXOracleClient::new(&env, &fx_oracle);
+            match oracle_client.try_get_rate(&payment.currency) {
+                Ok(Ok(rate_data)) => {
+                    payment.fx_rate = Some(rate_data.rate);
+                    payment.fx_rate_at = Some(env.ledger().timestamp());
+                }
+                _ => {
+                    env.events().publish(
+                        (
+                            Symbol::new(&env, "PAYMENT"),
+                            Symbol::new(&env, "FX_RATE_UNAVAILABLE"),
+                        ),
+                        payment_id.clone(),
+                    );
+                }
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+        Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+
+        let event_name = match &new_status {
+            PaymentStatus::Confirmed => Symbol::new(&env, "VERIFIED"),
+            PaymentStatus::Overpaid => Symbol::new(&env, "OVERPAID"),
+            PaymentStatus::PartiallyPaid => Symbol::new(&env, "PARTIALLY_PAID"),
+            _ => Symbol::new(&env, "FAILED"),
         let overpaid_refund_amount = if new_status == PaymentStatus::Overpaid {
             Some(amount_received.saturating_sub(payment.amount))
         } else {
@@ -6111,6 +6645,7 @@ impl PaymentProcessor {
         }
 
         // Issue #162: Merchant-configurable partial payment policy.
+        if new_status == PaymentStatus::PartiallyPaid {
             let partial_allowed = if let Some(registry_address) = env
                 .storage()
                 .persistent()
@@ -6341,6 +6876,7 @@ impl PaymentProcessor {
         );
 
         Ok(())
+    }
 
     /// Issue #482: Create a retry payment for an expired or failed original payment.
     /// Returns the payment_id of the newly created payment, linked to the original.
@@ -7572,12 +8108,115 @@ impl PaymentProcessor {
     ///
     /// # Returns
     /// The created PaymentCharge on success
+    /// Add a router address to the allowlist (issue #437).
+    pub fn add_router(env: Env, admin: Address, router: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllowedRouter(router.clone()), &true);
+
+        let mut list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllowedRoutersList)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !list.contains(&router) {
+            list.push_back(router.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllowedRoutersList, &list);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "ROUTER"),
+                Symbol::new(&env, "ADDED"),
+            ),
+            router,
+        );
+        Ok(())
+    }
+
+    /// Remove a router address from the allowlist (issue #437).
+    pub fn remove_router(env: Env, admin: Address, router: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AllowedRouter(router.clone()));
+
+        if let Some(list) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<Address>>(&DataKey::AllowedRoutersList)
+        {
+            let mut new_list: Vec<Address> = Vec::new(&env);
+            for r in list.iter() {
+                if r != router {
+                    new_list.push_back(r);
+                }
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllowedRoutersList, &new_list);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "ROUTER"),
+                Symbol::new(&env, "REMOVED"),
+            ),
+            router,
+        );
+        Ok(())
+    }
+
+    /// Check if a DEX router is allowed (issue #437).
+    pub fn is_router_allowed(env: Env, router: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowedRouter(router))
+            .unwrap_or(false)
+    }
+
+    /// Get all allowlisted DEX router addresses (issue #437).
+    pub fn get_allowed_routers(env: Env) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowedRoutersList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Set the Wrapped XLM (WXLM) token contract address (issue #434).
+    pub fn set_wrapped_xlm_contract(env: Env, admin: Address, wxlm: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedXlmContract, &wxlm);
+        Ok(())
+    }
+
+    /// Get the Wrapped XLM (WXLM) token contract address (issue #434).
+    pub fn get_wrapped_xlm_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WrappedXlmContract)
+    }
+
+    /// Swaps tokens via a DEX router and executes a payment (issue #434, #437).
     #[allow(clippy::too_many_arguments)]
     pub fn swap_and_pay(env: Env, args: SwapAndPayArgs) -> Result<PaymentCharge, Error> {
         args.payer.require_auth();
         Self::require_creation_not_paused(&env)?;
 
-        // Validate inputs
         if args.amount <= 0 || args.amount_in <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -7588,11 +8227,31 @@ impl PaymentProcessor {
             return Err(Error::SwapPathInvalid);
         }
 
-        // Issue #226: check path returns before executing the swap.
+        // Issue #437: DEX router allowlist check
+        let allowed_list = Self::get_allowed_routers(env.clone());
+        if !allowed_list.is_empty() && !Self::is_router_allowed(env.clone(), args.dex_router.clone()) {
+            return Err(Error::RouterNotAllowed);
+        }
+
+        // Issue #434: XLM auto-wrapping detection
+        let native_xlm = Address::from_str(&env, ZERO_CONTRACT_STRKEY);
+        let mut actual_token_in = args.token_in.clone();
+
+        if args.token_in == native_xlm {
+            if let Some(wxlm) = Self::get_wrapped_xlm_contract(env.clone()) {
+                token::Client::new(&env, &wxlm).transfer(
+                    &args.payer,
+                    &env.current_contract_address(),
+                    &args.amount_in,
+                );
+                actual_token_in = wxlm;
+            }
+        }
+
         let quoted_amounts = Self::validate_path_returns(
             &env,
             &args.dex_router,
-            &args.token_in,
+            &actual_token_in,
             args.amount_in,
             args.amount_out_min,
             &args.path,
@@ -7612,12 +8271,9 @@ impl PaymentProcessor {
             )?;
         }
 
-        // Execute atomic swap via DEX router
-        let deadline = env.ledger().timestamp().saturating_add(3_600); // 1 hour deadline
-
+        let deadline = env.ledger().timestamp().saturating_add(3_600);
         let dex_client = DexRouterClient::new(&env, &args.dex_router);
 
-        // Perform the swap - this transfers tokens from payer and sends output to deposit_address
         let swap_result = dex_client.swap_exact_tokens_for_tokens(
             &args.amount_in,
             &args.amount_out_min,
@@ -7640,11 +8296,10 @@ impl PaymentProcessor {
             return Err(Error::ArbitrageDetected);
         }
 
-        // Now create the payment with the swapped amount
         let settlement_token = args
             .path
             .get(args.path.len() - 1)
-            .unwrap_or(args.token_in.clone());
+            .unwrap_or(actual_token_in.clone());
         let create_args = CreatePaymentArgs {
             payment_id: args.payment_id.clone(),
             merchant_id: args.merchant_id,
@@ -7665,16 +8320,13 @@ impl PaymentProcessor {
 
         let mut payment = Self::create_payment(env.clone(), create_args)?;
 
-        // Issue #173: Store original token and swap path for refund routing
         payment.original_token = Some(args.token_in.clone());
         payment.swap_path = Some(args.path.clone());
-        
-        // Persist updated payment with swap info
+
         env.storage()
             .persistent()
             .set(&DataKey::Payment(payment.payment_id.clone()), &payment);
 
-        // Emit SWAP/AND/PAY event
         env.events().publish(
             (
                 Symbol::new(&env, "SWAP"),
@@ -7689,6 +8341,112 @@ impl PaymentProcessor {
                 args.amount,
             ),
         );
+        Ok(payment)
+    }
+
+    /// Issue #436: Multi-DEX route splitting / aggregation.
+    pub fn swap_and_pay_multi_route(
+        env: Env,
+        args: SwapAndPayArgs,
+        routes: Vec<SwapRoute>,
+        min_output_amount: i128,
+    ) -> Result<PaymentCharge, Error> {
+        args.payer.require_auth();
+        Self::require_creation_not_paused(&env)?;
+
+        if args.amount <= 0 || routes.is_empty() {
+            return Err(Error::InvalidAmount);
+        }
+
+        let allowed_list = Self::get_allowed_routers(env.clone());
+        let mut total_route_input: i128 = 0;
+
+        for route in routes.iter() {
+            if route.amount_in <= 0 || route.path.is_empty() {
+                return Err(Error::InvalidAmount);
+            }
+            total_route_input = total_route_input.saturating_add(route.amount_in);
+            if !allowed_list.is_empty() && !Self::is_router_allowed(env.clone(), route.router.clone()) {
+                return Err(Error::RouterNotAllowed);
+            }
+        }
+
+        if total_route_input != args.amount_in {
+            return Err(Error::InvalidAmount);
+        }
+
+        let deadline = env.ledger().timestamp().saturating_add(3_600);
+        let mut total_output: i128 = 0;
+
+        for route in routes.iter() {
+            let dex_client = DexRouterClient::new(&env, &route.router);
+            let swap_result = dex_client.swap_exact_tokens_for_tokens(
+                &route.amount_in,
+                &0,
+                &route.path,
+                &args.deposit_address,
+                &deadline,
+            );
+            let route_out = swap_result
+                .get(route.path.len() - 1)
+                .ok_or(Error::SwapPathInvalid)?;
+            total_output = total_output.saturating_add(route_out);
+        }
+
+        if total_output < min_output_amount {
+            return Err(Error::RouteOutputInsufficient);
+        }
+
+        let first_route = routes.get(0).unwrap();
+        let settlement_token = first_route
+            .path
+            .get(first_route.path.len() - 1)
+            .unwrap_or(args.token_in.clone());
+
+        let create_args = CreatePaymentArgs {
+            payment_id: args.payment_id.clone(),
+            merchant_id: args.merchant_id,
+            payer: None,
+            amount: args.amount,
+            currency: args.currency,
+            deposit_address: args.deposit_address,
+            expires_at: args.expires_at,
+            duration_secs: None,
+            memo: None,
+            memo_type: None,
+            token_address: Some(settlement_token),
+            client_token: None,
+            metadata_hash: None,
+            metadata: None,
+            fee_waiver_code: None,
+        };
+
+        let mut payment = Self::create_payment(env.clone(), create_args)?;
+
+        // Issue #173: record the original token and swap path so a later
+        // refund can be routed back through the DEX to the payer's token.
+        payment.original_token = Some(args.token_in.clone());
+        payment.swap_path = Some(args.path.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(args.payment_id.clone()), &payment);
+        Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "SWAP"),
+                Symbol::new(&env, "AND"),
+                Symbol::new(&env, "PAY"),
+            ),
+            (
+                args.payment_id,
+                args.payer,
+                args.amount_in,
+                args.token_in,
+                args.amount,
+            ),
+        );
+
         Ok(payment)
     }
 
@@ -7942,7 +8700,8 @@ impl PaymentProcessor {
         }
 
         result
-    
+    }
+
     /// Issue #487: Query aggregate analytics for a merchant over a time range.
     /// Returns total_payments, confirmed_payments, failed_payments, total_volume,
     /// avg_payment_amount, dispute_count, refund_count, net_settled_volume.
@@ -8010,7 +8769,6 @@ impl PaymentProcessor {
             net_settled_volume,
         }
     }
-}
 
     /// Issue #399: Remove the idempotency key associated with a payment so the
     /// client_token can be reused after expiry or cancellation.
@@ -8226,6 +8984,44 @@ impl PaymentProcessor {
             return Err(StreamError::Unauthorized);
         }
         PaymentStreaming::set_stream_destination(env, recipient, stream_id, destination)
+    }
+
+    /// Sender approves milestones for a stream, unlocking withdrawals.
+    pub fn approve_stream_milestone(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        PaymentStreaming::approve_stream_milestone(env, sender, stream_id)
+    }
+
+    /// Sender revokes a previous milestone approval, re-locking withdrawals.
+    pub fn revoke_stream_milestone(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        PaymentStreaming::revoke_stream_milestone(env, sender, stream_id)
+    }
+
+    /// Sender sets a floor for `decrease_rate_per_second` on this stream.
+    pub fn set_stream_min_rate(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        min_rate_per_second: i128,
+    ) -> Result<(), StreamError> {
+        PaymentStreaming::set_stream_min_rate(env, sender, stream_id, min_rate_per_second)
+    }
+
+    /// Reduce the flow rate of an active stream, refunding surplus deposit.
+    pub fn decrease_rate_per_second(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        new_rate: i128,
+    ) -> Result<(), StreamError> {
+        PaymentStreaming::decrease_rate_per_second(env, sender, stream_id, new_rate)
     }
 
     pub fn get_sender_streams(
@@ -8673,8 +9469,6 @@ impl PaymentProcessor {
             .get::<DataKey, Vec<String>>(&DataKey::MerchantInvoices(merchant_id.clone()))
             .unwrap_or_else(|| Vec::new(env))
     }
-
-}
 
 /// Bumps the version string by incrementing the number after the last '.'.
 /// Works with versions like "1.0.0" → "1.0.1", "1" → "2", "v1" → "v2".

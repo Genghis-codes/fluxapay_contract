@@ -84,6 +84,9 @@ pub struct PaymentStream {
     /// When false, distributions (withdrawals) are locked until the sender
     /// explicitly approves milestones for this stream.
     pub milestones_approved: bool,
+    /// Floor for [`PaymentStreaming::decrease_rate_per_second`]; defaults to
+    /// `0` (no minimum) unless set via `set_stream_min_rate`.
+    pub min_rate_per_second: i128,
 }
 
 /// Storage key for a [`PaymentStream`].
@@ -319,6 +322,8 @@ impl PaymentStreaming {
             last_checkpoint_at: now,
             accrued_at_checkpoint: 0,
             status: StreamStatus::Active,
+            milestones_approved: false,
+            min_rate_per_second: 0,
             milestones_approved: true,
         };
 
@@ -418,6 +423,74 @@ impl PaymentStreaming {
         Ok(())
     }
 
+    /// Sender revokes a previous milestone approval, re-locking distributions
+    /// until `approve_stream_milestone` is called again.
+    pub fn revoke_stream_milestone(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+
+        stream.milestones_approved = false;
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "STREAM"),
+                Symbol::new(&env, "MILESTONE_REVOKED"),
+                stream_id,
+            ),
+            (sender,),
+        );
+
+        Ok(())
+    }
+
+    /// Sender sets a floor below which [`Self::decrease_rate_per_second`] will
+    /// refuse to lower the stream's rate.
+    pub fn set_stream_min_rate(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        min_rate_per_second: i128,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        if min_rate_per_second < 0 {
+            return Err(StreamError::InvalidRate);
+        }
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+
+        stream.min_rate_per_second = min_rate_per_second;
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        Ok(())
+    }
+
     // ─── Rate decrease ────────────────────────────────────────────────────────
 
     /// Reduce the flow rate of an active stream.
@@ -467,6 +540,7 @@ impl PaymentStreaming {
             return Err(StreamError::RateNotDecreased);
         }
         if new_rate < stream.min_rate_per_second {
+            return Err(StreamError::InvalidRate);
             return Err(StreamError::RateBelowMinimum);
         }
 

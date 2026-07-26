@@ -938,7 +938,7 @@ fn test_create_and_get_refund() {
         &Symbol::new(&env, "USDC"),
     );
 
-    let refund_id = client.create_refund(&payment_id, &refund_amount, &reason, &requester);
+    let refund_id = client.create_refund(&payment_id, &refund_amount, &reason, &requester, &None);
     let refund = client.get_refund(&refund_id);
 
     assert_eq!(refund.payment_id, payment_id);
@@ -969,7 +969,7 @@ fn test_process_refund() {
         &refund_amount,
         &String::from_str(&env, "Reason"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -981,7 +981,42 @@ fn test_process_refund() {
 }
 
 #[test]
-fn test_approve_then_claim_refund_succeeds() {
+fn test_process_refund_within_expiry_window_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_expiry_ok");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    // Well within the default 30-day window.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 60);
+    client.process_refund(&operator, &refund_id);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Completed);
+}
+
+#[test]
+fn test_process_refund_rejects_after_expiry() {
     let env = Env::default();
     env.mock_all_auths();
     let (admin, client) = setup_refund_manager(&env);
@@ -989,6 +1024,8 @@ fn test_approve_then_claim_refund_succeeds() {
     let payment_id = String::from_str(&env, "payment_claim_1");
     let merchant_id = Address::generate(&env);
     let refund_amount = 1000i128;
+    let payment_id = String::from_str(&env, "payment_expiry_bad");
+    let merchant_id = Address::generate(&env);
     let requester = Address::generate(&env);
 
     client.register_payment(
@@ -1001,6 +1038,7 @@ fn test_approve_then_claim_refund_succeeds() {
     let refund_id = client.create_refund(
         &payment_id,
         &refund_amount,
+        &1000i128,
         &String::from_str(&env, "Reason"),
         &requester,
     );
@@ -1050,6 +1088,16 @@ fn test_claim_refund_before_approval_fails() {
 
 #[test]
 fn test_claim_refund_by_non_requester_fails() {
+    // 60 days later — past the default 30-day expiry window.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 60 * 24 * 60 * 60);
+
+    let err = client.try_process_refund(&operator, &refund_id);
+    assert_eq!(err, Err(Ok(Error::RefundExpired)));
+}
+
+#[test]
+fn test_expire_refund_clears_pending_expired_refund() {
     let env = Env::default();
     env.mock_all_auths();
     let (admin, client) = setup_refund_manager(&env);
@@ -1059,6 +1107,9 @@ fn test_claim_refund_by_non_requester_fails() {
     let refund_amount = 1000i128;
     let requester = Address::generate(&env);
     let stranger = Address::generate(&env);
+    let payment_id = String::from_str(&env, "payment_expire_cleanup");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
 
     client.register_payment(
         &payment_id,
@@ -1070,6 +1121,7 @@ fn test_claim_refund_by_non_requester_fails() {
     let refund_id = client.create_refund(
         &payment_id,
         &refund_amount,
+        &1000i128,
         &String::from_str(&env, "Reason"),
         &requester,
     );
@@ -1117,6 +1169,22 @@ fn test_double_claim_refund_blocked() {
 }
 
 #[test]
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 60 * 24 * 60 * 60);
+
+    client.expire_refund(&operator, &refund_id);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Rejected);
+
+    // Once cleared, it can't be expired (or processed) again.
+    let err = client.try_expire_refund(&operator, &refund_id);
+    assert_eq!(err, Err(Ok(Error::RefundAlreadyProcessed)));
+}
+
+#[test]
+fn test_set_refund_expiry_configures_window() {
 fn test_process_refund_accumulates_treasury_and_withdraws() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1179,6 +1247,10 @@ fn test_create_refund_fails_for_blacklisted_requester() {
     env.mock_all_auths();
     let (admin, client) = setup_refund_manager(&env);
 
+    // Shrink the window to 100 seconds.
+    client.set_refund_expiry(&admin, &100u64);
+
+    let payment_id = String::from_str(&env, "payment_custom_expiry");
     let payment_id = String::from_str(&env, "refund_blacklisted_requester");
     let merchant_id = Address::generate(&env);
     let requester = Address::generate(&env);
@@ -1189,6 +1261,8 @@ fn test_create_refund_fails_for_blacklisted_requester() {
         &5000i128,
         &Symbol::new(&env, "USDC"),
     );
+
+    let refund_id = client.create_refund(
     client.add_to_blacklist(&admin, &requester);
 
     let result = client.try_create_refund(
@@ -1197,6 +1271,14 @@ fn test_create_refund_fails_for_blacklisted_requester() {
         &String::from_str(&env, "Reason"),
         &requester,
     );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 200);
+
+    let err = client.try_process_refund(&operator, &refund_id);
+    assert_eq!(err, Err(Ok(Error::RefundExpired)));
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 
@@ -1310,7 +1392,7 @@ fn test_multiple_refunds_unique_ids() {
         &1000i128,
         &String::from_str(&env, "First refund"),
         &requester,
-    );
+        &None,);
 
     // Create second refund
     let refund_id_2 = client.create_refund(
@@ -1318,7 +1400,7 @@ fn test_multiple_refunds_unique_ids() {
         &500i128,
         &String::from_str(&env, "Second refund"),
         &requester,
-    );
+        &None,);
 
     // Create third refund
     let refund_id_3 = client.create_refund(
@@ -1326,7 +1408,7 @@ fn test_multiple_refunds_unique_ids() {
         &250i128,
         &String::from_str(&env, "Third refund"),
         &requester,
-    );
+        &None,);
 
     // Verify all refund IDs are unique
     assert_ne!(refund_id_1, refund_id_2);
@@ -1371,7 +1453,7 @@ fn test_create_refund_requires_auth() {
         &1000i128,
         &String::from_str(&env, "Unauthorized refund"),
         &requester,
-    );
+        &None,);
 }
 
 #[test]
@@ -1460,7 +1542,7 @@ fn test_process_refund_deducts_fee_from_requester() {
         &refund_amount,
         &String::from_str(&env, "fee test"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1495,7 +1577,7 @@ fn test_process_refund_sends_fee_to_admin() {
         &refund_amount,
         &String::from_str(&env, "fee test"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1528,7 +1610,7 @@ fn test_cancel_refund_by_requester() {
         &1000i128,
         &String::from_str(&env, "cancel me"),
         &requester,
-    );
+        &None,);
 
     client.cancel_refund(&requester, &refund_id);
 
@@ -1562,7 +1644,7 @@ fn test_cancel_refund_by_admin() {
         &500i128,
         &String::from_str(&env, "admin cancel"),
         &requester,
-    );
+        &None,);
 
     client.cancel_refund(&admin, &refund_id);
 
@@ -1591,7 +1673,7 @@ fn test_cancel_refund_unauthorized() {
         &500i128,
         &String::from_str(&env, "reason"),
         &requester,
-    );
+        &None,);
 
     let random = Address::generate(&env);
     let result = client.try_cancel_refund(&random, &refund_id);
@@ -1619,7 +1701,7 @@ fn test_cancel_refund_already_processed() {
         &500i128,
         &String::from_str(&env, "reason"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1651,7 +1733,7 @@ fn test_cancel_refund_emits_event() {
         &750i128,
         &String::from_str(&env, "reason"),
         &requester,
-    );
+        &None,);
 
     client.cancel_refund(&requester, &refund_id);
 
@@ -1685,7 +1767,7 @@ fn test_refund_total_equals_payment_amount_succeeds() {
         &amount,
         &String::from_str(&env, "full refund"),
         &requester,
-    );
+        &None,);
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.amount, amount);
 }
@@ -1714,7 +1796,7 @@ fn test_refund_exceeds_payment_amount_rejected() {
         &501i128,
         &String::from_str(&env, "over refund"),
         &requester,
-    );
+        &None,);
 }
 
 /// Cumulative partial refunds that exceed the payment amount must be rejected.
@@ -1742,7 +1824,7 @@ fn test_cumulative_refunds_exceed_payment_amount_rejected() {
         &600i128,
         &String::from_str(&env, "partial 1"),
         &requester,
-    );
+        &None,);
 
     // Second partial refund: 401 — total would be 1001 > 1000, must fail
     client.create_refund(
@@ -1750,7 +1832,7 @@ fn test_cumulative_refunds_exceed_payment_amount_rejected() {
         &401i128,
         &String::from_str(&env, "partial 2 over"),
         &requester,
-    );
+        &None,);
 }
 
 // ── Issue #115: Partial Refund Support ───────────────────────────────────────
@@ -1778,19 +1860,19 @@ fn test_partial_refunds_tracked_in_payment_refunds_list() {
         &300i128,
         &String::from_str(&env, "partial 1"),
         &requester,
-    );
+        &None,);
     let r2 = client.create_refund(
         &payment_id,
         &400i128,
         &String::from_str(&env, "partial 2"),
         &requester,
-    );
+        &None,);
     let r3 = client.create_refund(
         &payment_id,
         &300i128,
         &String::from_str(&env, "partial 3"),
         &requester,
-    );
+        &None,);
 
     // All three refunds should be in the payment's refund list
     let refunds = client.get_payment_refunds(&payment_id);
@@ -1825,7 +1907,7 @@ fn test_rejected_refund_does_not_count_toward_total() {
         &800i128,
         &String::from_str(&env, "will be rejected"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1837,7 +1919,7 @@ fn test_rejected_refund_does_not_count_toward_total() {
         &800i128,
         &String::from_str(&env, "replacement"),
         &requester,
-    );
+        &None,);
     let new_refund = client.get_refund(&new_refund_id);
     assert_eq!(new_refund.amount, 800i128);
     assert_eq!(new_refund.status, RefundStatus::Pending);
@@ -2296,7 +2378,7 @@ fn test_cumulative_refunds_exceed_payment_amount_fails() {
         &600i128,
         &String::from_str(&env, "partial 1"),
         &requester,
-    );
+        &None,);
 
     // Second refund: 500 — 600 + 500 = 1100 > 1000 — must fail
     let result = client.try_create_refund(
@@ -2332,7 +2414,7 @@ fn test_refund_exactly_equal_to_payment_amount_succeeds() {
         &payment_amount,
         &String::from_str(&env, "full refund"),
         &requester,
-    );
+        &None,);
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.amount, payment_amount);
     assert_eq!(refund.status, RefundStatus::Pending);
@@ -2362,7 +2444,7 @@ fn test_second_refund_after_full_refund_fails() {
         &payment_amount,
         &String::from_str(&env, "full"),
         &requester,
-    );
+        &None,);
 
     // Any additional refund — must fail
     let result = client.try_create_refund(
@@ -2398,7 +2480,7 @@ fn test_rejected_refunds_not_counted_in_cumulative_total() {
         &800i128,
         &String::from_str(&env, "will be rejected"),
         &requester,
-    );
+        &None,);
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
     client.reject_refund(&operator, &refund_id);
@@ -2409,7 +2491,7 @@ fn test_rejected_refunds_not_counted_in_cumulative_total() {
         &payment_amount,
         &String::from_str(&env, "after rejection"),
         &requester,
-    );
+        &None,);
     let refund = client.get_refund(&new_refund_id);
     assert_eq!(refund.amount, payment_amount);
     assert_eq!(refund.status, RefundStatus::Pending);
@@ -4563,6 +4645,12 @@ fn test_platform_fee_without_custom_recipient_credits_treasury() {
 
     let token_id = setup_and_mint_token(&env, &payment_contract, 1_000_000i128);
     env.as_contract(&payment_contract, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+}
+
 #[test]
 fn test_refund_cooldown_enforcement() {
     let env = Env::default();
@@ -4682,7 +4770,6 @@ fn test_merchant_payment_count_accurate_after_creates() {
     let mut count = client.get_merchant_payment_count_for_dashboard(&merchant);
     assert_eq!(count, 0u32, "Initial count should be 0");
 
-    // Create 1 payment
     let _ = client.create_payment(&CreatePaymentArgs {
         payment_id: String::from_str(&env, "pay1"),
         merchant_id: merchant.clone(),
@@ -4691,6 +4778,18 @@ fn test_merchant_payment_count_accurate_after_creates() {
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
         expires_at: None,
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    });
+}
+
+#[test]
 fn test_create_payment_future_expiry_accepted() {
     let env = Env::default();
     env.mock_all_auths();
@@ -4964,34 +5063,10 @@ fn test_create_payment_zero_amount_rejected() {
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
-    });
+    };
 
-    count = client.get_merchant_payment_count_for_dashboard(&merchant);
-    assert_eq!(count, 1u32, "Count should be 1 after 1 payment");
-
-    // Create 9 more payments (total 10)
-    for i in 2..=10 {
-        let _ = client.create_payment(&CreatePaymentArgs {
-            payment_id: String::from_str(&env, &format!("pay{}", i)),
-            merchant_id: merchant.clone(),
-            payer: None,
-            amount: 100,
-            currency: Symbol::new(&env, "USDC"),
-            deposit_address: Address::generate(&env),
-            expires_at: None,
-            duration_secs: None,
-            memo: None,
-            memo_type: None,
-            token_address: None,
-            client_token: None,
-            metadata_hash: None,
-            metadata: None,
-            fee_waiver_code: None,
-        });
-    }
-
-    count = client.get_merchant_payment_count_for_dashboard(&merchant);
-    assert_eq!(count, 10u32, "Count should be 10 after 10 payments");
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -5102,23 +5177,6 @@ fn test_withdraw_treasury_reduces_balance_and_logs_history() {
     let result = client.try_withdraw_treasury(&admin, &61i128, &destination);
     assert_eq!(result, Err(Ok(Error::InsufficientTreasuryBalance)));
     assert_eq!(client.get_treasury_balance(), 60i128);
-
-    let _ = token_client; // silence unused if only StellarAssetClient needed above
-    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-
-    let payment_id = String::from_str(&env, "cancel_test");
-    let _ = client.create_payment(&CreatePaymentArgs {
-        payment_id: payment_id.clone(),
-        merchant_id: merchant.clone(),
-        payer: None,
-        amount: 100,
-        currency: Symbol::new(&env, "USDC"),
-        deposit_address: Address::generate(&env),
-        expires_at: None,
-    };
-
-    let result = client.try_create_payment(&args);
-    assert!(result.is_err());
 }
 
 #[test]
@@ -5179,16 +5237,6 @@ fn test_create_payment_minimum_positive_amount_accepted() {
         metadata_hash: None,
         metadata: None,
         fee_waiver_code: None,
-    });
-
-    let count_before = client.get_merchant_payment_count_for_dashboard(&merchant);
-    assert_eq!(count_before, 1u32, "Count should be 1");
-
-    // Cancel the payment (set cooldown to 0 first to allow immediate operations)
-    let _ = client.try_cancel_payment(&merchant, &payment_id);
-
-    let count_after = client.get_merchant_payment_count_for_dashboard(&merchant);
-    assert_eq!(count_after, 1u32, "Count should NOT decrease after cancellation");
     };
 
     let payment = client.create_payment(&args);

@@ -38,17 +38,20 @@ deploy() {
 }
 
 # ── Deploy each contract ──────────────────────────────────────────────────────
-PAYMENT_PROCESSOR_ID=$(deploy "1/4 PaymentProcessor" "$WASM_DIR/fluxapay.wasm")
+PAYMENT_PROCESSOR_ID=$(deploy "1/5 PaymentProcessor" "$WASM_DIR/fluxapay.wasm")
 echo "$PAYMENT_PROCESSOR_ID"
 
-REFUND_MANAGER_ID=$(deploy "2/4 RefundManager" "$WASM_DIR/fluxapay.wasm")
+REFUND_MANAGER_ID=$(deploy "2/5 RefundManager" "$WASM_DIR/fluxapay.wasm")
 echo "$REFUND_MANAGER_ID"
 
-MERCHANT_REGISTRY_ID=$(deploy "3/4 MerchantRegistry" "$WASM_DIR/fluxapay.wasm")
+MERCHANT_REGISTRY_ID=$(deploy "3/5 MerchantRegistry" "$WASM_DIR/fluxapay.wasm")
 echo "$MERCHANT_REGISTRY_ID"
 
-FX_ORACLE_ID=$(deploy "4/4 FXOracle" "$WASM_DIR/fluxapay.wasm")
+FX_ORACLE_ID=$(deploy "4/5 FXOracle" "$WASM_DIR/fluxapay.wasm")
 echo "$FX_ORACLE_ID"
+
+GAS_ESTIMATOR_ID=$(deploy "5/5 GasEstimator" "$WASM_DIR/fluxapay.wasm")
+echo "$GAS_ESTIMATOR_ID"
 
 # ── Write .env.testnet ────────────────────────────────────────────────────────
 cat > "$ENV_OUT" <<EOF
@@ -58,6 +61,7 @@ PAYMENT_PROCESSOR_ID=${PAYMENT_PROCESSOR_ID}
 REFUND_MANAGER_ID=${REFUND_MANAGER_ID}
 MERCHANT_REGISTRY_ID=${MERCHANT_REGISTRY_ID}
 FX_ORACLE_ID=${FX_ORACLE_ID}
+GAS_ESTIMATOR_ID=${GAS_ESTIMATOR_ID}
 EOF
 
 echo "Contract IDs written to .env.testnet"

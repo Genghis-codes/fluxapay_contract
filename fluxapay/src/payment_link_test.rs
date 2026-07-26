@@ -6,7 +6,7 @@ use crate::{
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    token, vec, Address, BytesN, Env, Map, String, Symbol,
+    token, vec, Address, BytesN, Env, Map, String, Symbol, TryIntoVal,
 };
 
 fn setup_payment_link(env: &Env) -> (Address, PaymentLinkManagerClient<'_>) {
@@ -286,7 +286,6 @@ fn test_verify_batch_empty_input_returns_empty_vec() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #14)")]
 fn test_max_uses() {
     let env = Env::default();
     env.mock_all_auths();
@@ -308,8 +307,84 @@ fn test_max_uses() {
     );
 
     client.use_link(&payer, &link_id, &100i128, &None);
-    // Should fail on second use
-    client.use_link(&payer, &link_id, &100i128, &None);
+    let link = client.get_link(&link_id);
+    assert_eq!(link.use_count, 1);
+
+    // Should fail on second use with LinkMaxUsesReached
+    let result = client.try_use_link(&payer, &link_id, &100i128, &None);
+    assert_eq!(result, Err(Ok(crate::Error::LinkMaxUsesReached)));
+}
+
+#[test]
+fn test_max_uses_exact_accepted_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "exact_max_link");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(50i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Exact"),
+        &None,
+        &Some(2),
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    client.use_link(&payer, &link_id, &50i128, &None);
+    assert_eq!(client.get_link(&link_id).use_count, 1);
+
+    client.use_link(&payer, &link_id, &50i128, &None);
+    assert_eq!(client.get_link(&link_id).use_count, 2);
+
+    let emitted = env.events().all().iter().any(|(_, topics, _)| {
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (t0, t1),
+            (Ok(a), Ok(b))
+                if a == Symbol::new(&env, "LINK") && b == Symbol::new(&env, "MAX_USES_REACHED")
+        )
+    });
+    assert!(emitted, "LINK/MAX_USES_REACHED must fire when final use is consumed");
+
+    let rejected = client.try_use_link(&payer, &link_id, &50i128, &None);
+    assert_eq!(rejected, Err(Ok(crate::Error::LinkMaxUsesReached)));
+}
+
+#[test]
+fn test_unlimited_link_never_blocked_by_max_uses() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "unlimited_link");
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(25i128),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Open"),
+        &None,
+        &None, // unlimited
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+    );
+
+    for _ in 0..5 {
+        client.use_link(&payer, &link_id, &25i128, &None);
+    }
+    assert_eq!(client.get_link(&link_id).use_count, 5);
 }
 
 // -- Issue #111: Direct-to-Merchant Payment Flow ------------------------------

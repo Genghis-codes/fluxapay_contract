@@ -4192,6 +4192,82 @@ fn test_settle_payment_fee_split_rounding_dust_to_treasury() {
     assert_eq!(dev_bal + treasury_bal, 100i128, "All fee tokens must be accounted for");
 }
 
+// =============================================================================
+// Treasury fee unification — settlement + refund fees + withdrawal history
+// =============================================================================
+
+#[test]
+fn test_settlement_fee_accumulates_in_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    client.set_fee_rate(&admin, &200i128); // 2%
+    let payment_id = String::from_str(&env, "treasury_settle_accum");
+    let amount = 10_000i128;
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    let splits = vec![
+        &env,
+        SettlementSplit {
+            recipient: Address::generate(&env),
+            amount: 9_800i128,
+        },
+    ];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    assert_eq!(client.get_treasury_balance(), 200i128);
+}
+
+#[test]
+fn test_refund_fee_accumulates_in_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client, _usdc) = setup_refund_manager_with_token(&env);
+
+    let payment_id = String::from_str(&env, "treasury_refund_accum");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &10_000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1_000i128,
+        &String::from_str(&env, "reason"),
+        &requester,
+    );
+    let operator = Address::generate(&env);
+    client.grant_role(&_admin, &role_settlement_operator(&env), &operator);
+    client.process_refund(&operator, &refund_id);
+
+    // Default refund fee 100 bps of 1000 = 10
+    assert_eq!(client.get_treasury_balance(), 10i128);
+}
+
+#[test]
+fn test_platform_fee_without_custom_recipient_credits_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payment_contract = env.register(PaymentProcessor, ());
+    let registry_contract = env.register(crate::merchant_registry::MerchantRegistry, ());
+    let payment_client = PaymentProcessorClient::new(&env, &payment_contract);
+    let registry_client =
+        crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_contract);
+
+    let admin = Address::generate(&env);
+    payment_client.initialize_payment_processor(&admin);
+    registry_client.initialize(&admin);
+    payment_client.set_merchant_registry_address(&admin, &registry_contract);
+
+    let token_id = setup_and_mint_token(&env, &payment_contract, 1_000_000i128);
+    env.as_contract(&payment_contract, || {
 #[test]
 fn test_refund_cooldown_enforcement() {
     let env = Env::default();
@@ -4638,6 +4714,101 @@ fn test_merchant_payment_count_not_decremented_on_cancel() {
     });
 
     let merchant = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_merchant(&env), &merchant);
+
+    let fee_config = crate::merchant_registry::FeeConfig {
+        platform_fee_bps: 100, // 1%
+        fixed_fee: 0,
+        fee_recipient: None, // → TreasuryBalance
+    };
+    registry_client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "Fee Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None::<Address>,
+        &None::<String>,
+        &Some(fee_config),
+    );
+    registry_client.set_kyc_tier_with_signature(
+        &admin,
+        &merchant,
+        &crate::merchant_registry::KycTier::Full,
+        &Some(String::from_str(&env, "sig")),
+    );
+
+    let payment_id = String::from_str(&env, "plat_fee_treasury");
+    let amount = 10_000i128;
+    let args = create_payment_args(&env, &payment_id, &merchant, amount);
+    payment_client.create_payment(&args);
+
+    let oracle = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_oracle(&env), &oracle);
+    payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &BytesN::<32>::random(&env),
+        &Address::generate(&env),
+        &amount,
+    );
+
+    let operator = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    payment_client.settle_payment(&operator, &payment_id, &vec![&env]);
+
+    // 1% of 10_000 = 100 credited to treasury (no custom recipient)
+    assert_eq!(payment_client.get_treasury_balance(), 100i128);
+}
+
+#[test]
+fn test_withdraw_treasury_reduces_balance_and_logs_history() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token) = setup_refund_manager_with_token(&env);
+    let token_client = token::StellarAssetClient::new(&env, &usdc_token);
+
+    let merchant_id = Address::generate(&env);
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    let payment_id = String::from_str(&env, "withdraw_hist_pay");
+    let requester = Address::generate(&env);
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &50_000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+    let refund_id = client.create_refund(
+        &payment_id,
+        &10_000i128,
+        &String::from_str(&env, "reason"),
+        &requester,
+    );
+    client.process_refund(&operator, &refund_id);
+    // fee = 100 bps * 10000 = 100
+    assert_eq!(client.get_treasury_balance(), 100i128);
+
+    let destination = Address::generate(&env);
+    let starting = token::TokenClient::new(&env, &usdc_token).balance(&destination);
+    client.withdraw_treasury(&admin, &40i128, &destination);
+
+    assert_eq!(client.get_treasury_balance(), 60i128);
+    assert_eq!(
+        token::TokenClient::new(&env, &usdc_token).balance(&destination),
+        starting + 40
+    );
+
+    let history = client.get_treasury_withdrawal_history(&0u32, &10u32);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history.get(0).unwrap().amount, 40i128);
+    assert_eq!(history.get(0).unwrap().destination, destination);
+
+    // Insufficient withdrawal fails and does not change balance
+    let result = client.try_withdraw_treasury(&admin, &61i128, &destination);
+    assert_eq!(result, Err(Ok(Error::InsufficientTreasuryBalance)));
+    assert_eq!(client.get_treasury_balance(), 60i128);
+
+    let _ = token_client; // silence unused if only StellarAssetClient needed above
     client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
 
     let payment_id = String::from_str(&env, "cancel_test");

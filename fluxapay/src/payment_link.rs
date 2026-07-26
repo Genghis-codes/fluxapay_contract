@@ -250,7 +250,7 @@ impl PaymentLinkManager {
 
         if let Some(max_uses) = link.max_uses {
             if link.use_count >= max_uses {
-                return Err(crate::Error::PaymentAlreadyProcessed);
+                return Err(crate::Error::LinkMaxUsesReached);
             }
         }
 
@@ -297,12 +297,30 @@ impl PaymentLinkManager {
             amount
         };
 
-        link.use_count += 1;
+        // Atomic read-check-increment: use_count was checked above against the
+        // in-memory snapshot; the single storage write below commits the bump
+        // in the same transaction (Soroban tx isolation prevents mid-tx races).
+        link.use_count = link.use_count.saturating_add(1);
+        let hit_max_uses = link
+            .max_uses
+            .map(|m| link.use_count == m)
+            .unwrap_or(false);
+
         // Accumulate revenue from this payment.
         link.total_revenue = link.total_revenue.saturating_add(resolved_amount);
         env.storage()
             .persistent()
             .set(&LinkDataKey::Link(link_id.clone()), &link);
+
+        if hit_max_uses {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "LINK"),
+                    Symbol::new(&env, "MAX_USES_REACHED"),
+                ),
+                (link_id.clone(), link.use_count, link.max_uses),
+            );
+        }
 
         // Issue #111: If direct_transfer is true, transfer funds directly to the merchant,
         // bypassing the escrow/platform wallet.

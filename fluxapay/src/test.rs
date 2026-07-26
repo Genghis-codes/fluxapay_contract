@@ -591,6 +591,152 @@ fn test_process_refund() {
 }
 
 #[test]
+fn test_process_refund_within_expiry_window_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_expiry_ok");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    // Well within the default 30-day window.
+    env.ledger().set_timestamp(env.ledger().timestamp() + 60);
+    client.process_refund(&operator, &refund_id);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Completed);
+}
+
+#[test]
+fn test_process_refund_rejects_after_expiry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_expiry_bad");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    // 60 days later — past the default 30-day expiry window.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 60 * 24 * 60 * 60);
+
+    let err = client.try_process_refund(&operator, &refund_id);
+    assert_eq!(err, Err(Ok(Error::RefundExpired)));
+}
+
+#[test]
+fn test_expire_refund_clears_pending_expired_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_expire_cleanup");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 60 * 24 * 60 * 60);
+
+    client.expire_refund(&operator, &refund_id);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Rejected);
+
+    // Once cleared, it can't be expired (or processed) again.
+    let err = client.try_expire_refund(&operator, &refund_id);
+    assert_eq!(err, Err(Ok(Error::RefundAlreadyProcessed)));
+}
+
+#[test]
+fn test_set_refund_expiry_configures_window() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    // Shrink the window to 100 seconds.
+    client.set_refund_expiry(&admin, &100u64);
+
+    let payment_id = String::from_str(&env, "payment_custom_expiry");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 200);
+
+    let err = client.try_process_refund(&operator, &refund_id);
+    assert_eq!(err, Err(Ok(Error::RefundExpired)));
+}
+
+#[test]
 fn test_initialize_contract() {
     let env = Env::default();
     env.mock_all_auths();

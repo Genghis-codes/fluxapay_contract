@@ -19,6 +19,10 @@ const REFUND_FEE_BPS_BASIC: i128 = 100;     // 1.0% for Basic tier
 const REFUND_FEE_BPS_FULL: i128 = 80;       // 0.8% for Full tier
 const REFUND_FEE_BPS_BUSINESS: i128 = 50;   // 0.5% for Business tier
 
+/// Default window (Issue #170) during which a pending refund may be processed,
+/// measured from `Refund::created_at`. Configurable via `set_refund_expiry`.
+pub const DEFAULT_REFUND_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Maximum number of payment retries before a subscription is cancelled.
 pub const SUBSCRIPTION_MAX_RETRIES: u32 = 3;
 /// Spacing between retry attempts in seconds (2 days).
@@ -31,7 +35,7 @@ mod dex_router;
 pub mod fx_oracle;
 pub mod merchant_auth;
 use access_control::{
-    role_admin, role_merchant, role_oracle, role_settlement_operator, AccessControl,
+    role_admin, role_arbitrator, role_merchant, role_oracle, role_settlement_operator, AccessControl,
 };
 // Re-export for tests
 #[allow(unused_imports)]
@@ -99,6 +103,8 @@ pub struct Refund {
     pub requester: Address,
     pub created_at: u64,
     pub processed_at: Option<u64>,
+    /// Expiry timestamp for refund requests (Issue #170).
+    pub expiry_at: u64,
 }
 
 #[contracttype]
@@ -178,6 +184,10 @@ pub enum Error {
     InvalidResumeTimestamp = 32,
     /// Merchant authorization error (see MerchantAuthError for details).
     MerchantAuthError = 33,
+    /// Refund's `expiry_at` deadline has passed (Issue #170).
+    RefundExpired = 34,
+    /// Arbitrator has already cast a vote on this dispute.
+    AlreadyVoted = 35,
 }
 
 #[contracttype]
@@ -278,6 +288,27 @@ pub struct VoteTally {
     pub against_weight: i128,
     /// Number of arbitrators who have voted.
     pub vote_count: u32,
+}
+
+/// Number of `ARBITRATOR`-role votes (either direction) required to
+/// auto-execute a dispute resolution via [`FluxaPayContract::vote_dispute`].
+pub const ARBITRATOR_VOTING_THRESHOLD: u32 = 3;
+
+/// Vote choice for the simple `ARBITRATOR`-role voting flow (as opposed to
+/// the stake-weighted [`VoteChoice`] flow above).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ArbitratorVoteChoice {
+    Approve,
+    Reject,
+}
+
+/// Accumulated vote counts for the `ARBITRATOR`-role voting flow.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorVoteTally {
+    pub approve_count: u32,
+    pub reject_count: u32,
 }
 
 /// Operator note persisted on-chain for dispute transparency.
@@ -435,6 +466,13 @@ pub enum DataKey {
     DisputeVote(String, Address),
     /// Tally of votes for a dispute
     DisputeVoteTally(String),
+    /// Configurable refund expiry window in seconds (Issue #170).
+    RefundExpirySecs,
+    /// Vote cast by an arbitrator under the simple ARBITRATOR-role voting
+    /// flow: (dispute_id, arbitrator) → ArbitratorVoteChoice.
+    ArbitratorVote(String, Address),
+    /// Tally of ARBITRATOR-role votes for a dispute.
+    ArbitratorVoteTally(String),
 }
 
 // When building for WASM deployment, only the active contract's #[contractimpl]
@@ -627,6 +665,7 @@ impl RefundManager {
         // we use a match statement for common cases
         let refund_id = format_id(env, "refund_", counter);
 
+        let created_at = env.ledger().timestamp();
         let refund = Refund {
             refund_id: refund_id.clone(),
             payment_id: payment_id.clone(),
@@ -634,8 +673,9 @@ impl RefundManager {
             reason,
             status: RefundStatus::Pending,
             requester,
-            created_at: env.ledger().timestamp(),
+            created_at,
             processed_at: None,
+            expiry_at: created_at.saturating_add(Self::get_refund_expiry_secs(env)),
         };
 
         env.storage()
@@ -687,6 +727,10 @@ impl RefundManager {
 
         if refund.status != RefundStatus::Pending {
             return Err(Error::RefundAlreadyProcessed);
+        }
+
+        if env.ledger().timestamp() > refund.expiry_at {
+            return Err(Error::RefundExpired);
         }
 
         let usdc_token_address: Address = env
@@ -795,6 +839,71 @@ impl RefundManager {
         );
 
         Ok(())
+    }
+
+    /// Clean up a pending refund that has passed its `expiry_at` deadline
+    /// (Issue #170). Marks it `Rejected` so it no longer blocks the
+    /// payment's refundable balance. Callable by the same roles as
+    /// `process_refund`/`reject_refund`.
+    pub fn expire_refund(env: Env, operator: Address, refund_id: String) -> Result<(), Error> {
+        operator.require_auth();
+        let has_settlement =
+            AccessControl::has_role(&env, &role_settlement_operator(&env), &operator);
+        let has_oracle = AccessControl::has_role(&env, &role_oracle(&env), &operator);
+
+        if !has_settlement && !has_oracle {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut refund = Self::get_refund_internal(&env, &refund_id)?;
+
+        if refund.status != RefundStatus::Pending {
+            return Err(Error::RefundAlreadyProcessed);
+        }
+
+        if env.ledger().timestamp() <= refund.expiry_at {
+            return Err(Error::RefundExpired);
+        }
+
+        refund.status = RefundStatus::Rejected;
+        refund.processed_at = Some(env.ledger().timestamp());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id.clone()), &refund);
+        Self::bump_refund_ttl(&env, &refund_id, &refund.status);
+
+        env.events().publish(
+            (Symbol::new(&env, "REFUND"), Symbol::new(&env, "EXPIRED")),
+            (refund.payment_id, refund_id, refund.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Admin-configurable refund expiry window in seconds (Issue #170).
+    /// Applies to refunds created after this call.
+    pub fn set_refund_expiry(env: Env, admin: Address, secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if secs == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::RefundExpirySecs, &secs);
+
+        Ok(())
+    }
+
+    fn get_refund_expiry_secs(env: &Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::RefundExpirySecs)
+            .unwrap_or(DEFAULT_REFUND_EXPIRY_SECS)
     }
 
     /// Cancel a pending refund. Caller must be the refund requester (merchant) or contract admin.
@@ -1605,6 +1714,120 @@ impl RefundManager {
                 tally.against_weight,
                 favour_wins,
             ),
+        );
+
+        Ok(())
+    }
+
+    /// Cast a role-gated vote on a dispute. Unlike [`Self::cast_vote`] (which
+    /// is stake-weighted), this flow simply counts one vote per
+    /// `ARBITRATOR`-role address and auto-executes the resolution as soon as
+    /// either side reaches [`ARBITRATOR_VOTING_THRESHOLD`].
+    ///
+    /// # Parameters
+    /// * `arbitrator` – Must hold the `ARBITRATOR` role; must sign.
+    /// * `dispute_id` – Dispute to vote on; must currently be `UnderReview`.
+    /// * `choice`     – `ArbitratorVoteChoice::Approve` or `::Reject`.
+    pub fn vote_dispute(
+        env: Env,
+        arbitrator: Address,
+        dispute_id: String,
+        choice: ArbitratorVoteChoice,
+    ) -> Result<(), Error> {
+        arbitrator.require_auth();
+
+        if !AccessControl::has_role(&env, &role_arbitrator(&env), &arbitrator) {
+            return Err(Error::Unauthorized);
+        }
+
+        let dispute = Self::get_dispute_internal(&env, &dispute_id)?;
+        if dispute.status != DisputeStatus::UnderReview {
+            return Err(Error::DisputeAlreadyResolved);
+        }
+
+        let vote_key = DataKey::ArbitratorVote(dispute_id.clone(), arbitrator.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(Error::AlreadyVoted);
+        }
+
+        env.storage().persistent().set(&vote_key, &choice);
+        Self::bump_ttl(&env, &vote_key, LONG_LIVE_TTL);
+
+        let tally_key = DataKey::ArbitratorVoteTally(dispute_id.clone());
+        let mut tally: ArbitratorVoteTally = env
+            .storage()
+            .persistent()
+            .get(&tally_key)
+            .unwrap_or(ArbitratorVoteTally {
+                approve_count: 0,
+                reject_count: 0,
+            });
+
+        match choice {
+            ArbitratorVoteChoice::Approve => {
+                tally.approve_count = tally.approve_count.saturating_add(1)
+            }
+            ArbitratorVoteChoice::Reject => {
+                tally.reject_count = tally.reject_count.saturating_add(1)
+            }
+        }
+
+        env.storage().persistent().set(&tally_key, &tally);
+        Self::bump_ttl(&env, &tally_key, LONG_LIVE_TTL);
+
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "VOTE_CAST")),
+            (dispute_id.clone(), arbitrator),
+        );
+
+        if tally.approve_count >= ARBITRATOR_VOTING_THRESHOLD {
+            Self::auto_resolve_dispute(&env, &dispute_id, true)?;
+        } else if tally.reject_count >= ARBITRATOR_VOTING_THRESHOLD {
+            Self::auto_resolve_dispute(&env, &dispute_id, false)?;
+        }
+
+        Ok(())
+    }
+
+    /// Finalize a dispute once ARBITRATOR-role voting has reached
+    /// [`ARBITRATOR_VOTING_THRESHOLD`] in either direction. `approved` issues
+    /// a refund and marks the dispute `Resolved`; otherwise it's `Rejected`.
+    fn auto_resolve_dispute(env: &Env, dispute_id: &String, approved: bool) -> Result<(), Error> {
+        let mut dispute = Self::get_dispute_internal(env, dispute_id)?;
+        if dispute.status == DisputeStatus::Resolved || dispute.status == DisputeStatus::Rejected {
+            return Ok(());
+        }
+
+        if approved {
+            let refund_reason = String::from_str(env, "Auto-resolved by arbitrator vote");
+            if let Some(admin) = AccessControl::get_admin(env) {
+                if let Ok(refund_id) = Self::create_refund_internal(
+                    env,
+                    dispute.payment_id.clone(),
+                    dispute.amount,
+                    refund_reason,
+                    dispute.disputer.clone(),
+                ) {
+                    let _ = Self::process_refund_internal(env, &admin, refund_id);
+                }
+            }
+            dispute.status = DisputeStatus::Resolved;
+        } else {
+            dispute.status = DisputeStatus::Rejected;
+        }
+        dispute.resolved_at = Some(env.ledger().timestamp());
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
+        Self::bump_dispute_ttl(env, dispute_id, &dispute.status);
+
+        env.events().publish(
+            (
+                Symbol::new(env, "DISPUTE"),
+                Symbol::new(env, "AUTO_RESOLVED"),
+            ),
+            (dispute_id.clone(), approved),
         );
 
         Ok(())
@@ -3646,6 +3869,44 @@ impl PaymentProcessor {
         destination: Address,
     ) -> Result<(), StreamError> {
         PaymentStreaming::set_stream_destination(env, recipient, stream_id, destination)
+    }
+
+    /// Sender approves milestones for a stream, unlocking withdrawals.
+    pub fn approve_stream_milestone(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        PaymentStreaming::approve_stream_milestone(env, sender, stream_id)
+    }
+
+    /// Sender revokes a previous milestone approval, re-locking withdrawals.
+    pub fn revoke_stream_milestone(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        PaymentStreaming::revoke_stream_milestone(env, sender, stream_id)
+    }
+
+    /// Sender sets a floor for `decrease_rate_per_second` on this stream.
+    pub fn set_stream_min_rate(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        min_rate_per_second: i128,
+    ) -> Result<(), StreamError> {
+        PaymentStreaming::set_stream_min_rate(env, sender, stream_id, min_rate_per_second)
+    }
+
+    /// Reduce the flow rate of an active stream, refunding surplus deposit.
+    pub fn decrease_rate_per_second(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        new_rate: i128,
+    ) -> Result<(), StreamError> {
+        PaymentStreaming::decrease_rate_per_second(env, sender, stream_id, new_rate)
     }
 
     pub fn get_sender_streams(

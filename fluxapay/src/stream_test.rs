@@ -243,6 +243,7 @@ fn test_set_stream_destination_and_trigger_withdrawal() {
 
     client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id);
     client.set_stream_destination(&receiver, &stream_id, &destination);
+    client.approve_stream_milestone(&sender, &stream_id);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 10);
     let processed = client.trigger_withdrawal(&stream_id);
@@ -269,6 +270,9 @@ fn test_withdraw_all_for_recipient_limits_execution() {
     client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id1);
     client.create_stream(&sender, &receiver, &token, &20i128, &500i128, &stream_id2);
     client.create_stream(&sender, &receiver, &token, &30i128, &500i128, &stream_id3);
+    client.approve_stream_milestone(&sender, &stream_id1);
+    client.approve_stream_milestone(&sender, &stream_id2);
+    client.approve_stream_milestone(&sender, &stream_id3);
 
     env.ledger().set_timestamp(env.ledger().timestamp() + 10);
 
@@ -298,4 +302,95 @@ fn test_get_sender_streams_pagination() {
     assert_eq!(page2.len(), 2);
     let page3 = client.get_sender_streams(&sender, &2u32, &2u32);
     assert_eq!(page3.len(), 1);
+}
+
+// ─── Milestone approval gate ───────────────────────────────────────────────────
+
+#[test]
+fn test_withdraw_blocked_before_milestone_approval() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    let stream_id = String::from_str(&env, "stream_milestone_locked");
+    let destination = Address::generate(&env);
+    client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id);
+    client.set_stream_destination(&receiver, &stream_id, &destination);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    let err = client.try_trigger_withdrawal(&stream_id);
+    assert_eq!(err, Err(Ok(StreamError::MilestoneNotApproved)));
+}
+
+#[test]
+fn test_approve_stream_milestone_unblocks_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+    let token_client = token::StellarAssetClient::new(&env, &token);
+
+    let stream_id = String::from_str(&env, "stream_milestone_approved");
+    let destination = Address::generate(&env);
+    client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id);
+    client.set_stream_destination(&receiver, &stream_id, &destination);
+    client.approve_stream_milestone(&sender, &stream_id);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    let processed = client.trigger_withdrawal(&stream_id);
+
+    assert_eq!(processed, stream_id);
+    assert_eq!(token_client.balance(&destination), 100i128);
+}
+
+#[test]
+fn test_revoke_stream_milestone_relocks_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    let stream_id = String::from_str(&env, "stream_milestone_revoked");
+    let destination = Address::generate(&env);
+    client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id);
+    client.set_stream_destination(&receiver, &stream_id, &destination);
+    client.approve_stream_milestone(&sender, &stream_id);
+    client.revoke_stream_milestone(&sender, &stream_id);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    let err = client.try_trigger_withdrawal(&stream_id);
+    assert_eq!(err, Err(Ok(StreamError::MilestoneNotApproved)));
+}
+
+#[test]
+fn test_approve_stream_milestone_unauthorized_caller() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    let stream_id = String::from_str(&env, "stream_milestone_auth");
+    client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id);
+
+    let impostor = Address::generate(&env);
+    let err = client.try_approve_stream_milestone(&impostor, &stream_id);
+    assert_eq!(err, Err(Ok(StreamError::Unauthorized)));
+}
+
+// ─── Minimum rate enforcement ───────────────────────────────────────────────────
+
+#[test]
+fn test_decrease_rate_rejects_below_configured_min() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, sender, receiver, token) = setup(&env);
+
+    let stream_id = String::from_str(&env, "stream_min_rate");
+    client.create_stream(&sender, &receiver, &token, &10i128, &500i128, &stream_id);
+    client.set_stream_min_rate(&sender, &stream_id, &5i128);
+
+    let err = client.try_decrease_rate_per_second(&sender, &stream_id, &4i128);
+    assert_eq!(err, Err(Ok(StreamError::InvalidRate)));
+
+    // Exactly at the floor is allowed.
+    client.decrease_rate_per_second(&sender, &stream_id, &5i128);
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.rate_per_second, 5);
 }

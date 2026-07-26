@@ -1,6 +1,6 @@
 use crate::{
-    Dispute, DisputeStatus, PaymentProcessor, PaymentProcessorClient, Refund, RefundManager,
-    RefundManagerClient, RefundStatus,
+    ArbitratorVoteChoice, Dispute, DisputeStatus, Error, PaymentProcessor, PaymentProcessorClient,
+    Refund, RefundManager, RefundManagerClient, RefundStatus,
 };
 use soroban_sdk::{
     testutils::{Address as _, BytesN as _},
@@ -379,4 +379,158 @@ fn test_resolve_dispute_with_only_operator_auth() {
 
     let refund = refund_client.get_refund(&refund_id);
     assert_eq!(refund.status, RefundStatus::Completed);
+}
+
+// ─── ARBITRATOR-role vote_dispute ──────────────────────────────────────────────
+
+fn setup_dispute_under_review(
+    env: &Env,
+    admin: &Address,
+    payment_client: &PaymentProcessorClient,
+    refund_client: &RefundManagerClient,
+    payment_id: &String,
+    amount: i128,
+) -> String {
+    let merchant = Address::generate(env);
+    let customer = Address::generate(env);
+    let operator = Address::generate(env);
+
+    refund_client.grant_role(admin, &Symbol::new(env, "SETTLEMENT_OPERATOR"), &operator);
+    payment_client.grant_role(admin, &Symbol::new(env, "MERCHANT"), &merchant);
+    let args = create_payment_args(env, payment_id, &merchant, amount);
+    payment_client.create_payment(&args);
+
+    let oracle = Address::generate(env);
+    payment_client.grant_role(admin, &Symbol::new(env, "ORACLE"), &oracle);
+    let tx_hash = BytesN::<32>::random(env);
+    payment_client.verify_payment(&oracle, payment_id, &tx_hash, &customer, &amount);
+
+    refund_client.register_payment(payment_id, &merchant, &amount, &Symbol::new(env, "USDC"));
+
+    let dispute_id = refund_client.create_dispute(
+        payment_id,
+        &amount,
+        &String::from_str(env, "Item not as described"),
+        &String::from_str(env, "Photo evidence"),
+        &customer,
+    );
+    refund_client.review_dispute(&operator, &dispute_id);
+    dispute_id
+}
+
+#[test]
+fn test_vote_dispute_auto_resolves_on_three_approvals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, refund_client) = setup_contracts(&env);
+
+    let payment_id = String::from_str(&env, "payment_vote_approve");
+    let dispute_id = setup_dispute_under_review(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        &payment_id,
+        400i128,
+    );
+
+    let arbitrator_role = Symbol::new(&env, "ARBITRATOR");
+    let arb1 = Address::generate(&env);
+    let arb2 = Address::generate(&env);
+    let arb3 = Address::generate(&env);
+    refund_client.grant_role(&admin, &arbitrator_role, &arb1);
+    refund_client.grant_role(&admin, &arbitrator_role, &arb2);
+    refund_client.grant_role(&admin, &arbitrator_role, &arb3);
+
+    refund_client.vote_dispute(&arb1, &dispute_id, &ArbitratorVoteChoice::Approve);
+    refund_client.vote_dispute(&arb2, &dispute_id, &ArbitratorVoteChoice::Approve);
+
+    // Only 2 of 3 votes in — dispute must still be under review.
+    let dispute = refund_client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::UnderReview);
+
+    refund_client.vote_dispute(&arb3, &dispute_id, &ArbitratorVoteChoice::Approve);
+
+    let dispute = refund_client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::Resolved);
+    assert!(dispute.resolved_at.is_some());
+}
+
+#[test]
+fn test_vote_dispute_auto_rejects_on_three_rejections() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, refund_client) = setup_contracts(&env);
+
+    let payment_id = String::from_str(&env, "payment_vote_reject");
+    let dispute_id = setup_dispute_under_review(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        &payment_id,
+        400i128,
+    );
+
+    let arbitrator_role = Symbol::new(&env, "ARBITRATOR");
+    let arb1 = Address::generate(&env);
+    let arb2 = Address::generate(&env);
+    let arb3 = Address::generate(&env);
+    refund_client.grant_role(&admin, &arbitrator_role, &arb1);
+    refund_client.grant_role(&admin, &arbitrator_role, &arb2);
+    refund_client.grant_role(&admin, &arbitrator_role, &arb3);
+
+    refund_client.vote_dispute(&arb1, &dispute_id, &ArbitratorVoteChoice::Reject);
+    refund_client.vote_dispute(&arb2, &dispute_id, &ArbitratorVoteChoice::Reject);
+    refund_client.vote_dispute(&arb3, &dispute_id, &ArbitratorVoteChoice::Reject);
+
+    let dispute = refund_client.get_dispute(&dispute_id);
+    assert_eq!(dispute.status, DisputeStatus::Rejected);
+    assert!(dispute.resolved_at.is_some());
+}
+
+#[test]
+fn test_vote_dispute_duplicate_vote_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, refund_client) = setup_contracts(&env);
+
+    let payment_id = String::from_str(&env, "payment_vote_dup");
+    let dispute_id = setup_dispute_under_review(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        &payment_id,
+        400i128,
+    );
+
+    let arbitrator_role = Symbol::new(&env, "ARBITRATOR");
+    let arb1 = Address::generate(&env);
+    refund_client.grant_role(&admin, &arbitrator_role, &arb1);
+
+    refund_client.vote_dispute(&arb1, &dispute_id, &ArbitratorVoteChoice::Approve);
+    let err = refund_client.try_vote_dispute(&arb1, &dispute_id, &ArbitratorVoteChoice::Approve);
+    assert_eq!(err, Err(Ok(Error::AlreadyVoted)));
+}
+
+#[test]
+fn test_vote_dispute_non_arbitrator_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, refund_client) = setup_contracts(&env);
+
+    let payment_id = String::from_str(&env, "payment_vote_unauth");
+    let dispute_id = setup_dispute_under_review(
+        &env,
+        &admin,
+        &payment_client,
+        &refund_client,
+        &payment_id,
+        400i128,
+    );
+
+    let impostor = Address::generate(&env);
+    let err = refund_client.try_vote_dispute(&impostor, &dispute_id, &ArbitratorVoteChoice::Approve);
+    assert_eq!(err, Err(Ok(Error::Unauthorized)));
 }

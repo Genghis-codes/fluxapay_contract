@@ -170,6 +170,37 @@ pub enum RefundStatus {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvoiceStatus {
+    Created,
+    Paid,
+    Overdue,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LineItem {
+    pub description: String,
+    pub amount: i128,
+    pub quantity: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Invoice {
+    pub invoice_id: String,
+    pub merchant_id: Address,
+    pub customer_email: String,
+    pub line_items: Vec<LineItem>,
+    pub total_amount: i128,
+    pub currency: Symbol,
+    pub due_date: u64,
+    pub status: InvoiceStatus,
+    pub payment_link_id: Option<String>,
+    pub created_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DisputeStatus {
     Open,
     UnderReview,
@@ -723,6 +754,9 @@ pub enum DataKey {
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
+    Invoice(String),
+    MerchantInvoices(Address),
+    InvoiceCounter,
     /// Issue #482: Payment retry chain tracking - maps original_id to list of retry payment IDs
     PaymentRetries(String),
     /// Issue #478: FX oracle max rate deviation per currency pair in basis points
@@ -7477,6 +7511,116 @@ impl PaymentProcessor {
 
         Ok(merchants_processed)
     }
+}
+    pub fn create_invoice(
+        env: Env,
+        merchant_id: Address,
+        customer_email: String,
+        line_items: Vec<LineItem>,
+        total_amount: i128,
+        currency: Symbol,
+        due_date: u64,
+    ) -> Result<String, Error> {
+        merchant_id.require_auth();
+
+        if total_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let invoice_id = Self::get_next_invoice_id(&env);
+        let now = env.ledger().timestamp();
+
+        let invoice = Invoice {
+            invoice_id: invoice_id.clone(),
+            merchant_id: merchant_id.clone(),
+            customer_email: customer_email.clone(),
+            line_items,
+            total_amount,
+            currency,
+            due_date,
+            status: InvoiceStatus::Created,
+            payment_link_id: None,
+            created_at: now,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id.clone()), &invoice);
+
+        let mut merchant_invoices = Self::get_merchant_invoices_internal(&env, &merchant_id);
+        merchant_invoices.push_back(invoice_id.clone());
+        env.storage().persistent().set(
+            &DataKey::MerchantInvoices(merchant_id.clone()),
+            &merchant_invoices,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "INVOICE"), Symbol::new(&env, "CREATED")),
+            (invoice_id.clone(), merchant_id.clone(), total_amount),
+        );
+
+        Ok(invoice_id)
+    }
+
+    pub fn mark_invoice_paid(env: Env, invoice_id: String) -> Result<(), Error> {
+        let mut invoice: Invoice = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Invoice(invoice_id.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if invoice.status != InvoiceStatus::Created {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        invoice.status = InvoiceStatus::Paid;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Invoice(invoice_id.clone()), &invoice);
+
+        env.events().publish(
+            (Symbol::new(&env, "INVOICE"), Symbol::new(&env, "PAID")),
+            (invoice_id.clone(), invoice.merchant_id.clone()),
+        );
+
+        Ok(())
+    }
+
+    pub fn get_invoice(env: Env, invoice_id: String) -> Result<Invoice, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Invoice(invoice_id))
+            .ok_or(Error::PaymentNotFound)
+    }
+
+    pub fn get_merchant_invoices(env: Env, merchant_id: Address) -> Vec<String> {
+        Self::get_merchant_invoices_internal(&env, &merchant_id)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn get_next_invoice_id(env: &Env) -> String {
+        let counter = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::InvoiceCounter)
+            .unwrap_or(0);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InvoiceCounter, &(counter + 1));
+
+        utils::format_id(env, "invoice_", counter)
+    }
+
+    fn get_merchant_invoices_internal(env: &Env, merchant_id: &Address) -> Vec<String> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<String>>(&DataKey::MerchantInvoices(merchant_id.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
 }
 
 /// Bumps the version string by incrementing the number after the last '.'.

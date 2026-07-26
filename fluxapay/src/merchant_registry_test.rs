@@ -1,6 +1,9 @@
 use super::merchant_registry::*;
 use crate::{PaymentProcessor, PaymentProcessorClient, RefundManager, RefundManagerClient};
-use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env, String, Symbol};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events, testutils::Ledger, Address, Env, String, Symbol,
+    TryIntoVal,
+};
 
 #[test]
 fn test_merchant_registration() {
@@ -351,6 +354,7 @@ fn test_unverified_merchant_cannot_create_payment() {
     let args = crate::CreatePaymentArgs {
         payment_id,
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -360,6 +364,8 @@ fn test_unverified_merchant_cannot_create_payment() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
+        metadata: None,
     };
 
     // This should panic with Unauthorized error
@@ -411,6 +417,7 @@ fn test_verified_merchant_can_create_payment() {
     let args = crate::CreatePaymentArgs {
         payment_id: payment_id.clone(),
         merchant_id: merchant.clone(),
+        payer: None,
         amount,
         currency: Symbol::new(&env, "USDC"),
         deposit_address: Address::generate(&env),
@@ -420,6 +427,8 @@ fn test_verified_merchant_can_create_payment() {
         memo_type: None,
         token_address: None,
         client_token: None,
+        metadata_hash: None,
+        metadata: None,
     };
 
     let payment = payment_client.create_payment(&args);
@@ -452,7 +461,7 @@ fn test_suspend_merchant() {
     );
 
     let reason = String::from_str(&env, "Fraudulent activity");
-    client.suspend_merchant(&admin, &merchant_id, &reason);
+    client.suspend_merchant(&admin, &merchant_id, &reason, &0u64);
 
     let merchant = client.get_merchant(&merchant_id);
     assert!(!merchant.active);
@@ -483,7 +492,7 @@ fn test_reinstate_merchant() {
     );
 
     let reason = String::from_str(&env, "Fraudulent activity");
-    client.suspend_merchant(&admin, &merchant_id, &reason);
+    client.suspend_merchant(&admin, &merchant_id, &reason, &0u64);
 
     // Check it's suspended
     let suspended = client.get_merchant(&merchant_id);
@@ -659,7 +668,12 @@ fn test_suspend_merchant_unauthorized() {
         &None,
     );
 
-    client.suspend_merchant(&attacker, &merchant_id, &String::from_str(&env, "Reason"));
+    client.suspend_merchant(
+        &attacker,
+        &merchant_id,
+        &String::from_str(&env, "Reason"),
+        &0u64,
+    );
 }
 
 // Tests for issue #208: Content-Addressable Merchant Profiles
@@ -1080,7 +1094,45 @@ fn test_pagination_with_large_merchant_list() {
 }
 
 #[test]
-fn test_pagination_with_zero_limit() {
+fn test_get_all_merchants_pagination_offset_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(&env, &contract_id);
+
+    let merchant_names = [
+        "Merchant A",
+        "Merchant B",
+        "Merchant C",
+        "Merchant D",
+        "Merchant E",
+    ];
+
+    for name in merchant_names.iter() {
+        let merchant_id = Address::generate(&env);
+        client.register_merchant(
+            &merchant_id,
+            &String::from_str(&env, name),
+            &String::from_str(&env, "USDC"),
+            &None,
+            &None,
+            &None,
+        );
+    }
+
+    let page1 = client.get_all_merchants(&0, &3);
+    assert_eq!(page1.len(), 3);
+
+    let page2 = client.get_all_merchants(&1, &3);
+    assert_eq!(page2.len(), 3);
+
+    let page_out_of_range = client.get_all_merchants(&6, &3);
+    assert_eq!(page_out_of_range.len(), 0);
+}
+
+#[test]
+fn test_get_all_merchants_zero_limit_returns_empty() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -1183,9 +1235,9 @@ fn test_verify_merchant_with_oracle_signature() {
     );
 
     let signature = String::from_str(&env, "0x1234567890abcdef");
-    
+
     // Verify merchant with oracle signature
-    client.verify_merchant(&admin, &merchant_id, &signature);
+    client.verify_merchant_with_signature(&admin, &merchant_id, &Some(signature.clone()));
 
     let merchant = client.get_merchant(&merchant_id);
     assert_eq!(merchant.oracle_signature, Some(signature));
@@ -1214,10 +1266,697 @@ fn test_set_kyc_tier_with_oracle_signature() {
     );
 
     let signature = String::from_str(&env, "0xabcdef1234567890");
-    
+
     // Set KYC tier with oracle signature
-    client.set_kyc_tier(&admin, &merchant_id, &KycTier::Full, &signature);
+    client.set_kyc_tier_with_signature(
+        &admin,
+        &merchant_id,
+        &KycTier::Full,
+        &Some(signature.clone()),
+    );
 
     let merchant = client.get_merchant(&merchant_id);
     assert_eq!(merchant.oracle_signature, Some(signature));
+}
+
+// ─── Tier-Based Volume Cap Tests (Issue #63) ─────────────────────────────────
+
+fn setup_volume_cap_env(
+    env: &Env,
+) -> (
+    Address,
+    PaymentProcessorClient<'_>,
+    MerchantRegistryClient<'_>,
+    Address, // merchant
+    Address, // oracle
+) {
+    let payment_contract = env.register(crate::PaymentProcessor, ());
+    let registry_contract = env.register(MerchantRegistry, ());
+
+    let payment_client = PaymentProcessorClient::new(env, &payment_contract);
+    let registry_client = MerchantRegistryClient::new(env, &registry_contract);
+
+    let admin = Address::generate(env);
+    payment_client.initialize_payment_processor(&admin);
+    registry_client.initialize(&admin);
+
+    // Link registry to payment processor
+    payment_client.set_merchant_registry_address(&admin, &registry_contract);
+
+    let merchant = Address::generate(env);
+    let oracle = Address::generate(env);
+
+    payment_client.grant_role(&admin, &Symbol::new(env, "MERCHANT"), &merchant);
+    payment_client.grant_role(&admin, &Symbol::new(env, "ORACLE"), &oracle);
+
+    registry_client.register_merchant(
+        &merchant,
+        &String::from_str(env, "Test Merchant"),
+        &String::from_str(env, "USDC"),
+        &None::<Address>,
+        &None::<String>,
+        &None,
+    );
+
+    (admin, payment_client, registry_client, merchant, oracle)
+}
+
+#[test]
+fn test_basic_tier_cap_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (admin, payment_client, registry_client, merchant, oracle) = setup_volume_cap_env(&env);
+
+    // Set merchant to Basic tier ($10,000 cap = 100_000_000_000 stroops)
+    registry_client.set_kyc_tier_with_signature(
+        &admin,
+        &merchant,
+        &KycTier::Basic,
+        &Some(String::from_str(&env, "sig")),
+    );
+
+    let deposit = Address::generate(&env);
+
+    // First payment: $9,000 — should succeed
+    let pid1 = String::from_str(&env, "pay_1");
+    payment_client.create_payment(&crate::CreatePaymentArgs {
+        payment_id: pid1.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 90_000_000_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit.clone(),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+    payment_client.verify_payment(
+        &oracle,
+        &pid1,
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &90_000_000_000,
+    );
+
+    // Second payment: $2,000 — would push total to $11,000, exceeding $10,000 cap
+    let pid2 = String::from_str(&env, "pay_2");
+    payment_client.create_payment(&crate::CreatePaymentArgs {
+        payment_id: pid2.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 20_000_000_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit.clone(),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+
+    let result = payment_client.try_verify_payment(
+        &oracle,
+        &pid2,
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &20_000_000_000,
+    );
+    assert!(result.is_err(), "Expected TierVolumeLimitExceeded error");
+}
+
+#[test]
+fn test_business_tier_no_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (admin, payment_client, registry_client, merchant, oracle) = setup_volume_cap_env(&env);
+
+    // Business tier: unlimited
+    registry_client.set_kyc_tier_with_signature(
+        &admin,
+        &merchant,
+        &KycTier::Business,
+        &Some(String::from_str(&env, "sig")),
+    );
+
+    let deposit = Address::generate(&env);
+
+    // Pay well above any cap — should succeed
+    let pid = String::from_str(&env, "pay_big");
+    payment_client.create_payment(&crate::CreatePaymentArgs {
+        payment_id: pid.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 10_000_000_000_000, // $1,000,000
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit.clone(),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+    payment_client.verify_payment(
+        &oracle,
+        &pid,
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &10_000_000_000_000,
+    );
+}
+
+#[test]
+fn test_volume_resets_next_month() {
+    let env = Env::default();
+    env.mock_all_auths();
+    // Start at beginning of a month epoch
+    env.ledger().with_mut(|li| li.timestamp = 2_592_000); // epoch 1
+
+    let (admin, payment_client, registry_client, merchant, oracle) = setup_volume_cap_env(&env);
+
+    registry_client.set_kyc_tier_with_signature(
+        &admin,
+        &merchant,
+        &KycTier::Basic,
+        &Some(String::from_str(&env, "sig")),
+    );
+
+    let deposit = Address::generate(&env);
+
+    // Fill up the cap this month ($10,000)
+    let pid1 = String::from_str(&env, "pay_m1");
+    payment_client.create_payment(&crate::CreatePaymentArgs {
+        payment_id: pid1.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 100_000_000_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit.clone(),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+    payment_client.verify_payment(
+        &oracle,
+        &pid1,
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &100_000_000_000,
+    );
+
+    // Advance to next month epoch
+    env.ledger().with_mut(|li| li.timestamp = 2 * 2_592_000 + 1); // epoch 2
+
+    // Same amount should succeed in the new month
+    let pid2 = String::from_str(&env, "pay_m2");
+    payment_client.create_payment(&crate::CreatePaymentArgs {
+        payment_id: pid2.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 100_000_000_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit.clone(),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+    payment_client.verify_payment(
+        &oracle,
+        &pid2,
+        &soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        &Address::generate(&env),
+        &100_000_000_000,
+    );
+}
+
+// =============================================================================
+// Payout Address History Tests
+// =============================================================================
+
+/// Helper: register a merchant and initialize the registry admin.
+fn setup_registry_with_merchant(env: &Env) -> (MerchantRegistryClient<'_>, Address, Address) {
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    client.initialize(&admin);
+
+    let merchant_id = Address::generate(env);
+    client.register_merchant(
+        &merchant_id,
+        &String::from_str(env, "Test Merchant"),
+        &String::from_str(env, "USDC"),
+        &None,
+        &None,
+        &None,
+    );
+
+    (client, admin, merchant_id)
+}
+
+/// First-time payout_address set: no history entry should be added because
+/// there was no previous address to record.
+#[test]
+fn test_first_payout_address_set_produces_no_history() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, merchant_id) = setup_registry_with_merchant(&env);
+
+    let new_addr = Address::generate(&env);
+    client.update_merchant(
+        &merchant_id,
+        &None,
+        &None,
+        &None,
+        &Some(new_addr.clone()),
+        &None,
+        &None,
+    );
+
+    // Merchant has the new payout address
+    let merchant = client.get_merchant(&merchant_id);
+    assert_eq!(merchant.payout_address, Some(new_addr));
+
+    // History is empty because there was no prior address
+    let history = client.get_payout_history(&merchant_id);
+    assert_eq!(history.len(), 0, "Expected no history on first set");
+}
+
+/// When payout_address is updated to a new value the old address is appended
+/// to MerchantPayoutHistory and a MERCHANT/PAYOUT_UPDATED event is emitted.
+#[test]
+fn test_payout_address_update_appends_old_to_history_and_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, merchant_id) = setup_registry_with_merchant(&env);
+
+    let first_addr = Address::generate(&env);
+    let second_addr = Address::generate(&env);
+
+    // First set (no history expected)
+    client.update_merchant(
+        &merchant_id,
+        &None,
+        &None,
+        &None,
+        &Some(first_addr.clone()),
+        &None,
+        &None,
+    );
+
+    // Advance time past the 48-hour rotation delay
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+
+    // Second update — first_addr should end up in history
+    client.update_merchant(
+        &merchant_id,
+        &None,
+        &None,
+        &None,
+        &Some(second_addr.clone()),
+        &None,
+        &None,
+    );
+
+    let merchant = client.get_merchant(&merchant_id);
+    assert_eq!(merchant.payout_address, Some(second_addr.clone()));
+
+    let history = client.get_payout_history(&merchant_id);
+    assert_eq!(history.len(), 1, "Expected one history entry");
+    assert_eq!(history.get(0).unwrap(), first_addr);
+
+    // Check MERCHANT/PAYOUT_UPDATED event was published
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1;
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (t0, t1),
+            (Ok(a), Ok(b))
+                if a == Symbol::new(&env, "MERCHANT") && b == Symbol::new(&env, "PAYOUT_UPDATED")
+        )
+    });
+    assert!(found, "MERCHANT/PAYOUT_UPDATED event was not emitted");
+}
+
+/// When payout_address is set to the same value, no history entry is added
+/// and no PAYOUT_UPDATED event is emitted.
+#[test]
+fn test_unchanged_payout_address_produces_no_history_and_no_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, merchant_id) = setup_registry_with_merchant(&env);
+
+    let addr = Address::generate(&env);
+
+    // First set
+    client.update_merchant(
+        &merchant_id,
+        &None,
+        &None,
+        &None,
+        &Some(addr.clone()),
+        &None,
+        &None,
+    );
+
+    // Advance past delay
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+
+    // "Update" to the same address — no history entry, no PAYOUT_UPDATED event
+    client.update_merchant(
+        &merchant_id,
+        &None,
+        &None,
+        &None,
+        &Some(addr.clone()),
+        &None,
+        &None,
+    );
+
+    let history = client.get_payout_history(&merchant_id);
+    assert_eq!(history.len(), 0, "Expected no history when address is unchanged");
+
+    // Count PAYOUT_UPDATED events — should be zero
+    let events = env.events().all();
+    let payout_updated_count = events.iter().filter(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1.clone();
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (t0, t1),
+            (Ok(a), Ok(b))
+                if a == Symbol::new(&env, "MERCHANT") && b == Symbol::new(&env, "PAYOUT_UPDATED")
+        )
+    }).count();
+    assert_eq!(
+        payout_updated_count, 0,
+        "Expected no PAYOUT_UPDATED events when address unchanged"
+    );
+}
+
+/// get_payout_history returns the full list of previous addresses in order.
+#[test]
+fn test_get_payout_history_returns_all_previous_addresses_in_order() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, merchant_id) = setup_registry_with_merchant(&env);
+
+    let addr1 = Address::generate(&env);
+    let addr2 = Address::generate(&env);
+    let addr3 = Address::generate(&env);
+
+    // Set addr1 (no history yet)
+    client.update_merchant(
+        &merchant_id,
+        &None,
+        &None,
+        &None,
+        &Some(addr1.clone()),
+        &None,
+        &None,
+    );
+
+    // Advance and change to addr2 (history: [addr1])
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+    client.update_merchant(
+        &merchant_id,
+        &None,
+        &None,
+        &None,
+        &Some(addr2.clone()),
+        &None,
+        &None,
+    );
+
+    // Advance and change to addr3 (history: [addr1, addr2])
+    env.ledger().with_mut(|li| li.timestamp += 48 * 60 * 60 + 1);
+    client.update_merchant(
+        &merchant_id,
+        &None,
+        &None,
+        &None,
+        &Some(addr3.clone()),
+        &None,
+        &None,
+    );
+
+    let history = client.get_payout_history(&merchant_id);
+    assert_eq!(history.len(), 2, "Expected two history entries");
+    assert_eq!(
+        history.get(0).unwrap(),
+        addr1,
+        "First history entry should be addr1"
+    );
+    assert_eq!(
+        history.get(1).unwrap(),
+        addr2,
+        "Second history entry should be addr2"
+    );
+}
+
+
+// ── Issue #398: transfer_admin tests ────────────────────────────────────────
+
+fn setup_registry_with_admin(env: &Env) -> (MerchantRegistryClient<'_>, Address) {
+    let contract_id = env.register(MerchantRegistry, ());
+    let client = MerchantRegistryClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    client.initialize(&admin);
+    (client, admin)
+}
+
+#[test]
+fn test_transfer_admin_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_registry_with_admin(&env);
+    let new_admin = Address::generate(&env);
+
+    client.transfer_admin(&admin, &new_admin);
+
+    // get_admin should now return the new admin.
+    assert_eq!(client.get_admin(), Some(new_admin.clone()));
+
+    // New admin can call admin-only functions (verify_merchant).
+    let merchant = Address::generate(&env);
+    client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "Shop"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+        &None,
+    );
+    client.verify_merchant(&new_admin, &merchant);
+    assert_eq!(
+        client.get_merchant(&merchant).kyc_tier,
+        KycTier::Basic,
+    );
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #3)")]
+fn test_transfer_admin_unauthorized_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin) = setup_registry_with_admin(&env);
+    let attacker = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    // Non-admin attempts to transfer — must panic with Unauthorized (code 3).
+    client.transfer_admin(&attacker, &new_admin);
+}
+
+#[test]
+#[should_panic(expected = "HostError: Error(Contract, #3)")]
+fn test_old_admin_cannot_act_after_transfer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, old_admin) = setup_registry_with_admin(&env);
+    let new_admin = Address::generate(&env);
+
+    client.transfer_admin(&old_admin, &new_admin);
+
+    // Register a merchant so we can attempt verify with the old admin.
+    let merchant = Address::generate(&env);
+    client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "OldShop"),
+        &String::from_str(&env, "USDC"),
+        &None,
+        &None,
+        &None,
+    );
+
+    // Old admin tries to verify — must fail with Unauthorized.
+    client.verify_merchant(&old_admin, &merchant);
+}
+
+#[test]
+fn test_transfer_admin_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin) = setup_registry_with_admin(&env);
+    let new_admin = Address::generate(&env);
+
+    client.transfer_admin(&admin, &new_admin);
+
+    let events = env.events().all();
+    let found = events.iter().any(|(_, topics, _)| {
+        if let (Ok(ns), Ok(ev)) = (
+            topics.get(0).unwrap().try_into_val(&env),
+            topics.get(1).unwrap().try_into_val(&env),
+        ) {
+            let ns: Symbol = ns;
+            let ev: Symbol = ev;
+            ns == Symbol::new(&env, "MERCHANT_REGISTRY")
+                && ev == Symbol::new(&env, "ADMIN_TRANSFERRED")
+        } else {
+            false
+        }
+    });
+    assert!(found, "MERCHANT_REGISTRY/ADMIN_TRANSFERRED event not emitted");
+}
+
+// ─── Customer Whitelist Mode Tests (Issue #516) ──────────────────────────────
+
+#[test]
+fn test_whitelist_mode_requires_business_tier() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (_admin, _payment_client, registry_client, merchant, _oracle) =
+        setup_volume_cap_env(&env);
+
+    // Merchant is still Unverified — enabling whitelist mode must fail.
+    let result = registry_client.try_set_merchant_whitelist_mode(&merchant, &true);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_whitelist_mode_toggle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, _payment_client, registry_client, merchant, _oracle) =
+        setup_volume_cap_env(&env);
+
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Business, &None);
+
+    registry_client.set_merchant_whitelist_mode(&merchant, &true);
+    assert!(registry_client.get_merchant(&merchant).whitelist_mode);
+
+    registry_client.set_merchant_whitelist_mode(&merchant, &false);
+    assert!(!registry_client.get_merchant(&merchant).whitelist_mode);
+}
+
+#[test]
+fn test_non_whitelisted_payer_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (admin, payment_client, registry_client, merchant, _oracle) =
+        setup_volume_cap_env(&env);
+
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Business, &None);
+    registry_client.set_merchant_whitelist_mode(&merchant, &true);
+
+    let payer = Address::generate(&env);
+    let deposit = Address::generate(&env);
+
+    let result = payment_client.try_create_payment(&crate::CreatePaymentArgs {
+        payment_id: String::from_str(&env, "pay_wl_1"),
+        merchant_id: merchant.clone(),
+        payer: Some(payer),
+        amount: 1_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit,
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+
+    assert!(result.is_err(), "Expected PayerNotWhitelisted error");
+}
+
+#[test]
+fn test_whitelisted_payer_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| li.timestamp = 1_000_000);
+
+    let (admin, payment_client, registry_client, merchant, _oracle) =
+        setup_volume_cap_env(&env);
+
+    registry_client.set_kyc_tier_with_signature(&admin, &merchant, &KycTier::Business, &None);
+    registry_client.set_merchant_whitelist_mode(&merchant, &true);
+
+    let payer = Address::generate(&env);
+    registry_client.add_to_customer_whitelist(&merchant, &payer);
+
+    let deposit = Address::generate(&env);
+
+    let payment = payment_client.create_payment(&crate::CreatePaymentArgs {
+        payment_id: String::from_str(&env, "pay_wl_2"),
+        merchant_id: merchant.clone(),
+        payer: Some(payer.clone()),
+        amount: 1_000,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: deposit,
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+    });
+
+    assert_eq!(payment.merchant_id, merchant);
+
+    // Removing the payer from the whitelist should block subsequent payments.
+    registry_client.remove_from_customer_whitelist(&merchant, &payer);
+    assert!(!registry_client.is_customer_whitelisted(&merchant, &payer));
 }

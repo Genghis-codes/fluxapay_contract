@@ -5,11 +5,23 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MetroLogic/fluxapay_contract.git",
+    "directory": "sdk"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc",
     "generate": "bash ../scripts/generate-sdk.sh",
     "generate:build": "npm run generate && npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --input-type=module -e \"import { FluxapayClient, RefundManagerClient, MerchantRegistryClient } from './dist/index.js'; if (typeof FluxapayClient !== 'function' || typeof RefundManagerClient !== 'function' || typeof MerchantRegistryClient !== 'function') { throw new Error('Missing SDK exports'); }\"",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -23,10 +35,10 @@
   "author": "FluxaPay Team",
   "license": "MIT",
   "dependencies": {
-    "@stellar/stellar-sdk": "^13.0.0"
+    "@stellar/stellar-sdk": "^16.0.1"
   },
   "devDependencies": {
-    "typescript": "^5.0.0",
+    "typescript": "^6.0.3",
     "@types/node": "^20.0.0"
   }
 }

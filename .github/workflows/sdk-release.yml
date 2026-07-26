@@ -1,0 +1,57 @@
+name: SDK Release
+
+on:
+  push:
+    tags:
+      - "sdk/v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish @fluxapay/sdk
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sdk
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#sdk/v}"
+          if [ -z "$VERSION" ]; then
+            echo "Tag must follow the format sdk/v<semver> (e.g. sdk/v0.1.0)"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Publishing @fluxapay/sdk@$VERSION"
+
+      - name: Sync package version with tag
+        run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: sdk/package-lock.json
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build SDK
+        run: npm run build
+
+      - name: Test SDK
+        run: npm test
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

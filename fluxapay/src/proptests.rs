@@ -1,4 +1,7 @@
+extern crate alloc;
+use alloc::format;
 use crate::format_id;
+use crate::utils::validate_id;
 use proptest::prelude::*;
 use soroban_sdk::{
     testutils::{Address as _, BytesN as _, Ledger as _},
@@ -84,6 +87,7 @@ proptest! {
         let args = crate::CreatePaymentArgs {
             payment_id: payment_id.clone(),
             merchant_id: merchant.clone(),
+            payer: None,
             amount,
             currency: Symbol::new(&env, "USDC"),
             deposit_address: Address::generate(&env),
@@ -93,7 +97,8 @@ proptest! {
             memo_type: None,
             token_address: None,
             client_token: None,
-            metadata_hash: None,
+            metadata_hash: None, metadata: None,
+            fee_waiver_code: None,
         };
 
         client.create_payment(&args);
@@ -134,6 +139,7 @@ proptest! {
         let args = crate::CreatePaymentArgs {
             payment_id: payment_id.clone(),
             merchant_id: merchant.clone(),
+            payer: None,
             amount,
             currency: Symbol::new(&env, "USDC"),
             deposit_address: Address::generate(&env),
@@ -143,7 +149,8 @@ proptest! {
             memo_type: None,
             token_address: None,
             client_token: None,
-            metadata_hash: None,
+            metadata_hash: None, metadata: None,
+            fee_waiver_code: None,
         };
 
         client.create_payment(&args);
@@ -165,5 +172,102 @@ proptest! {
         };
 
         assert_eq!(status, expected);
+    }
+
+    #[test]
+    fn test_validate_id_valid_chars(
+        prefix in "[a-zA-Z0-9]{1,20}",
+        suffix in "[a-zA-Z0-9_-]{0,20}",
+    ) {
+        let env = Env::default();
+        let combined = format!("{}{}", prefix, suffix);
+        // Only test strings in the 3-64 char range
+        prop_assume!(combined.len() >= 3 && combined.len() <= 64);
+        let s = soroban_sdk::String::from_str(&env, &combined);
+        assert!(validate_id(&s), "expected valid id: {}", combined);
+    }
+
+    #[test]
+    fn test_validate_id_rejects_too_short(s in "[a-z]{0,2}") {
+        let env = Env::default();
+        let id = soroban_sdk::String::from_str(&env, &s);
+        assert!(!validate_id(&id), "expected invalid (too short): {}", s);
+    }
+
+    #[test]
+    fn test_validate_id_rejects_too_long(extra in "[a-z]{1,10}") {
+        let env = Env::default();
+        // Build a 65+ char string
+        let base = "a".repeat(64);
+        let long_str = format!("{}{}", base, extra);
+        let id = soroban_sdk::String::from_str(&env, &long_str);
+        assert!(!validate_id(&id), "expected invalid (too long)");
+    }
+
+    #[test]
+    fn test_validate_id_rejects_disallowed_chars(
+        valid in "[a-zA-Z0-9_-]{2,30}",
+        bad_char in "[^a-zA-Z0-9_\\-]",
+    ) {
+        let env = Env::default();
+        let with_bad = format!("{}{}", valid, bad_char);
+        prop_assume!(with_bad.len() >= 3 && with_bad.len() <= 64);
+        // Only test if the bad char is actually non-ASCII or a known disallowed ASCII char
+        let has_disallowed = with_bad.bytes().any(|b: u8| {
+            !b.is_ascii_alphanumeric() && b != b'-' && b != b'_'
+        });
+        if has_disallowed {
+            let id = soroban_sdk::String::from_str(&env, &with_bad);
+            assert!(!validate_id(&id), "expected invalid (bad char): {}", with_bad);
+        }
+    }
+
+    /// Accrued amount never decreases between two consecutive timestamps.
+    #[test]
+    fn proptest_stream_accrual_monotonic(
+        checkpoint in 0i128..1_000_000_000i128,
+        last_at in 0u64..1_000_000u64,
+        delta1 in 0u64..10_000u64,
+        delta2 in 0u64..10_000u64,
+        rate in 0i128..1_000_000i128,
+        deposit in 1i128..i128::MAX / 4,
+    ) {
+        use crate::stream::compute_total_accrued;
+
+        let t1 = last_at.saturating_add(delta1);
+        let t2 = t1.saturating_add(delta2);
+        let a1 = compute_total_accrued(checkpoint, last_at, t1, rate, deposit);
+        let a2 = compute_total_accrued(checkpoint, last_at, t2, rate, deposit);
+        prop_assert!(a2 >= a1, "accrual decreased: {} -> {} (t {} -> {})", a1, a2, t1, t2);
+    }
+
+    /// Large rates/durations must not overflow or panic (saturating arithmetic).
+    #[test]
+    fn proptest_stream_accrual_no_overflow(
+        checkpoint in 0i128..=i128::MAX / 2,
+        last_at in 0u64..u64::MAX / 2,
+        now_offset in 0u64..u64::MAX / 2,
+        rate in 0i128..=i128::MAX,
+        deposit in 0i128..=i128::MAX,
+    ) {
+        use crate::stream::compute_total_accrued;
+
+        let now = last_at.saturating_add(now_offset);
+        let accrued = compute_total_accrued(checkpoint, last_at, now, rate, deposit);
+        prop_assert!(accrued >= 0);
+        prop_assert!(accrued <= deposit.max(0));
+    }
+
+    /// Withdrawal never drives remaining deposit negative.
+    #[test]
+    fn proptest_stream_remaining_deposit_non_negative(
+        remaining in 0i128..=i128::MAX,
+        withdraw in 0i128..=i128::MAX,
+    ) {
+        use crate::stream::compute_remaining_after_withdraw;
+
+        let after = compute_remaining_after_withdraw(remaining, withdraw);
+        prop_assert!(after >= 0);
+        prop_assert!(after <= remaining.max(0));
     }
 }

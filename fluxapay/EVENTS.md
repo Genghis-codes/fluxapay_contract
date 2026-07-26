@@ -144,7 +144,7 @@ Emitted when a merchant creates a new payment link.
 - **Data**: `(link_id: String, merchant_id: Address)`
 
 ### LINK/USED
-Emitted when a payer uses a payment link to initiate a payment.
+Emitted when a payer uses a payment link to initiate a payment. When the link has a `fiat` config, the `amount` in the data payload is the resolved USDC equivalent computed via the FX oracle.
 - **Topics**: `(LINK, USED)`
 - **Data**: `(link_id: String, payer: Address, amount: i128, payment_id: String)`
 
@@ -152,6 +152,17 @@ Emitted when a payer uses a payment link to initiate a payment.
 Emitted when a merchant deactivates a payment link.
 - **Topics**: `(LINK, DEACTIVATED)`
 - **Data**: `link_id: String`
+
+---
+
+## Contract Upgrade Events
+
+Emitted by any upgradeable contract (`PaymentProcessor`, `RefundManager`, `FXOracle`, `MerchantRegistry`, `PaymentLinkManager`).
+
+### CONTRACT/UPGRADED
+Emitted when a contract's WASM is upgraded by an admin.
+- **Topics**: `(CONTRACT, UPGRADED)`
+- **Data**: `(old_version: String, new_version: String)`
 
 ---
 
@@ -174,3 +185,8 @@ Emitted by the `PaymentProcessor` contract.
 Emitted when a new payment stream is created.
 - **Topics**: `(STREAM, CREATED)`
 - **Data**: `(stream_id: String, sender: Address, amount: i128)`
+
+### STREAM/WITHDRAWN
+Emitted when accrued tokens are withdrawn from a stream.
+- **Topics**: `(STREAM, WITHDRAWN, stream_id)`
+- **Data**: `(receiver: Address, destination: Address, amount: i128, remaining_deposit: i128)`

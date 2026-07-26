@@ -2,6 +2,10 @@ Fluxapay is a payment gateway on the Stellar blockchain that enables merchants t
 
 FluxaPay bridges the gap between crypto payments and real-world commerce—making stablecoin payments as easy to integrate as Stripe.
 
+## Getting Started
+
+New to FluxaPay? Follow the **[Merchant Quickstart Guide](docs/quickstart.md)** to go from SDK install to your first confirmed USDC payment in minutes.
+
 ## TypeScript SDK
 
 [![npm version](https://img.shields.io/npm/v/@fluxapay/sdk.svg)](https://www.npmjs.com/package/@fluxapay/sdk)

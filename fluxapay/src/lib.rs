@@ -841,6 +841,8 @@ pub enum DataKey {
     TierVolumeCap(KycTier),
     /// Configurable refund fee in basis points (overrides REFUND_FEE_BPS const).
     RefundFeeBps,
+    /// Issue #471: Whether overpaid payments automatically create a pending refund.
+    AutoRefundOverpayment,
     /// Configurable refund cooldown period in seconds (overrides REFUND_COOLDOWN_SECS const).
     RefundCooldownSecs,
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
@@ -1357,8 +1359,8 @@ impl RefundManager {
         Self::require_not_blacklisted(env, &payment.merchant_id)?;
         Self::require_not_blacklisted(env, &requester)?;
 
-        // Issue #76: Reject refunds unless payment.status == Confirmed
-        if payment.status != PaymentStatus::Confirmed {
+        // Issue #76: Reject refunds unless payment.status == Confirmed or Overpaid
+        if payment.status != PaymentStatus::Confirmed && payment.status != PaymentStatus::Overpaid {
             return Err(Error::PaymentAlreadyProcessed);
         }
 
@@ -4425,6 +4427,31 @@ impl PaymentProcessor {
         Ok(())
     }
 
+    /// Admin-only: enable or disable automatic pending refund creation for overpaid payments.
+    /// When enabled (default), any payment verified as Overpaid will automatically create
+    /// a pending refund for the excess amount and emit a REFUND/AUTO_CREATED event.
+    pub fn set_auto_refund_overpayment(
+        env: Env,
+        admin: Address,
+        enabled: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AutoRefundOverpayment, &enabled);
+        Ok(())
+    }
+
+    /// Check whether automatic refund creation for overpaid payments is enabled.
+    /// Defaults to true if not explicitly configured.
+    pub fn get_auto_refund_overpayment(env: &Env) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AutoRefundOverpayment)
+            .unwrap_or(true)
     /// Return the accumulated treasury balance collected via settlement fees
     /// and platform fees (when no custom fee_recipient).
     pub fn set_min_payment_duration_secs(env: Env, admin: Address, min_secs: u64) -> Result<(), Error> {
@@ -5886,8 +5913,29 @@ impl PaymentProcessor {
             None
         };
 
-        // Issue #162: Merchant-configurable partial payment policy.
+        // Issue #471: Emit status-specific events for PartiallyPaid and Overpaid.
         if new_status == PaymentStatus::PartiallyPaid {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT"),
+                    Symbol::new(&env, "PARTIALLY_PAID"),
+                    payment.merchant_id.clone(),
+                ),
+                (payment_id.clone(), payment.amount, amount_received),
+            );
+        }
+        if new_status == PaymentStatus::Overpaid {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "PAYMENT"),
+                    Symbol::new(&env, "OVERPAID"),
+                    payment.merchant_id.clone(),
+                ),
+                (payment_id.clone(), payment.amount, amount_received),
+            );
+        }
+
+        // Issue #162: Merchant-configurable partial payment policy.
             let partial_allowed = if let Some(registry_address) = env
                 .storage()
                 .persistent()
@@ -5952,37 +6000,48 @@ impl PaymentProcessor {
         payment.status = payment_state_machine::transition_status(&payment.status, new_status.clone())?;
 
         if let Some(refund_amount) = overpaid_refund_amount {
-            if let Some(registry_address) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
-            {
-                let registry_client = crate::merchant_registry::MerchantRegistryClient::new(
-                    &env,
-                    &registry_address,
-                );
-
-                if let Some(refund_manager_address) = registry_client.get_refund_manager_address() {
-                    let refund_client = RefundManagerClient::new(&env, &refund_manager_address);
-                    refund_client.register_payment(
-                        &payment_id,
-                        &payment.merchant_id,
-                        &payment.amount,
-                        &payment.currency,
+            if Self::get_auto_refund_overpayment(&env) {
+                if let Some(registry_address) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+                {
+                    let registry_client = crate::merchant_registry::MerchantRegistryClient::new(
+                        &env,
+                        &registry_address,
                     );
 
-                    let auto_reason = String::from_str(&env, "Automatic refund for overpayment");
-                    refund_client
-                        .try_queue_auto_refund(
-                            &env.current_contract_address(),
-                            &registry_address,
+                    if let Some(refund_manager_address) = registry_client.get_refund_manager_address() {
+                        let refund_client = RefundManagerClient::new(&env, &refund_manager_address);
+                        refund_client.register_payment(
                             &payment_id,
-                            &refund_amount,
-                            &payer_address,
-                            &auto_reason,
-                        )
-                        .map_err(|_| Error::Unauthorized)?
-                        .map_err(|_| Error::Unauthorized)?;
+                            &payment.merchant_id,
+                            &payment.amount,
+                            &payment.currency,
+                        );
+
+                        let auto_reason = String::from_str(&env, "Automatic refund for overpayment");
+                        let auto_refund_id = refund_client
+                            .try_queue_auto_refund(
+                                &env.current_contract_address(),
+                                &registry_address,
+                                &payment_id,
+                                &refund_amount,
+                                &payer_address,
+                                &auto_reason,
+                            )
+                            .map_err(|_| Error::Unauthorized)?
+                            .map_err(|_| Error::Unauthorized)?;
+
+                        env.events().publish(
+                            (
+                                Symbol::new(&env, "REFUND"),
+                                Symbol::new(&env, "AUTO_CREATED"),
+                                payment.merchant_id.clone(),
+                            ),
+                            (payment_id.clone(), refund_amount, auto_refund_id),
+                        );
+                    }
                 }
             }
         }
@@ -6029,6 +6088,84 @@ impl PaymentProcessor {
         Ok(new_status)
     }
 
+    /// Issue #471: Allow a merchant to accept a PartiallyPaid payment at the received amount.
+    /// Moves the payment from PartiallyPaid to Confirmed, using the received amount as the
+    /// effective payment amount. No refund is created for the difference.
+    pub fn accept_partial_payment(
+        env: Env,
+        merchant_id: Address,
+        payment_id: String,
+    ) -> Result<(), Error> {
+        merchant_id.require_auth();
+        Self::require_not_blacklisted(&env, &merchant_id)?;
+
+        let mut payment = Self::get_payment_internal(&env, &payment_id)?;
+        if payment.status != PaymentStatus::PartiallyPaid {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+        if payment.merchant_id != merchant_id {
+            return Err(Error::Unauthorized);
+        }
+
+        payment.status = PaymentStatus::Confirmed;
+        let amount_received = payment.amount_received.unwrap_or(payment.amount);
+        payment.amount = amount_received;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "PARTIAL_ACCEPTED"),
+                merchant_id,
+            ),
+            (payment_id, amount_received),
+        );
+
+        Ok(())
+    }
+
+    /// Issue #471: Allow a customer to complete a PartiallyPaid payment by topping up.
+    /// This is a declaration that the payer will send additional funds off-chain.
+    /// The payment status is moved to Pending so a new verify_payment call can
+    /// confirm it with the combined amount.
+    pub fn complete_partial_payment(
+        env: Env,
+        payer: Address,
+        payment_id: String,
+        top_up_amount: i128,
+    ) -> Result<(), Error> {
+        payer.require_auth();
+        Self::require_not_blacklisted(&env, &payer)?;
+
+        if top_up_amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let mut payment = Self::get_payment_internal(&env, &payment_id)?;
+        if payment.status != PaymentStatus::PartiallyPaid {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        payment.status = PaymentStatus::Pending;
+        payment.amount = payment.amount.saturating_add(top_up_amount);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment_id.clone()), &payment);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "PAYMENT"),
+                Symbol::new(&env, "PARTIAL_TOPUP"),
+                payer,
+            ),
+            (payment_id, top_up_amount),
+        );
+
+        Ok(())
 
     /// Issue #482: Create a retry payment for an expired or failed original payment.
     /// Returns the payment_id of the newly created payment, linked to the original.
@@ -8364,6 +8501,8 @@ pub use payment_link::{
 };
 #[cfg(test)]
 mod memo_test;
+#[cfg(test)]
+mod partial_overpaid_test;
 #[cfg(test)]
 mod pause_test;
 #[cfg(test)]

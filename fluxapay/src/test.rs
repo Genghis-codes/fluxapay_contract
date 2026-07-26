@@ -1169,6 +1169,31 @@ fn test_double_claim_refund_blocked() {
 }
 
 #[test]
+fn test_expire_refund_clears_pending() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_expire");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
 
     env.ledger()
         .set_timestamp(env.ledger().timestamp() + 60 * 24 * 60 * 60);
@@ -1184,7 +1209,6 @@ fn test_double_claim_refund_blocked() {
 }
 
 #[test]
-fn test_set_refund_expiry_configures_window() {
 fn test_process_refund_accumulates_treasury_and_withdraws() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1242,16 +1266,14 @@ fn test_withdraw_treasury_rejects_insufficient_balance() {
 }
 
 #[test]
-fn test_create_refund_fails_for_blacklisted_requester() {
+fn test_set_refund_expiry_configures_window() {
     let env = Env::default();
     env.mock_all_auths();
     let (admin, client) = setup_refund_manager(&env);
 
-    // Shrink the window to 100 seconds.
     client.set_refund_expiry(&admin, &100u64);
 
     let payment_id = String::from_str(&env, "payment_custom_expiry");
-    let payment_id = String::from_str(&env, "refund_blacklisted_requester");
     let merchant_id = Address::generate(&env);
     let requester = Address::generate(&env);
 
@@ -1263,9 +1285,6 @@ fn test_create_refund_fails_for_blacklisted_requester() {
     );
 
     let refund_id = client.create_refund(
-    client.add_to_blacklist(&admin, &requester);
-
-    let result = client.try_create_refund(
         &payment_id,
         &1000i128,
         &String::from_str(&env, "Reason"),
@@ -1279,6 +1298,33 @@ fn test_create_refund_fails_for_blacklisted_requester() {
 
     let err = client.try_process_refund(&operator, &refund_id);
     assert_eq!(err, Err(Ok(Error::RefundExpired)));
+}
+
+#[test]
+fn test_create_refund_fails_for_blacklisted_requester() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "refund_blacklisted_requester");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    client.add_to_blacklist(&admin, &requester);
+
+    let result = client.try_create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 

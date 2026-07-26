@@ -706,6 +706,10 @@ pub enum DataKey {
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
+    /// Minimum payment duration in seconds (default: CREATE_PAYMENT_WINDOW_SECS = 60).
+    MinPaymentDurationSecs,
+    /// Maximum payment duration in seconds (default: 30 days).
+    MaxPaymentDurationSecs,
     /// Issue #489: Reverse index from metadata_hash to payment_id for order reconciliation.
     MetadataHashPayment(BytesN<32>),
     /// Issue #492: Customer profile keyed by (merchant_id, customer_id) for CRM features.
@@ -3360,12 +3364,13 @@ impl RefundManager {
                 env.events().publish(
                     (
                         Symbol::new(&env, "SUBSCRIPTION"),
-                        Symbol::new(&env, "CANCELLED"),
+                        Symbol::new(&env, "CANCELLED_MAX_RETRIES"),
                     ),
                     (
                         subscription_id.clone(),
                         payer.clone(),
                         subscription.retry_count,
+                        SUBSCRIPTION_MAX_RETRIES,
                     ),
                 );
 
@@ -3389,6 +3394,7 @@ impl RefundManager {
                         subscription_id,
                         payer,
                         subscription.retry_count,
+                        SUBSCRIPTION_MAX_RETRIES,
                         next_retry,
                     ),
                 );
@@ -3456,6 +3462,49 @@ impl RefundManager {
         env.events().publish(
             (Symbol::new(&env, "SUBSCRIPTION"), Symbol::new(&env, "CANCELLED")),
             (subscription_id, payer),
+        );
+
+        Ok(())
+    }
+
+    /// Admin override to reactivate a subscription that was cancelled due to max retries.
+    /// Resets retry_count to 0 and reschedules the next payment.
+    pub fn admin_reactivate_subscription(
+        env: Env,
+        admin: Address,
+        subscription_id: String,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut subscription = Self::get_subscription_internal(&env, &subscription_id)?;
+
+        if subscription.status != SubscriptionStatus::Cancelled {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        let now = env.ledger().timestamp();
+        subscription.status = SubscriptionStatus::Active;
+        subscription.retry_count = 0;
+        subscription.next_retry_at = None;
+        subscription.next_payment_at = now.saturating_add(subscription.interval_secs);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscription_id.clone()), &subscription);
+
+        // Issue #302: Add back to ActiveSubscriptions index
+        Self::add_active_subscription(&env, &subscription_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "SUBSCRIPTION"),
+                Symbol::new(&env, "REACTIVATED"),
+            ),
+            (subscription_id, subscription.payer_address.clone()),
         );
 
         Ok(())
@@ -3906,6 +3955,40 @@ impl PaymentProcessor {
         env.storage()
             .persistent()
             .set(&DataKey::SettlementFeeRate, &bps);
+        Ok(())
+    }
+
+    pub fn set_min_payment_duration_secs(env: Env, admin: Address, min_secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if min_secs < CREATE_PAYMENT_WINDOW_SECS {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinPaymentDurationSecs, &min_secs);
+        Ok(())
+    }
+
+    pub fn set_max_payment_duration_secs(env: Env, admin: Address, max_secs: u64) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if max_secs > 30 * 24 * 3600 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MaxPaymentDurationSecs, &max_secs);
         Ok(())
     }
 
@@ -4703,13 +4786,34 @@ impl PaymentProcessor {
         Self::enforce_create_payment_rate_limit(&env, &args.merchant_id)?;
 
         let now = env.ledger().timestamp();
+        let min_duration = env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MinPaymentDurationSecs)
+            .unwrap_or(CREATE_PAYMENT_WINDOW_SECS);
+        let max_duration = env.storage()
+            .persistent()
+            .get::<DataKey, u64>(&DataKey::MaxPaymentDurationSecs)
+            .unwrap_or(30 * 24 * 3600);
+
         let resolved_expires_at = match args.expires_at {
-            Some(ts) => ts,
-            None => now.saturating_add(args.duration_secs.unwrap_or(DEFAULT_PAYMENT_DURATION_SECS)),
+            Some(ts) => {
+                if ts <= now {
+                    return Err(Error::InvalidExpiry);
+                }
+                let duration = ts.saturating_sub(now);
+                if duration < min_duration || duration > max_duration {
+                    return Err(Error::InvalidExpiry);
+                }
+                ts
+            }
+            None => {
+                let duration = args.duration_secs.unwrap_or(DEFAULT_PAYMENT_DURATION_SECS);
+                if duration < min_duration || duration > max_duration {
+                    return Err(Error::InvalidExpiry);
+                }
+                now.saturating_add(duration)
+            }
         };
-        if resolved_expires_at <= now {
-            return Err(Error::InvalidExpiry);
-        }
 
         let payment = PaymentCharge {
             payment_id: args.payment_id.clone(),

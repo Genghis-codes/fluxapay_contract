@@ -329,6 +329,130 @@ fn test_create_stream_fails_for_blacklisted_sender() {
 }
 
 #[test]
+fn test_pause_stream_checkpoints_accrual_and_sets_paused() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_payment_processor(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let stream_id = String::from_str(&env, "pause_stream_1");
+
+    token::StellarAssetClient::new(&env, &token).mint(&sender, &1_000_000i128);
+    client.create_stream(&sender, &recipient, &token, &10i128, &1_000i128, &stream_id);
+
+    env.ledger().with_mut(|li| li.timestamp += 50);
+
+    client.pause_stream(&sender, &stream_id);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Paused);
+    // 50 seconds at rate 10/s should have been checkpointed.
+    assert_eq!(stream.accrued_at_checkpoint, 500i128);
+    assert_eq!(stream.last_checkpoint_at, env.ledger().timestamp());
+}
+
+#[test]
+fn test_double_pause_stream_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_payment_processor(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let stream_id = String::from_str(&env, "double_pause_stream_1");
+
+    token::StellarAssetClient::new(&env, &token).mint(&sender, &1_000_000i128);
+    client.create_stream(&sender, &recipient, &token, &10i128, &1_000i128, &stream_id);
+    client.pause_stream(&sender, &stream_id);
+
+    let result = client.try_pause_stream(&sender, &stream_id);
+    assert_eq!(result, Err(Ok(StreamError::StreamNotActive)));
+}
+
+#[test]
+fn test_resume_stream_restarts_accrual_from_correct_point() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_payment_processor(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let stream_id = String::from_str(&env, "resume_stream_1");
+
+    token::StellarAssetClient::new(&env, &token).mint(&sender, &1_000_000i128);
+    client.create_stream(&sender, &recipient, &token, &10i128, &1_000i128, &stream_id);
+
+    env.ledger().with_mut(|li| li.timestamp += 50);
+    client.pause_stream(&sender, &stream_id);
+
+    // Time passes while paused — must not accrue.
+    env.ledger().with_mut(|li| li.timestamp += 200);
+    client.resume_stream(&sender, &stream_id);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.status, StreamStatus::Active);
+    // Accrual while paused must not be counted; only the pre-pause 50s * 10/s.
+    assert_eq!(stream.accrued_at_checkpoint, 500i128);
+    assert_eq!(stream.last_checkpoint_at, env.ledger().timestamp());
+}
+
+#[test]
+fn test_resume_non_paused_stream_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_payment_processor(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let stream_id = String::from_str(&env, "resume_active_stream_1");
+
+    token::StellarAssetClient::new(&env, &token).mint(&sender, &1_000_000i128);
+    client.create_stream(&sender, &recipient, &token, &10i128, &1_000i128, &stream_id);
+
+    let result = client.try_resume_stream(&sender, &stream_id);
+    assert_eq!(result, Err(Ok(StreamError::StreamNotPaused)));
+}
+
+#[test]
+fn test_pause_resume_stream_unauthorized_for_non_sender() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_payment_processor(&env);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let stranger = Address::generate(&env);
+    let stream_id = String::from_str(&env, "pause_unauthorized_stream_1");
+
+    token::StellarAssetClient::new(&env, &token).mint(&sender, &1_000_000i128);
+    client.create_stream(&sender, &recipient, &token, &10i128, &1_000i128, &stream_id);
+
+    let result = client.try_pause_stream(&stranger, &stream_id);
+    assert_eq!(result, Err(Ok(StreamError::Unauthorized)));
+}
+
+#[test]
 fn test_batch_withdraw_to_custom_routing() {
     let env = Env::default();
     env.mock_all_auths();
@@ -854,6 +978,142 @@ fn test_process_refund() {
 
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.status, RefundStatus::Completed);
+}
+
+#[test]
+fn test_approve_then_claim_refund_succeeds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_claim_1");
+    let merchant_id = Address::generate(&env);
+    let refund_amount = 1000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    client.approve_refund(&operator, &refund_id);
+    let refund = client.get_refund(&refund_id);
+    assert!(refund.approved);
+    assert_eq!(refund.status, RefundStatus::Pending);
+
+    client.claim_refund(&requester, &refund_id);
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Completed);
+}
+
+#[test]
+fn test_claim_refund_before_approval_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_claim_2");
+    let merchant_id = Address::generate(&env);
+    let refund_amount = 1000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let result = client.try_claim_refund(&requester, &refund_id);
+    assert_eq!(result, Err(Ok(Error::RefundNotApproved)));
+}
+
+#[test]
+fn test_claim_refund_by_non_requester_fails() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_claim_3");
+    let merchant_id = Address::generate(&env);
+    let refund_amount = 1000i128;
+    let requester = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    client.approve_refund(&operator, &refund_id);
+
+    let result = client.try_claim_refund(&stranger, &refund_id);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_double_claim_refund_blocked() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_claim_4");
+    let merchant_id = Address::generate(&env);
+    let refund_amount = 1000i128;
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "Reason"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    client.approve_refund(&operator, &refund_id);
+    client.claim_refund(&requester, &refund_id);
+
+    let result = client.try_claim_refund(&requester, &refund_id);
+    assert_eq!(result, Err(Ok(Error::RefundAlreadyProcessed)));
 }
 
 #[test]

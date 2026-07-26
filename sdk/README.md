@@ -195,6 +195,43 @@ const dispute = await client.getDispute("dispute_001");
 const paymentDisputes = await client.getPaymentDisputes("pay_123");
 ```
 
+## Merchant Pre-Authorization (Pull Billing)
+
+`MerchantPreAuth` lets a customer grant a merchant permission to pull up to a
+fixed amount per billing period — useful for SaaS-style recurring charges
+without requiring a fresh signature on every charge.
+
+```typescript
+// Customer grants the merchant a $50/30-day pull allowance.
+const auth = await client.preAuthorizeMerchant({
+  customer: "GCUSTOMER...",
+  merchant: "GMERCHANT...",
+  token: "CUSDC...",
+  limitPerPeriod: 50_000_000n, // 50 USDC (7 decimals)
+  periodSecs: 2_592_000n, // 30 days
+});
+
+// Merchant pulls a charge against the authorization. Returns the
+// cumulative amount pulled so far in the current period.
+const pulledThisPeriod = await client.pullFromAuthorization(
+  "GMERCHANT...",
+  "GCUSTOMER...",
+  10_000_000n, // 10 USDC
+);
+
+// Look up the current authorization (null if none exists).
+const current = await client.getAuthorization("GCUSTOMER...", "GMERCHANT...");
+
+// Customer revokes the authorization at any time.
+await client.revokeAuthorization("GCUSTOMER...", "GMERCHANT...");
+```
+
+Billing periods reset automatically: once `now >= period_start + period_secs`,
+the next `pullFromAuthorization` call resets `pulled_this_period` to 0 and
+emits a `MERCHANT_AUTH/PERIOD_RESET` event before applying the pull, so a new
+period always starts with the full `limitPerPeriod` available regardless of
+how many periods were skipped with no activity.
+
 ## RefundManagerClient
 
 The `RefundManagerClient` provides methods for managing refunds on a dedicated RefundManager contract:

@@ -18,6 +18,12 @@ const REFUND_FEE_BPS: i128 = 100;
 const REFUND_COOLDOWN_SECS: u64 = 300;
 /// Default refund request expiry period (30 days in seconds).
 const REFUND_EXPIRY_SECS: u64 = 30 * 24 * 60 * 60;
+/// Issue #480: Minimum time between daily settlements (24 hours in seconds).
+const SETTLEMENT_DAILY_INTERVAL_SECS: u64 = 86_400;
+/// Issue #480: Minimum time between weekly settlements (7 days in seconds).
+const SETTLEMENT_WEEKLY_INTERVAL_SECS: u64 = 604_800;
+/// Issue #480: Minimum pending balance required to trigger a settlement.
+const SETTLEMENT_MIN_AMOUNT: i128 = 1_000_000; // 0.1 USDC (7 decimals)
 /// Minimum number of arbitrators required for dispute resolution voting.
 const ARBITRATOR_VOTING_THRESHOLD: u32 = 3;
 /// Fixed dispute bond in the contract's stablecoin denomination.
@@ -7101,6 +7107,24 @@ impl PaymentProcessor {
 
         payment.status = payment_state_machine::transition_status(&payment.status, PaymentStatus::Settled)?;
 
+        // Issue #480: Accumulate net merchant amount to pending settlement.
+        let net_merchant_amount: i128 = splits
+            .iter()
+            .find(|s| s.recipient == payment.merchant_id)
+            .map(|s| s.amount)
+            .unwrap_or(0);
+        if net_merchant_amount > 0 {
+            if let Some(registry_address) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+            {
+                let registry_client =
+                    crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+                registry_client.add_pending_settlement(&payment.merchant_id, &net_merchant_amount);
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::Payment(payment_id.clone()), &payment);
@@ -7152,6 +7176,95 @@ impl PaymentProcessor {
         }
 
         Ok(())
+    }
+
+    /// Issue #480: Trigger a settlement for a merchant's accumulated pending balance.
+    ///
+    /// Sweeps the merchant's pending settlement balance to their payout address.
+    /// For `Daily` and `Weekly` schedules, enforces a minimum time since the
+    /// last settlement. For `Manual`, settles immediately as long as the pending
+    /// balance exceeds `SETTLEMENT_MIN_AMOUNT`.
+    pub fn trigger_settlement(
+        env: Env,
+        operator: Address,
+        merchant_id: Address,
+    ) -> Result<i128, Error> {
+        operator.require_auth();
+
+        if !AccessControl::has_role(&env, &role_settlement_operator(&env), &operator) {
+            return Err(Error::Unauthorized);
+        }
+
+        // Get merchant info from registry.
+        let registry_address = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::MerchantRegistryAddress)
+            .ok_or(Error::Unauthorized)?;
+        let registry_client =
+            crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_address);
+
+        let merchant = registry_client.get_merchant(&merchant_id);
+
+        // Resolve the USDC token address.
+        let usdc_token = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .ok_or(Error::Unauthorized)?;
+
+        // Determine the payout address.
+        let payout_address = merchant.payout_address.ok_or(Error::InvalidAddress)?;
+
+        // Check minimum time since last settlement for scheduled types.
+        let now = env.ledger().timestamp();
+        let min_interval = match merchant.settlement_schedule {
+            crate::merchant_registry::SettlementSchedule::Daily => {
+                Some(SETTLEMENT_DAILY_INTERVAL_SECS)
+            }
+            crate::merchant_registry::SettlementSchedule::Weekly => {
+                Some(SETTLEMENT_WEEKLY_INTERVAL_SECS)
+            }
+            crate::merchant_registry::SettlementSchedule::Manual => None,
+        };
+
+        if let Some(interval) = min_interval {
+            if let Some(last) = merchant.last_settlement_at {
+                if now < last.saturating_add(interval) {
+                    // Schedule not yet eligible; still allow manual override with operator auth.
+                    return Err(Error::Unauthorized);
+                }
+            }
+        }
+
+        // Read the pending settlement balance.
+        let pending = registry_client.get_pending_settlement(&merchant_id);
+        if pending < SETTLEMENT_MIN_AMOUNT {
+            return Err(Error::InvalidAmount);
+        }
+
+        // Transfer USDC from the PaymentProcessor contract to the merchant's payout address.
+        let token_client = token::TokenClient::new(&env, &usdc_token);
+        let from = env.current_contract_address();
+        token_client.transfer(&from, &payout_address, &pending);
+
+        // Clear pending settlement balance.
+        registry_client.clear_pending_settlement(&merchant_id);
+
+        // Update last_settlement_at on the merchant record.
+        registry_client.set_last_settlement_at(&merchant_id, &now);
+
+        // Emit MERCHANT/SETTLEMENT_TRIGGERED event.
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "SETTLEMENT_TRIGGERED"),
+                merchant_id,
+            ),
+            (pending,),
+        );
+
+        Ok(pending)
     }
 
     pub fn prune_expired_payments(
@@ -8533,3 +8646,5 @@ pub use gas_estimator::{CostEstimate, GasEstimator, GasEstimatorClient, Operatio
 mod mock_dex_router;
 #[cfg(test)]
 mod swap_test;
+#[cfg(test)]
+mod settlement_test;

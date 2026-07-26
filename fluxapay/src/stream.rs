@@ -6,6 +6,33 @@ use crate::PaymentProcessor;
 
 // ─── Data types ───────────────────────────────────────────────────────────────
 
+/// Pure accrual computation (lazy formula with saturating arithmetic).
+///
+/// `total = min(deposit, checkpoint + (now - last_checkpoint) * rate)`
+pub fn compute_total_accrued(
+    accrued_at_checkpoint: i128,
+    last_checkpoint_at: u64,
+    now: u64,
+    rate_per_second: i128,
+    remaining_deposit: i128,
+) -> i128 {
+    let rate = rate_per_second.max(0);
+    let deposit = remaining_deposit.max(0);
+    let elapsed = now.saturating_sub(last_checkpoint_at);
+    let newly_accrued = (elapsed as i128).saturating_mul(rate);
+    accrued_at_checkpoint
+        .saturating_add(newly_accrued)
+        .min(deposit)
+        .max(0)
+}
+
+/// Remaining deposit after a withdrawal; never negative.
+pub fn compute_remaining_after_withdraw(remaining_deposit: i128, withdraw_amount: i128) -> i128 {
+    remaining_deposit
+        .saturating_sub(withdraw_amount.max(0))
+        .max(0)
+}
+
 /// Status of a payment stream.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -525,14 +552,13 @@ impl PaymentStreaming {
         }
 
         let now = env.ledger().timestamp();
-        let elapsed = now.saturating_sub(stream.last_checkpoint_at);
-        let newly_accrued = (elapsed as i128).saturating_mul(stream.rate_per_second);
-        let total = stream
-            .accrued_at_checkpoint
-            .saturating_add(newly_accrued)
-            .min(stream.remaining_deposit);
-
-        Ok(total)
+        Ok(compute_total_accrued(
+            stream.accrued_at_checkpoint,
+            stream.last_checkpoint_at,
+            now,
+            stream.rate_per_second,
+            stream.remaining_deposit,
+        ))
     }
 
     /// Query streams created by the given sender.

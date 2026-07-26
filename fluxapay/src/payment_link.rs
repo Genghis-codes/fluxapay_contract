@@ -155,6 +155,9 @@ impl PaymentLinkManager {
     ) -> Result<String, crate::Error> {
         merchant.require_auth();
 
+        if !crate::utils::validate_id(&link_id) {
+            return Err(crate::Error::InvalidPaymentId);
+        }
         if let Some(ref meta_map) = metadata {
             if meta_map.len() > 20 {
                 return Err(crate::Error::MetadataTooLarge);
@@ -327,6 +330,13 @@ impl PaymentLinkManager {
             let merchant_muxed: MuxedAddress = (&link.merchant_id).into();
             token_client.transfer(&payer, &merchant_muxed, &resolved_amount);
         }
+        // Emit LINK/DIRECT_TRANSFER_USED event for audit trail when direct transfer is used
+        if link.direct_transfer {
+            env.events().publish(
+                (Symbol::new(&env, "LINK"), Symbol::new(&env, "DIRECT_TRANSFER_USED")),
+                (link_id.clone(), payer.clone(), resolved_amount),
+            );
+        }
 
         // Generate a virtual payment ID for tracking
         let payment_id = format_id(&env, "lnk_pay_", env.ledger().timestamp());
@@ -355,12 +365,22 @@ impl PaymentLinkManager {
             fx_rate: None,
             fx_rate_at: None,
             metadata: link.metadata.clone(),
+            fee_waiver_code: None,
+            retry_of_payment_id: None,
+            payer_muxed_id: None,
         };
 
         // Store the payment charge
         env.storage()
             .persistent()
             .set(&LinkDataKey::LinkPayment(payment_id.clone()), &payment);
+        // If this is a direct transfer payment, mark it in the main contract storage
+        // to prevent future disputes (issue #485)
+        if link.direct_transfer {
+            env.storage()
+                .persistent()
+                .set(&crate::DataKey::DirectTransferPayment(payment_id.clone()), &true);
+        }
 
         // Track payment ID in the link's payment list
         let mut payment_ids: Vec<String> = env

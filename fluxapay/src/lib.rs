@@ -276,6 +276,8 @@ pub enum Error {
     InvalidSettlementSignature = 41,
     /// Issue #303: FX oracle rate is stale or unavailable.
     StaleOracleRate = 45,
+    /// Issue #476: Payment link has expired.
+    LinkExpired = 46,
     /// Issue #313: Reentrancy detected in process_refund_internal or settle_payment.
     Reentrancy = 43,
     /// Upgrade failed — WASM hash replacement rejected by the host.

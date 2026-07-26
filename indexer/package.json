@@ -1,0 +1,27 @@
+{
+  "name": "@fluxapay/indexer",
+  "version": "1.0.0",
+  "description": "FluxaPay Soroban event indexer for PostgreSQL",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "migrate": "node dist/migrations/run.js",
+    "watch": "tsc --watch"
+  },
+  "keywords": ["soroban", "indexer", "stellar", "postgres"],
+  "author": "FluxaPay",
+  "license": "MIT",
+  "dependencies": {
+    "stellar-sdk": "^12.0.0",
+    "pg": "^8.11.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.10.9",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.2"
+  }
+}

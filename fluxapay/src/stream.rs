@@ -106,6 +106,8 @@ pub enum StreamError {
     RateBelowMinimum = 12,
     /// Stream is not paused.
     StreamNotPaused = 13,
+    /// Receiver address cannot be the same as sender address.
+    InvalidReceiver = 14,
 }
 
 /// Storage key for the per-stream withdrawal reentrancy lock.
@@ -258,6 +260,9 @@ impl PaymentStreaming {
         min_rate: Option<i128>,
     ) -> Result<PaymentStream, StreamError> {
         sender.require_auth();
+        if sender == receiver {
+            return Err(StreamError::InvalidReceiver);
+        }
 
         if rate_per_second <= 0 {
             return Err(StreamError::InvalidRate);
@@ -336,6 +341,9 @@ impl PaymentStreaming {
         }
         if stream.status != StreamStatus::Active {
             return Err(StreamError::StreamNotActive);
+        }
+        if stream.sender == destination {
+            return Err(StreamError::InvalidReceiver);
         }
 
         stream.destination = Some(destination.clone());

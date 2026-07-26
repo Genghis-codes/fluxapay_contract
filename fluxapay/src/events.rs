@@ -415,6 +415,16 @@ pub struct LinkViewed {
     pub link_id: String,
 }
 
+/// Emitted when a direct transfer payment link is used (issue #485).
+/// Provides mandatory audit trail for direct transfers bypassing escrow.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DirectTransferUsed {
+    pub link_id: String,
+    pub payer: Address,
+    pub amount: i128,
+}
+
 // ============================================================================
 // Merchant Events
 // ============================================================================

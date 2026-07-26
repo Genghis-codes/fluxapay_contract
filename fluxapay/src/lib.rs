@@ -330,6 +330,8 @@ pub enum Error {
     InvalidMemoId = 52,
     /// Issue #516: Payer address is not on the merchant's customer whitelist.
     PayerNotWhitelisted = 53,
+    /// Issue #485: Payment was created via a direct_transfer link and disputes are not allowed.
+    DirectTransferNotDisputable = 54,
     /// Issue #482: Maximum retry chain depth (3) exceeded for payment retry.
     MaxRetriesExceeded = 54,
     /// Issue #478: FX oracle rate deviation exceeds configured limit.
@@ -754,6 +756,11 @@ pub enum DataKey {
     /// Admin-managed reusable fee-waiver code registry for per-payment promotions.
     /// Keyed by the code string itself.
     FeeWaiverCode(String),
+    /// Issue #485: Marks a payment as created from a direct_transfer payment link.
+    /// Prevents future disputes from being created for this payment.
+    DirectTransferPayment(String),
+    /// Issue #483: Maps token address to its currency symbol (e.g., USDC, EURC, BRLT).
+    TokenCurrency(Address),
     Invoice(String),
     MerchantInvoices(Address),
     InvoiceCounter,
@@ -779,6 +786,18 @@ pub const INITIAL_CONTRACT_VERSION: &str = "1.0.0";
 // When building for WASM deployment, only the active contract's #[contractimpl]
 // is compiled to avoid duplicate exported symbols. On non-WASM targets (tests,
 // tooling), all impls compile so that *Client types are available everywhere.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantAnalytics {
+    pub total_payments: u32,
+    pub confirmed_payments: u32,
+    pub failed_payments: u32,
+    pub total_volume: i128,
+    pub avg_payment_amount: i128,
+    pub dispute_count: u32,
+    pub refund_count: u32,
+    pub net_settled_volume: i128,
+}
 #[cfg_attr(
     any(not(target_arch = "wasm32"), feature = "contract-refund-manager"),
     contractimpl
@@ -1652,6 +1671,11 @@ impl RefundManager {
             .persistent()
             .get(&DataKey::Payment(payment_id.clone()))
             .ok_or(Error::PaymentNotFound)?;
+
+        // Issue #485: Prevent disputes on direct transfer payments
+        if env.storage().persistent().has(&DataKey::DirectTransferPayment(payment_id.clone())) {
+            return Err(Error::DirectTransferNotDisputable);
+        }
 
         if payment.merchant_id != merchant_id {
             return Err(Error::Unauthorized);
@@ -4574,6 +4598,24 @@ impl PaymentProcessor {
         }
         Ok(())
     }
+    /// Issue #483: Set the currency symbol for an allowed token (e.g., USDC, EURC, BRLT).
+    /// Must be called after allow_token() to establish token-to-currency mapping.
+    pub fn set_token_currency(env: Env, admin: Address, token_address: Address, currency: Symbol) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        
+        if !env.storage().persistent().has(&DataKey::AllowedToken(token_address.clone())) {
+            return Err(Error::UnsupportedToken);
+        }
+        
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenCurrency(token_address), &currency);
+        Ok(())
+    }
+
 
     /// Issue #301: Remove a token from the supported tokens list (admin only).
     pub fn remove_supported_token(
@@ -4743,6 +4785,18 @@ impl PaymentProcessor {
                 .unwrap_or(false);
             if !allowed {
                 return Err(Error::UnsupportedToken);
+            }
+        }
+        // Issue #483: Verify that token_address (if provided) matches the currency symbol
+        if let Some(ref token_addr) = args.token_address {
+            if let Some(token_currency) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Symbol>(&DataKey::TokenCurrency(token_addr.clone()))
+            {
+                if token_currency != args.currency {
+                    return Err(Error::UnsupportedToken);
+                }
             }
         }
 
@@ -5018,6 +5072,18 @@ impl PaymentProcessor {
                     return Err(Error::UnsupportedToken);
                 }
             }
+        // Issue #483: Verify that token_address (if provided) matches the currency symbol
+        if let Some(ref token_addr) = args.token_address {
+            if let Some(token_currency) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Symbol>(&DataKey::TokenCurrency(token_addr.clone()))
+            {
+                if token_currency != args.currency {
+                    return Err(Error::UnsupportedToken);
+                }
+            }
+        }
 
             // Validate merchant is verified and active
             if let Some(registry_address) = env
@@ -6957,7 +7023,75 @@ impl PaymentProcessor {
         }
 
         result
+    
+    /// Issue #487: Query aggregate analytics for a merchant over a time range.
+    /// Returns total_payments, confirmed_payments, failed_payments, total_volume,
+    /// avg_payment_amount, dispute_count, refund_count, net_settled_volume.
+    /// Aggregates are computed lazily from stored payment records (paginated internally, max 500).
+    pub fn get_merchant_analytics(env: Env, merchant_id: Address, from_ts: u64, to_ts: u64) -> MerchantAnalytics {
+        let payments = Self::get_merchant_payments_internal(&env, &merchant_id);
+        let mut total_payments = 0u32;
+        let mut confirmed_payments = 0u32;
+        let mut failed_payments = 0u32;
+        let mut total_volume: i128 = 0;
+        let mut net_settled_volume: i128 = 0;
+        let mut refund_count = 0u32;
+        let max_samples = 500usize;
+        let mut sample_count = 0usize;
+
+        for payment_id in payments.iter() {
+            if sample_count >= max_samples {
+                break;
+            }
+            sample_count += 1;
+
+            if let Ok(payment) = Self::get_payment_internal(&env, &payment_id) {
+                if payment.created_at >= from_ts && payment.created_at <= to_ts {
+                    total_payments += 1;
+                    total_volume = total_volume.saturating_add(payment.amount);
+
+                    match payment.status {
+                        PaymentStatus::Confirmed => {
+                            confirmed_payments += 1;
+                            net_settled_volume = net_settled_volume.saturating_add(payment.amount);
+                        }
+                        PaymentStatus::Failed | PaymentStatus::Expired => {
+                            failed_payments += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                
+                let refunds_for_payment = Self::get_payment_refunds_internal(&env, &payment_id);
+                for refund_id in refunds_for_payment.iter() {
+                    if let Ok(refund) = Self::get_refund_internal(&env, &refund_id) {
+                        if refund.created_at >= from_ts && refund.created_at <= to_ts {
+                            refund_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let dispute_count = Self::get_merchant_dispute_count(&env, merchant_id) as u32;
+        let avg_payment_amount = if total_payments > 0 {
+            total_volume / (total_payments as i128)
+        } else {
+            0
+        };
+
+        MerchantAnalytics {
+            total_payments,
+            confirmed_payments,
+            failed_payments,
+            total_volume,
+            avg_payment_amount,
+            dispute_count,
+            refund_count,
+            net_settled_volume,
+        }
     }
+}
 
     /// Issue #399: Remove the idempotency key associated with a payment so the
     /// client_token can be reused after expiry or cancellation.

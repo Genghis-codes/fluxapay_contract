@@ -15,10 +15,13 @@ import { Networks } from "@stellar/stellar-sdk";
 import {
   FluxapayOfflineSigner,
   OfflineTransactionPayload,
+  SubscriptionBillingClient,
   buildOfflinePayload,
   buildCreatePaymentPayload,
   buildVerifyPaymentPayload,
   buildCreateRefundPayload,
+  buildSubscriptionTickPayload,
+  buildPullAuthorizationPayload,
   prepareForOfflineSigning,
   restoreFromOfflinePayload,
 } from "./offline-signer.js";
@@ -80,6 +83,85 @@ export interface CreatePaymentParams {
    */
   feeWaiverCode?: string;
 }
+
+/** Mirrors the on-chain `StreamStatus` enum in `stream.rs`. */
+export type StreamStatus = "Active" | "Cancelled" | "Exhausted" | "Paused";
+
+/** Mirrors the on-chain `StreamError` enum in `stream.rs`. */
+export enum StreamError {
+  StreamNotFound = 1,
+  Unauthorized = 2,
+  RateNotDecreased = 3,
+  InvalidRate = 4,
+  StreamAlreadyExists = 5,
+  InvalidDeposit = 6,
+  StreamNotActive = 7,
+  DestinationNotSet = 8,
+  ContractPaused = 9,
+  MilestoneNotApproved = 10,
+  WithdrawalInProgress = 11,
+  RateBelowMinimum = 12,
+  StreamNotPaused = 13,
+  InvalidReceiver = 14,
+}
+
+/** Mirrors the on-chain `PaymentStream` struct in `stream.rs`. */
+export interface PaymentStream {
+  streamId: string;
+  sender: string;
+  receiver: string;
+  destination: string | null;
+  token: string;
+  ratePerSecond: bigint;
+  minRatePerSecond: bigint;
+  remainingDeposit: bigint;
+  lastCheckpointAt: bigint;
+  accruedAtCheckpoint: bigint;
+  status: StreamStatus;
+  milestonesApproved: boolean;
+}
+
+export interface CreateStreamParams {
+  sender: string;
+  receiver: string;
+  token: string;
+  ratePerSecond: bigint;
+  deposit: bigint;
+  streamId: string;
+}
+
+function fromContractStream(raw: {
+  stream_id: string;
+  sender: string;
+  receiver: string;
+  destination?: string | null;
+  token: string;
+  rate_per_second: bigint;
+  min_rate_per_second: bigint;
+  remaining_deposit: bigint;
+  last_checkpoint_at: bigint;
+  accrued_at_checkpoint: bigint;
+  status: StreamStatus;
+  milestones_approved: boolean;
+}): PaymentStream {
+  return {
+    streamId: raw.stream_id,
+    sender: raw.sender,
+    receiver: raw.receiver,
+    destination: raw.destination ?? null,
+    token: raw.token,
+    ratePerSecond: raw.rate_per_second,
+    minRatePerSecond: raw.min_rate_per_second,
+    remainingDeposit: raw.remaining_deposit,
+    lastCheckpointAt: raw.last_checkpoint_at,
+    accruedAtCheckpoint: raw.accrued_at_checkpoint,
+    status: raw.status,
+    milestonesApproved: raw.milestones_approved,
+  };
+}
+
+/** Max i128 value, used as a sentinel "withdraw everything accrued" amount. */
+const I128_MAX = (1n << 127n) - 1n;
 
 export interface RegisterMerchantParams {
   merchantId: string;
@@ -822,6 +904,109 @@ export class FluxapayClient {
     return this.getPaymentLinkManager().getLinkAnalytics(linkId);
   }
 
+  /**
+   * Create a new payment stream. Tokens are pulled from `params.sender` into
+   * the contract and streamed to `params.receiver` at `ratePerSecond`.
+   * Maps to `PaymentProcessor.create_stream` on-chain.
+   */
+  async createStream(params: CreateStreamParams): Promise<PaymentStream> {
+    const raw = await withMappedContractError(() =>
+      (this.contract as any).create_stream({
+        sender: params.sender,
+        receiver: params.receiver,
+        token: params.token,
+        rate_per_second: params.ratePerSecond,
+        deposit: params.deposit,
+        stream_id: params.streamId,
+      }),
+    );
+    return fromContractStream(raw);
+  }
+
+  /**
+   * Withdraw accrued funds from a stream to `recipient`.
+   * Maps to `PaymentProcessor.batch_withdraw_to` on-chain with a single entry.
+   * @param recipient - Must be the stream's receiver; must sign.
+   * @param streamId - The stream to withdraw from.
+   * @param amount - Optional amount cap; defaults to withdrawing everything accrued.
+   */
+  async withdrawStream(recipient: string, streamId: string, amount?: bigint): Promise<void> {
+    return withMappedContractError(() =>
+      (this.contract as any).batch_withdraw_to({
+        recipient,
+        withdrawals: [
+          { stream_id: streamId, destination: recipient, amount: amount ?? I128_MAX },
+        ],
+      }),
+    );
+  }
+
+  /**
+   * Cancel an active stream and refund any un-accrued deposit to the sender.
+   * Maps to `PaymentProcessor.cancel_stream` on-chain.
+   */
+  async cancelStream(sender: string, streamId: string): Promise<void> {
+    return withMappedContractError(() =>
+      (this.contract as any).cancel_stream({ sender, stream_id: streamId }),
+    );
+  }
+
+  /**
+   * Pause an active stream, freezing accrual until resumed.
+   * Maps to `PaymentProcessor.pause_stream` on-chain.
+   */
+  async pauseStream(sender: string, streamId: string): Promise<void> {
+    return withMappedContractError(() =>
+      (this.contract as any).pause_stream({ sender, stream_id: streamId }),
+    );
+  }
+
+  /**
+   * Resume a paused stream, restarting accrual from the current timestamp.
+   * Maps to `PaymentProcessor.resume_stream` on-chain.
+   */
+  async resumeStream(sender: string, streamId: string): Promise<void> {
+    return withMappedContractError(() =>
+      (this.contract as any).resume_stream({ sender, stream_id: streamId }),
+    );
+  }
+
+  /**
+   * Top up an existing stream's deposit.
+   * Maps to `PaymentProcessor.top_up_stream` on-chain.
+   */
+  async topUpStream(sender: string, streamId: string, amount: bigint): Promise<void> {
+    return withMappedContractError(() =>
+      (this.contract as any).top_up_stream({ caller: sender, stream_id: streamId, amount }),
+    );
+  }
+
+  /**
+   * Get stream details by ID.
+   * Maps to `PaymentProcessor.get_stream` on-chain.
+   */
+  async getStream(streamId: string): Promise<PaymentStream> {
+    const raw = await withMappedContractError(() =>
+      (this.contract as any).get_stream({ stream_id: streamId }),
+    );
+    return fromContractStream(raw);
+  }
+
+  /**
+   * Query streams created by `sender`, paginated (max 100 per page).
+   * Maps to `PaymentProcessor.get_sender_streams` on-chain.
+   */
+  async getSenderStreams(
+    sender: string,
+    page = 0,
+    pageSize = 100,
+  ): Promise<PaymentStream[]> {
+    const raw: unknown[] = await withMappedContractError(() =>
+      (this.contract as any).get_sender_streams({ sender, page, page_size: pageSize }),
+    );
+    return raw.map((s) => fromContractStream(s as Parameters<typeof fromContractStream>[0]));
+  }
+
   /** Offline/hardware wallet payload builder utilities. */
 
 
@@ -849,16 +1034,23 @@ export {
   CreatePaymentArgs,
   FluxapayOfflineSigner,
   OfflineTransactionPayload,
+  SubscriptionBillingClient,
   buildOfflinePayload,
   buildCreatePaymentPayload,
   buildVerifyPaymentPayload,
   buildCreateRefundPayload,
+  buildSubscriptionTickPayload,
+  buildPullAuthorizationPayload,
   prepareForOfflineSigning,
   restoreFromOfflinePayload,
   NetworkProfileSwitcher,
   NetworkEnvironment,
   NetworkProfiles,
   NetworkProfile,
+  PaymentStream,
+  StreamStatus,
+  StreamError,
+  CreateStreamParams,
 };
 
 export { RefundManagerClient, type RefundManagerConfig } from "./contracts/refund-manager.js";
@@ -879,6 +1071,12 @@ export {
   type CreatePaymentLinkResult,
 } from "./contracts/payment-link-manager.js";
 export { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
+export {
+  GasEstimatorClient,
+  type GasEstimatorConfig,
+  type GasEstimate,
+  type GasOperation,
+} from "./contracts/gas-estimator.js";
 
 
 

@@ -221,4 +221,53 @@ proptest! {
             assert!(!validate_id(&id), "expected invalid (bad char): {}", with_bad);
         }
     }
+
+    /// Accrued amount never decreases between two consecutive timestamps.
+    #[test]
+    fn proptest_stream_accrual_monotonic(
+        checkpoint in 0i128..1_000_000_000i128,
+        last_at in 0u64..1_000_000u64,
+        delta1 in 0u64..10_000u64,
+        delta2 in 0u64..10_000u64,
+        rate in 0i128..1_000_000i128,
+        deposit in 1i128..i128::MAX / 4,
+    ) {
+        use crate::stream::compute_total_accrued;
+
+        let t1 = last_at.saturating_add(delta1);
+        let t2 = t1.saturating_add(delta2);
+        let a1 = compute_total_accrued(checkpoint, last_at, t1, rate, deposit);
+        let a2 = compute_total_accrued(checkpoint, last_at, t2, rate, deposit);
+        prop_assert!(a2 >= a1, "accrual decreased: {} -> {} (t {} -> {})", a1, a2, t1, t2);
+    }
+
+    /// Large rates/durations must not overflow or panic (saturating arithmetic).
+    #[test]
+    fn proptest_stream_accrual_no_overflow(
+        checkpoint in 0i128..=i128::MAX / 2,
+        last_at in 0u64..u64::MAX / 2,
+        now_offset in 0u64..u64::MAX / 2,
+        rate in 0i128..=i128::MAX,
+        deposit in 0i128..=i128::MAX,
+    ) {
+        use crate::stream::compute_total_accrued;
+
+        let now = last_at.saturating_add(now_offset);
+        let accrued = compute_total_accrued(checkpoint, last_at, now, rate, deposit);
+        prop_assert!(accrued >= 0);
+        prop_assert!(accrued <= deposit.max(0));
+    }
+
+    /// Withdrawal never drives remaining deposit negative.
+    #[test]
+    fn proptest_stream_remaining_deposit_non_negative(
+        remaining in 0i128..=i128::MAX,
+        withdraw in 0i128..=i128::MAX,
+    ) {
+        use crate::stream::compute_remaining_after_withdraw;
+
+        let after = compute_remaining_after_withdraw(remaining, withdraw);
+        prop_assert!(after >= 0);
+        prop_assert!(after <= remaining.max(0));
+    }
 }

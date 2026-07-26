@@ -78,6 +78,8 @@ Fluxapay solves this by enabling _USDC-in → fiat-out_ payments with a merchant
   - Violations return `MetadataTooLarge` / `MetadataValueTooLong`
   •⁠ ⁠*Webhooks*
 - ⁠ payment.created ⁠, ⁠ payment.pending ⁠, ⁠ payment.confirmed ⁠, ⁠ payment.failed ⁠, ⁠ payment.settled ⁠
+- Also: `refund.*` and `dispute.*` lifecycle events
+- Full merchant guide (payloads, HMAC verification, retries, idempotency, examples): **[docs/webhooks.md](docs/webhooks.md)**
 
 ### No-Code / Low-Code
 

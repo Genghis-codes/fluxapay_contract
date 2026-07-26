@@ -34,12 +34,16 @@ pub enum FXOracleError {
     Unauthorized = 3,
     /// Batch rate update exceeds the maximum of 20 pairs.
     BatchTooLarge = 4,
+    /// Issue #478: Rate deviation exceeds configured limit
+    RateDeviationExceeded = 4,
 }
 
 #[contracttype]
 pub enum OracleDataKey {
     Rate(Symbol),
     StalenessThreshold,
+    /// Issue #478: Maximum allowed rate deviation per pair in basis points
+    MaxDeviation(Symbol),
 }
 
 #[cfg_attr(
@@ -133,6 +137,44 @@ impl FXOracle {
     }
 
     fn store_rate(env: &Env, pair: Symbol, rate: i128, decimals: u32) {
+        // Issue #478: Check rate deviation against configured limit
+        let max_deviation_bps = env
+            .storage()
+            .persistent()
+            .get::<OracleDataKey, u32>(&OracleDataKey::MaxDeviation(pair.clone()))
+            .unwrap_or(0);
+
+        if max_deviation_bps > 0 {
+            if let Ok(last_rate_data) = env
+                .storage()
+                .persistent()
+                .get::<OracleDataKey, RateData>(&OracleDataKey::Rate(pair.clone()))
+                .ok_or(FXOracleError::RateNotFound)
+            {
+                let last_rate = last_rate_data.rate;
+                // Calculate deviation in basis points: (abs(new - old) / old) * 10_000
+                let diff = if rate > last_rate {
+                    rate - last_rate
+                } else {
+                    last_rate - rate
+                };
+                let deviation_bps = ((diff * 10_000) / last_rate.abs().max(1)).max(0) as u32;
+
+                if deviation_bps > max_deviation_bps {
+                    return Err(FXOracleError::RateDeviationExceeded);
+                }
+
+                // Emit warning if deviation is within 50% of limit
+                if deviation_bps * 2 >= max_deviation_bps {
+                    env.events().publish(
+                        (Symbol::new(&env, "RATE"), Symbol::new(&env, "DEVIATION_WARNING")),
+                        (pair.clone(), last_rate, rate, deviation_bps),
+                    );
+                }
+            }
+            // On first rate set (no prior rate), skip deviation check
+        }
+
         let rate_data = RateData {
             pair: pair.clone(),
             rate,
@@ -294,5 +336,42 @@ impl FXOracle {
             .instance()
             .set(&OracleDataKey::StalenessThreshold, &threshold);
         Ok(())
+    }
+}
+
+    /// Issue #478: Set maximum allowed rate deviation per currency pair in basis points.
+    /// Example: 1000 = 10% max allowed deviation.
+    pub fn set_rate_deviation_limit(
+        env: Env,
+        admin: Address,
+        pair: Symbol,
+        max_deviation_bps: u32,
+    ) -> Result<(), FXOracleError> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(FXOracleError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&OracleDataKey::MaxDeviation(pair.clone()), &max_deviation_bps);
+
+        // Emit event: (RATE, DEVIATION_LIMIT_SET), pair
+        env.events().publish(
+            (Symbol::new(&env, "RATE"), Symbol::new(&env, "DEVIATION_LIMIT_SET")),
+            (pair, max_deviation_bps),
+        );
+
+        Ok(())
+    }
+
+    /// Issue #478: Get the maximum allowed rate deviation for a pair (in basis points).
+    /// Returns 0 if no limit is configured (unlimited).
+    pub fn get_rate_deviation_limit(env: Env, pair: Symbol) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<OracleDataKey, u32>(&OracleDataKey::MaxDeviation(pair))
+            .unwrap_or(0) // 0 = no limit
     }
 }

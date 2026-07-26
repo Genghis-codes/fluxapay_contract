@@ -54,6 +54,51 @@ async function main() {
 - **Typed Interfaces**: Full TypeScript support for all contract models (`Merchant`, `PaymentCharge`, `Refund`, `FeeConfig`, etc.).
 - **Automatic Simulation**: Built-in support for Soroban transaction simulation.
 - **Network Presets**: Easy switching between `testnet` and `mainnet`.
+- **SEP-10 Authentication**: Merchant API access via Stellar Web Authentication standard.
+
+## SEP-10 Merchant Authentication
+
+Authenticate merchants using their Stellar keypair via Stellar SEP-10 Web Authentication:
+
+```typescript
+import { FluxapayClient } from "@fluxapay/sdk";
+import { Keypair } from "@stellar/stellar-sdk";
+
+const client = new FluxapayClient({
+  network: "testnet",
+  rpcUrl: "https://soroban-testnet.stellar.org",
+  contractId: "C...",
+});
+
+// Initialize SEP-10 authenticator (server keypair should be stored securely)
+client.initSEP10(
+  "GBRPYHIL2CI3WHZDTOOQFC6EB4RRJC3XVCDTUJ76ZAE2QL4LFD5TWUC",
+  "fluxapay.stellar.org"
+);
+
+// 1. Get challenge for a merchant keypair
+const merchantKeypair = Keypair.random();
+const challenge = client.generateSEP10Challenge(merchantKeypair.publicKey());
+
+// 2. Merchant signs the challenge
+const signedChallenge = merchantKeypair.sign(
+  Buffer.from(challenge.challenge, "base64")
+).toString("base64");
+
+// 3. Client verifies signature and returns JWT
+const { jwt } = client.authorizeSEP10(
+  challenge.challenge,
+  signedChallenge,
+  merchantKeypair.publicKey()
+);
+
+console.log("JWT for API access:", jwt);
+
+// 4. Include JWT in Authorization header for API calls
+const headers = {
+  "Authorization": `Bearer ${jwt}`
+};
+```
 
 ## Merchant Management (FluxapayClient)
 

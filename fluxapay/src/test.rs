@@ -814,7 +814,7 @@ fn test_create_and_get_refund() {
         &Symbol::new(&env, "USDC"),
     );
 
-    let refund_id = client.create_refund(&payment_id, &refund_amount, &reason, &requester);
+    let refund_id = client.create_refund(&payment_id, &refund_amount, &reason, &requester, &None);
     let refund = client.get_refund(&refund_id);
 
     assert_eq!(refund.payment_id, payment_id);
@@ -845,7 +845,7 @@ fn test_process_refund() {
         &refund_amount,
         &String::from_str(&env, "Reason"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1175,7 +1175,7 @@ fn test_multiple_refunds_unique_ids() {
         &1000i128,
         &String::from_str(&env, "First refund"),
         &requester,
-    );
+        &None,);
 
     // Create second refund
     let refund_id_2 = client.create_refund(
@@ -1183,7 +1183,7 @@ fn test_multiple_refunds_unique_ids() {
         &500i128,
         &String::from_str(&env, "Second refund"),
         &requester,
-    );
+        &None,);
 
     // Create third refund
     let refund_id_3 = client.create_refund(
@@ -1191,7 +1191,7 @@ fn test_multiple_refunds_unique_ids() {
         &250i128,
         &String::from_str(&env, "Third refund"),
         &requester,
-    );
+        &None,);
 
     // Verify all refund IDs are unique
     assert_ne!(refund_id_1, refund_id_2);
@@ -1236,7 +1236,7 @@ fn test_create_refund_requires_auth() {
         &1000i128,
         &String::from_str(&env, "Unauthorized refund"),
         &requester,
-    );
+        &None,);
 }
 
 #[test]
@@ -1325,7 +1325,7 @@ fn test_process_refund_deducts_fee_from_requester() {
         &refund_amount,
         &String::from_str(&env, "fee test"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1360,7 +1360,7 @@ fn test_process_refund_sends_fee_to_admin() {
         &refund_amount,
         &String::from_str(&env, "fee test"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1393,7 +1393,7 @@ fn test_cancel_refund_by_requester() {
         &1000i128,
         &String::from_str(&env, "cancel me"),
         &requester,
-    );
+        &None,);
 
     client.cancel_refund(&requester, &refund_id);
 
@@ -1427,7 +1427,7 @@ fn test_cancel_refund_by_admin() {
         &500i128,
         &String::from_str(&env, "admin cancel"),
         &requester,
-    );
+        &None,);
 
     client.cancel_refund(&admin, &refund_id);
 
@@ -1456,7 +1456,7 @@ fn test_cancel_refund_unauthorized() {
         &500i128,
         &String::from_str(&env, "reason"),
         &requester,
-    );
+        &None,);
 
     let random = Address::generate(&env);
     let result = client.try_cancel_refund(&random, &refund_id);
@@ -1484,7 +1484,7 @@ fn test_cancel_refund_already_processed() {
         &500i128,
         &String::from_str(&env, "reason"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1516,7 +1516,7 @@ fn test_cancel_refund_emits_event() {
         &750i128,
         &String::from_str(&env, "reason"),
         &requester,
-    );
+        &None,);
 
     client.cancel_refund(&requester, &refund_id);
 
@@ -1550,7 +1550,7 @@ fn test_refund_total_equals_payment_amount_succeeds() {
         &amount,
         &String::from_str(&env, "full refund"),
         &requester,
-    );
+        &None,);
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.amount, amount);
 }
@@ -1579,7 +1579,7 @@ fn test_refund_exceeds_payment_amount_rejected() {
         &501i128,
         &String::from_str(&env, "over refund"),
         &requester,
-    );
+        &None,);
 }
 
 /// Cumulative partial refunds that exceed the payment amount must be rejected.
@@ -1607,7 +1607,7 @@ fn test_cumulative_refunds_exceed_payment_amount_rejected() {
         &600i128,
         &String::from_str(&env, "partial 1"),
         &requester,
-    );
+        &None,);
 
     // Second partial refund: 401 — total would be 1001 > 1000, must fail
     client.create_refund(
@@ -1615,7 +1615,7 @@ fn test_cumulative_refunds_exceed_payment_amount_rejected() {
         &401i128,
         &String::from_str(&env, "partial 2 over"),
         &requester,
-    );
+        &None,);
 }
 
 // ── Issue #115: Partial Refund Support ───────────────────────────────────────
@@ -1643,19 +1643,19 @@ fn test_partial_refunds_tracked_in_payment_refunds_list() {
         &300i128,
         &String::from_str(&env, "partial 1"),
         &requester,
-    );
+        &None,);
     let r2 = client.create_refund(
         &payment_id,
         &400i128,
         &String::from_str(&env, "partial 2"),
         &requester,
-    );
+        &None,);
     let r3 = client.create_refund(
         &payment_id,
         &300i128,
         &String::from_str(&env, "partial 3"),
         &requester,
-    );
+        &None,);
 
     // All three refunds should be in the payment's refund list
     let refunds = client.get_payment_refunds(&payment_id);
@@ -1690,7 +1690,7 @@ fn test_rejected_refund_does_not_count_toward_total() {
         &800i128,
         &String::from_str(&env, "will be rejected"),
         &requester,
-    );
+        &None,);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
@@ -1702,7 +1702,7 @@ fn test_rejected_refund_does_not_count_toward_total() {
         &800i128,
         &String::from_str(&env, "replacement"),
         &requester,
-    );
+        &None,);
     let new_refund = client.get_refund(&new_refund_id);
     assert_eq!(new_refund.amount, 800i128);
     assert_eq!(new_refund.status, RefundStatus::Pending);
@@ -2161,7 +2161,7 @@ fn test_cumulative_refunds_exceed_payment_amount_fails() {
         &600i128,
         &String::from_str(&env, "partial 1"),
         &requester,
-    );
+        &None,);
 
     // Second refund: 500 — 600 + 500 = 1100 > 1000 — must fail
     let result = client.try_create_refund(
@@ -2197,7 +2197,7 @@ fn test_refund_exactly_equal_to_payment_amount_succeeds() {
         &payment_amount,
         &String::from_str(&env, "full refund"),
         &requester,
-    );
+        &None,);
     let refund = client.get_refund(&refund_id);
     assert_eq!(refund.amount, payment_amount);
     assert_eq!(refund.status, RefundStatus::Pending);
@@ -2227,7 +2227,7 @@ fn test_second_refund_after_full_refund_fails() {
         &payment_amount,
         &String::from_str(&env, "full"),
         &requester,
-    );
+        &None,);
 
     // Any additional refund — must fail
     let result = client.try_create_refund(
@@ -2263,7 +2263,7 @@ fn test_rejected_refunds_not_counted_in_cumulative_total() {
         &800i128,
         &String::from_str(&env, "will be rejected"),
         &requester,
-    );
+        &None,);
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_settlement_operator(&env), &operator);
     client.reject_refund(&operator, &refund_id);
@@ -2274,7 +2274,7 @@ fn test_rejected_refunds_not_counted_in_cumulative_total() {
         &payment_amount,
         &String::from_str(&env, "after rejection"),
         &requester,
-    );
+        &None,);
     let refund = client.get_refund(&new_refund_id);
     assert_eq!(refund.amount, payment_amount);
     assert_eq!(refund.status, RefundStatus::Pending);

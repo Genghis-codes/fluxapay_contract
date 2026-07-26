@@ -10,6 +10,9 @@ fluxapay/test_snapshots
 .soroban
 .stellar
 
+# Git worktrees (linked checkouts — never commit these)
+.worktrees/
+
 # Environment variables (do not commit secrets)
 .env
 .env.local

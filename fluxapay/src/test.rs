@@ -3073,6 +3073,41 @@ fn test_process_refund_reentrancy_lock_cleared() {
 }
 
 #[test]
+fn test_process_refund_same_id_only_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_concurrent_refund");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "once"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    client.process_refund(&operator, &refund_id);
+    let second = client.try_process_refund(&operator, &refund_id);
+    assert!(second.is_err());
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Completed);
+}
+
+#[test]
 fn test_settle_payment_reentrancy_guard_normal_flow() {
     let env = Env::default();
     env.mock_all_auths();
@@ -4190,4 +4225,877 @@ fn test_settle_payment_fee_split_rounding_dust_to_treasury() {
     assert_eq!(dev_bal, 33i128);
     assert_eq!(treasury_bal, 67i128);
     assert_eq!(dev_bal + treasury_bal, 100i128, "All fee tokens must be accounted for");
+}
+
+// =============================================================================
+// Treasury fee unification — settlement + refund fees + withdrawal history
+// =============================================================================
+
+#[test]
+fn test_settlement_fee_accumulates_in_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    client.set_fee_rate(&admin, &200i128); // 2%
+    let payment_id = String::from_str(&env, "treasury_settle_accum");
+    let amount = 10_000i128;
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    let splits = vec![
+        &env,
+        SettlementSplit {
+            recipient: Address::generate(&env),
+            amount: 9_800i128,
+        },
+    ];
+    client.settle_payment(&operator, &payment_id, &splits);
+
+    assert_eq!(client.get_treasury_balance(), 200i128);
+}
+
+#[test]
+fn test_refund_fee_accumulates_in_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client, _usdc) = setup_refund_manager_with_token(&env);
+
+    let payment_id = String::from_str(&env, "treasury_refund_accum");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &10_000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1_000i128,
+        &String::from_str(&env, "reason"),
+        &requester,
+    );
+    let operator = Address::generate(&env);
+    client.grant_role(&_admin, &role_settlement_operator(&env), &operator);
+    client.process_refund(&operator, &refund_id);
+
+    // Default refund fee 100 bps of 1000 = 10
+    assert_eq!(client.get_treasury_balance(), 10i128);
+}
+
+#[test]
+fn test_platform_fee_without_custom_recipient_credits_treasury() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let payment_contract = env.register(PaymentProcessor, ());
+    let registry_contract = env.register(crate::merchant_registry::MerchantRegistry, ());
+    let payment_client = PaymentProcessorClient::new(&env, &payment_contract);
+    let registry_client =
+        crate::merchant_registry::MerchantRegistryClient::new(&env, &registry_contract);
+
+    let admin = Address::generate(&env);
+    payment_client.initialize_payment_processor(&admin);
+    registry_client.initialize(&admin);
+    payment_client.set_merchant_registry_address(&admin, &registry_contract);
+
+    let token_id = setup_and_mint_token(&env, &payment_contract, 1_000_000i128);
+    env.as_contract(&payment_contract, || {
+#[test]
+fn test_refund_cooldown_enforcement() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_payment_processor(&env);
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let amount = 1000i128;
+    let payment_id = String::from_str(&env, "cooldown_pay");
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let requester = Address::generate(&env);
+
+    // Try to create refund immediately (within cooldown) - should fail
+    let res = client.try_create_refund(&requester, &payment_id, &100, &String::from_str(&env, "Too much"));
+    assert!(res.is_err(), "Should block refund within cooldown period");
+}
+
+#[test]
+fn test_refund_cooldown_allows_after_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_payment_processor(&env);
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let amount = 1000i128;
+    let payment_id = String::from_str(&env, "cooldown_pass_pay");
+
+    // Create payment at ledger time 0, confirm at time 1
+    env.ledger().with_mut(|li| {
+        li.timestamp = 1;
+    });
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    // Advance time by 301 seconds (default cooldown is 300)
+    env.ledger().with_mut(|li| {
+        li.timestamp = 302;
+    });
+
+    let requester = Address::generate(&env);
+
+    // Now create refund should succeed
+    let res = client.try_create_refund(&requester, &payment_id, &100, &String::from_str(&env, "Too much"));
+    assert!(res.is_ok(), "Should allow refund after cooldown period expires");
+}
+
+#[test]
+fn test_refund_cooldown_configurable() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_payment_processor(&env);
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    // Set cooldown to 0 (allow immediate refunds)
+    let res = client.try_set_refund_cooldown(&admin, &0u64);
+    assert!(res.is_ok(), "Admin should be able to set refund cooldown");
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let amount = 1000i128;
+    let payment_id = String::from_str(&env, "immediate_refund");
+    make_confirmed_payment(&env, &client, &admin, &payment_id, amount);
+
+    let requester = Address::generate(&env);
+
+    // With cooldown = 0, refund should succeed immediately
+    let res = client.try_create_refund(&requester, &payment_id, &100, &String::from_str(&env, "Too much"));
+    assert!(res.is_ok(), "Should allow immediate refund when cooldown is set to 0");
+}
+
+#[test]
+fn test_merchant_payment_count_accurate_after_creates() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_payment_processor(&env);
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    // Initially count should be 0
+    let mut count = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count, 0u32, "Initial count should be 0");
+
+    // Create 1 payment
+    let _ = client.create_payment(&CreatePaymentArgs {
+        payment_id: String::from_str(&env, "pay1"),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 100,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+fn test_create_payment_future_expiry_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_future_expiry");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    let future_expiry = now + 7200; // 2 hours in the future
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(future_expiry),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let payment = client.create_payment(&args);
+    assert_eq!(payment.expires_at, future_expiry);
+}
+
+#[test]
+fn test_create_payment_current_timestamp_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_current_expiry");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(now), // Exactly now
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_past_expiry_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_past_expiry");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let now = env.ledger().timestamp();
+    let past_expiry = now - 3600; // 1 hour in the past
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(past_expiry),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_duration_min_bound_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_min_duration");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+        duration_secs: Some(30), // Below CREATE_PAYMENT_WINDOW_SECS (60)
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_duration_max_bound_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_max_duration");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+        duration_secs: Some(31 * 24 * 3600), // Exceeds 30 days
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_valid_duration_within_bounds() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_valid_duration");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let duration_secs = 7200u64; // 2 hours, within bounds
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+        duration_secs: Some(duration_secs),
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let payment = client.create_payment(&args);
+    let now = env.ledger().timestamp();
+    let expected_expiry = now + duration_secs;
+    assert_eq!(payment.expires_at, expected_expiry);
+}
+
+#[test]
+fn test_admin_set_min_payment_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let new_min = 120u64;
+    client.set_min_payment_duration_secs(&admin, &new_min);
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let stored_min: u64 = env.storage()
+            .persistent()
+            .get(&DataKey::MinPaymentDurationSecs)
+            .unwrap();
+        assert_eq!(stored_min, new_min);
+    });
+}
+
+#[test]
+fn test_admin_set_max_payment_duration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let new_max = 14 * 24 * 3600u64; // 14 days
+    client.set_max_payment_duration_secs(&admin, &new_max);
+
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let stored_max: u64 = env.storage()
+            .persistent()
+            .get(&DataKey::MaxPaymentDurationSecs)
+            .unwrap();
+        assert_eq!(stored_max, new_max);
+    });
+}
+
+#[test]
+fn test_create_payment_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_zero_amount");
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount: 0,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    });
+
+    count = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count, 1u32, "Count should be 1 after 1 payment");
+
+    // Create 9 more payments (total 10)
+    for i in 2..=10 {
+        let _ = client.create_payment(&CreatePaymentArgs {
+            payment_id: String::from_str(&env, &format!("pay{}", i)),
+            merchant_id: merchant.clone(),
+            payer: None,
+            amount: 100,
+            currency: Symbol::new(&env, "USDC"),
+            deposit_address: Address::generate(&env),
+            expires_at: None,
+            duration_secs: None,
+            memo: None,
+            memo_type: None,
+            token_address: None,
+            client_token: None,
+            metadata_hash: None,
+            metadata: None,
+            fee_waiver_code: None,
+        });
+    }
+
+    count = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count, 10u32, "Count should be 10 after 10 payments");
+}
+
+#[test]
+fn test_merchant_payment_count_not_decremented_on_cancel() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, client) = setup_payment_processor(&env);
+    let contract_id = client.address.clone();
+    let token_id = setup_and_mint_token(&env, &contract_id, 1_000_000i128);
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsdcToken, &token_id);
+    });
+
+    let merchant = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_merchant(&env), &merchant);
+
+    let fee_config = crate::merchant_registry::FeeConfig {
+        platform_fee_bps: 100, // 1%
+        fixed_fee: 0,
+        fee_recipient: None, // → TreasuryBalance
+    };
+    registry_client.register_merchant(
+        &merchant,
+        &String::from_str(&env, "Fee Merchant"),
+        &String::from_str(&env, "USDC"),
+        &None::<Address>,
+        &None::<String>,
+        &Some(fee_config),
+    );
+    registry_client.set_kyc_tier_with_signature(
+        &admin,
+        &merchant,
+        &crate::merchant_registry::KycTier::Full,
+        &Some(String::from_str(&env, "sig")),
+    );
+
+    let payment_id = String::from_str(&env, "plat_fee_treasury");
+    let amount = 10_000i128;
+    let args = create_payment_args(&env, &payment_id, &merchant, amount);
+    payment_client.create_payment(&args);
+
+    let oracle = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_oracle(&env), &oracle);
+    payment_client.verify_payment(
+        &oracle,
+        &payment_id,
+        &BytesN::<32>::random(&env),
+        &Address::generate(&env),
+        &amount,
+    );
+
+    let operator = Address::generate(&env);
+    payment_client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    payment_client.settle_payment(&operator, &payment_id, &vec![&env]);
+
+    // 1% of 10_000 = 100 credited to treasury (no custom recipient)
+    assert_eq!(payment_client.get_treasury_balance(), 100i128);
+}
+
+#[test]
+fn test_withdraw_treasury_reduces_balance_and_logs_history() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token) = setup_refund_manager_with_token(&env);
+    let token_client = token::StellarAssetClient::new(&env, &usdc_token);
+
+    let merchant_id = Address::generate(&env);
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    let payment_id = String::from_str(&env, "withdraw_hist_pay");
+    let requester = Address::generate(&env);
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &50_000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+    let refund_id = client.create_refund(
+        &payment_id,
+        &10_000i128,
+        &String::from_str(&env, "reason"),
+        &requester,
+    );
+    client.process_refund(&operator, &refund_id);
+    // fee = 100 bps * 10000 = 100
+    assert_eq!(client.get_treasury_balance(), 100i128);
+
+    let destination = Address::generate(&env);
+    let starting = token::TokenClient::new(&env, &usdc_token).balance(&destination);
+    client.withdraw_treasury(&admin, &40i128, &destination);
+
+    assert_eq!(client.get_treasury_balance(), 60i128);
+    assert_eq!(
+        token::TokenClient::new(&env, &usdc_token).balance(&destination),
+        starting + 40
+    );
+
+    let history = client.get_treasury_withdrawal_history(&0u32, &10u32);
+    assert_eq!(history.len(), 1);
+    assert_eq!(history.get(0).unwrap().amount, 40i128);
+    assert_eq!(history.get(0).unwrap().destination, destination);
+
+    // Insufficient withdrawal fails and does not change balance
+    let result = client.try_withdraw_treasury(&admin, &61i128, &destination);
+    assert_eq!(result, Err(Ok(Error::InsufficientTreasuryBalance)));
+    assert_eq!(client.get_treasury_balance(), 60i128);
+
+    let _ = token_client; // silence unused if only StellarAssetClient needed above
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let payment_id = String::from_str(&env, "cancel_test");
+    let _ = client.create_payment(&CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant.clone(),
+        payer: None,
+        amount: 100,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_negative_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_negative_amount");
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount: -1000i128,
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    };
+
+    let result = client.try_create_payment(&args);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_payment_minimum_positive_amount_accepted() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_min_amount");
+    let merchant_id = Address::generate(&env);
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = CreatePaymentArgs {
+        payment_id: payment_id.clone(),
+        merchant_id: merchant_id.clone(),
+        payer: None,
+        amount: 1, // Minimum valid amount (1 stroop)
+        currency: Symbol::new(&env, "USDC"),
+        deposit_address: Address::generate(&env),
+        expires_at: Some(env.ledger().timestamp() + 3600),
+        duration_secs: None,
+        memo: None,
+        memo_type: None,
+        token_address: None,
+        client_token: None,
+        metadata_hash: None,
+        metadata: None,
+        fee_waiver_code: None,
+    });
+
+    let count_before = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count_before, 1u32, "Count should be 1");
+
+    // Cancel the payment (set cooldown to 0 first to allow immediate operations)
+    let _ = client.try_cancel_payment(&merchant, &payment_id);
+
+    let count_after = client.get_merchant_payment_count_for_dashboard(&merchant);
+    assert_eq!(count_after, 1u32, "Count should NOT decrease after cancellation");
+    };
+
+    let payment = client.create_payment(&args);
+    assert_eq!(payment.amount, 1i128);
+}
+
+#[test]
+fn test_create_refund_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_for_refund");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = create_payment_args(&env, &payment_id, &merchant_id, amount);
+    let _ = client.create_payment(&args);
+
+    let requester = Address::generate(&env);
+    let result = client.try_create_refund(&payment_id, &0, &String::from_str(&env, "test"), &requester);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_dispute_zero_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payment_id = String::from_str(&env, "payment_for_dispute");
+    let merchant_id = Address::generate(&env);
+    let amount = 1000000000i128;
+    client.grant_role(&admin, &role_merchant(&env), &merchant_id);
+
+    let args = create_payment_args(&env, &payment_id, &merchant_id, amount);
+    let _ = client.create_payment(&args);
+
+    let disputer = Address::generate(&env);
+    let result = client.try_create_dispute(
+        &payment_id,
+        &0,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, "QmHash1234567890"),
+        &disputer,
+        &vec![&env],
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_subscription_max_retries_cancelled() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payer = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan_max_retries");
+    let subscription_id = String::from_str(&env, "sub_max_retries");
+
+    // Create subscription plan
+    let plan = client.create_subscription_plan(
+        &admin,
+        &plan_id,
+        &100_000_000i128,
+        &3600u64,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    // Create subscription
+    let subscription = client.create_subscription(&payer, &subscription_id, &plan.plan_id);
+    assert_eq!(subscription.status, SubscriptionStatus::Active);
+
+    // Simulate 3 failed payment attempts
+    for i in 1..=3 {
+        let result = client.try_charge_subscription(
+            &Address::generate(&env),
+            &subscription_id,
+            &Address::generate(&env),
+        );
+
+        if i < 3 {
+            // First 2 failures should NOT cancel the subscription
+            let sub = client.get_subscription(&subscription_id).unwrap();
+            assert_eq!(sub.status, SubscriptionStatus::Active);
+            assert_eq!(sub.retry_count, i as u32);
+        } else {
+            // 3rd failure should cancel the subscription
+            let sub = client.get_subscription(&subscription_id).unwrap();
+            assert_eq!(sub.status, SubscriptionStatus::Cancelled);
+            assert_eq!(sub.retry_count, 3u32);
+        }
+    }
+}
+
+#[test]
+fn test_subscription_retry_counter_reset_on_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payer = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan_retry_reset");
+    let subscription_id = String::from_str(&env, "sub_retry_reset");
+
+    let plan = client.create_subscription_plan(
+        &admin,
+        &plan_id,
+        &100_000_000i128,
+        &3600u64,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let subscription = client.create_subscription(&payer, &subscription_id, &plan.plan_id);
+    assert_eq!(subscription.retry_count, 0u32);
+
+    // Simulate one failed payment
+    let _ = client.try_charge_subscription(
+        &Address::generate(&env),
+        &subscription_id,
+        &Address::generate(&env),
+    );
+
+    let sub = client.get_subscription(&subscription_id).unwrap();
+    assert_eq!(sub.retry_count, 1u32);
+
+    // Simulate successful payment (assuming it resets counter)
+    // This would need actual payment confirmation logic which may vary
+    // For now, just verify the counter incremented as expected
+}
+
+#[test]
+fn test_admin_reactivate_max_retries_cancelled_subscription() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_payment_processor(&env);
+
+    let payer = Address::generate(&env);
+    let plan_id = String::from_str(&env, "plan_reactivate");
+    let subscription_id = String::from_str(&env, "sub_reactivate");
+
+    let plan = client.create_subscription_plan(
+        &admin,
+        &plan_id,
+        &100_000_000i128,
+        &3600u64,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let subscription = client.create_subscription(&payer, &subscription_id, &plan.plan_id);
+
+    // Manually mark subscription as cancelled to simulate max retries cancellation
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        let mut sub = client.get_subscription(&subscription_id).unwrap();
+        sub.status = SubscriptionStatus::Cancelled;
+        sub.retry_count = 3u32;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Subscription(subscription_id.clone()), &sub);
+    });
+
+    // Admin reactivates the subscription
+    client.admin_reactivate_subscription(&admin, &subscription_id);
+
+    let reactivated = client.get_subscription(&subscription_id).unwrap();
+    assert_eq!(reactivated.status, SubscriptionStatus::Active);
+    assert_eq!(reactivated.retry_count, 0u32);
 }

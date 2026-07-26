@@ -23,7 +23,28 @@ export type OfflineCapableClient = ContractClient & {
   fromJSON: Record<string, (json: string) => AssembledTransaction<unknown>>;
 };
 
-/** Ensure simulation completed so payload fields are populated. */
+/** Extended client surface covering subscription/pre-auth billing operations
+ * not yet present in the generated `ContractClient` bindings. */
+export type SubscriptionBillingClient = OfflineCapableClient & {
+  charge_subscription(args: {
+    operator: string;
+    subscription_id: string;
+    token: string;
+  }): Promise<AssembledTransaction<unknown>>;
+  pull_payment(args: {
+    merchant: string;
+    customer: string;
+    amount: bigint;
+  }): Promise<AssembledTransaction<unknown>>;
+};
+
+/**
+ * Ensure simulation completed so payload fields are populated.
+ *
+ * Operation-agnostic: works for any `AssembledTransaction`, including the
+ * `charge_subscription` and `pull_payment` operations used by
+ * `buildSubscriptionTickPayload` / `buildPullAuthorizationPayload`.
+ */
 export async function prepareForOfflineSigning<T>(
   tx: AssembledTransaction<T>,
 ): Promise<AssembledTransaction<T>> {
@@ -98,6 +119,36 @@ export async function buildCreateRefundPayload(
   return buildOfflinePayload("create_refund", contractId, networkPassphrase, tx);
 }
 
+/** Raw payload builder for `charge_subscription` (subscription tick) invocations. */
+export async function buildSubscriptionTickPayload(
+  client: SubscriptionBillingClient,
+  contractId: string,
+  networkPassphrase: string,
+  params: { operator: string; subscriptionId: string; token: string },
+): Promise<OfflineTransactionPayload> {
+  const tx = await client.charge_subscription({
+    operator: params.operator,
+    subscription_id: params.subscriptionId,
+    token: params.token,
+  });
+  return buildOfflinePayload("charge_subscription", contractId, networkPassphrase, tx);
+}
+
+/** Raw payload builder for `pull_payment` (pre-authorized pull) invocations. */
+export async function buildPullAuthorizationPayload(
+  client: SubscriptionBillingClient,
+  contractId: string,
+  networkPassphrase: string,
+  params: { merchant: string; customer: string; amount: bigint },
+): Promise<OfflineTransactionPayload> {
+  const tx = await client.pull_payment({
+    merchant: params.merchant,
+    customer: params.customer,
+    amount: params.amount,
+  });
+  return buildOfflinePayload("pull_payment", contractId, networkPassphrase, tx);
+}
+
 /**
  * High-level helper exposing common raw payload builders for hardware wallets.
  */
@@ -138,6 +189,32 @@ export class FluxapayOfflineSigner {
       this.contractId,
       this.networkPassphrase,
       args,
+    );
+  }
+
+  buildSubscriptionTick(params: {
+    operator: string;
+    subscriptionId: string;
+    token: string;
+  }): Promise<OfflineTransactionPayload> {
+    return buildSubscriptionTickPayload(
+      this.client as SubscriptionBillingClient,
+      this.contractId,
+      this.networkPassphrase,
+      params,
+    );
+  }
+
+  buildPullAuthorization(params: {
+    merchant: string;
+    customer: string;
+    amount: bigint;
+  }): Promise<OfflineTransactionPayload> {
+    return buildPullAuthorizationPayload(
+      this.client as SubscriptionBillingClient,
+      this.contractId,
+      this.networkPassphrase,
+      params,
     );
   }
 

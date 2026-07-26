@@ -13,6 +13,7 @@ export const FX_ORACLE_ERROR_MAP: Record<number, string> = {
   1: "RateNotFound",
   2: "RateStale",
   3: "Unauthorized",
+  4: "BatchTooLarge",
 };
 
 export class FxOracleError extends Error {
@@ -200,6 +201,33 @@ export class FxOracleClient {
       this.getContract().set_staleness_threshold({
         admin,
         threshold,
+      }),
+    );
+  }
+
+  /**
+   * Permissionless probe: returns true when the rate is stale (emits RATE/STALE_ALERT).
+   * @param pair - Currency pair symbol
+   */
+  async checkRateStaleness(pair: string): Promise<boolean> {
+    return withFxOracleContractError(() =>
+      this.getContract().check_rate_staleness({ pair }),
+    );
+  }
+
+  /**
+   * Atomically update up to 20 currency pairs. Requires the ORACLE role.
+   * @param operator - Address with the ORACLE role
+   * @param rates - Array of `[pair, rate, decimals]` tuples
+   */
+  async setRatesBatch(
+    operator: string,
+    rates: Array<[string, bigint, number]>,
+  ): Promise<number> {
+    return withFxOracleContractError(() =>
+      this.getContract().set_rates_batch({
+        operator,
+        rates,
       }),
     );
   }

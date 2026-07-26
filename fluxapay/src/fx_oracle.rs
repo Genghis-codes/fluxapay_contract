@@ -1,4 +1,6 @@
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 use crate::access_control::{role_admin, role_oracle, AccessControl};
 
@@ -7,6 +9,9 @@ const MAX_RATE_AGE_SECS: u64 = 86_400; // 24 hours
 
 /// Maximum ledger sequence gap since last rate update (~24 h at ~5 s/ledger).
 const MAX_LEDGER_GAP: u32 = 17_280;
+
+/// Maximum number of currency pairs accepted by `set_rates_batch`.
+const MAX_BATCH_RATES: u32 = 20;
 
 #[contract]
 pub struct FXOracle;
@@ -27,6 +32,8 @@ pub enum FXOracleError {
     RateNotFound = 1,
     RateStale = 2,
     Unauthorized = 3,
+    /// Batch rate update exceeds the maximum of 20 pairs.
+    BatchTooLarge = 4,
     /// Issue #478: Rate deviation exceeds configured limit
     RateDeviationExceeded = 4,
 }
@@ -87,6 +94,49 @@ impl FXOracle {
             return Err(FXOracleError::Unauthorized);
         }
 
+        Self::store_rate(&env, pair.clone(), rate, decimals);
+
+        // Emit event: (RATE, UPDATED), pair
+        env.events().publish(
+            (Symbol::new(&env, "RATE"), Symbol::new(&env, "UPDATED")),
+            pair,
+        );
+
+        Ok(())
+    }
+
+    /// Atomically update up to 20 currency pairs. Requires the ORACLE role.
+    ///
+    /// Emits `RATE/BATCH_UPDATED` with the number of pairs updated.
+    pub fn set_rates_batch(
+        env: Env,
+        operator: Address,
+        rates: Vec<(Symbol, i128, u32)>,
+    ) -> Result<u32, FXOracleError> {
+        operator.require_auth();
+
+        if !AccessControl::has_role(&env, &role_oracle(&env), &operator) {
+            return Err(FXOracleError::Unauthorized);
+        }
+
+        if rates.len() > MAX_BATCH_RATES {
+            return Err(FXOracleError::BatchTooLarge);
+        }
+
+        let count = rates.len();
+        for (pair, rate, decimals) in rates.iter() {
+            Self::store_rate(&env, pair, rate, decimals);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "RATE"), Symbol::new(&env, "BATCH_UPDATED")),
+            count,
+        );
+
+        Ok(count)
+    }
+
+    fn store_rate(env: &Env, pair: Symbol, rate: i128, decimals: u32) {
         // Issue #478: Check rate deviation against configured limit
         let max_deviation_bps = env
             .storage()
@@ -135,15 +185,7 @@ impl FXOracle {
 
         env.storage()
             .persistent()
-            .set(&OracleDataKey::Rate(pair.clone()), &rate_data);
-
-        // Emit event: (RATE, UPDATED), pair
-        env.events().publish(
-            (Symbol::new(&env, "RATE"), Symbol::new(&env, "UPDATED")),
-            pair,
-        );
-
-        Ok(())
+            .set(&OracleDataKey::Rate(pair), &rate_data);
     }
 
     pub fn get_rate(env: Env, pair: Symbol) -> Result<RateData, FXOracleError> {
@@ -156,6 +198,29 @@ impl FXOracle {
         Self::check_rate_freshness(&env, &rate_data, &pair)?;
 
         Ok(rate_data)
+    }
+
+    /// Permissionless staleness probe. Returns `true` when the rate is stale
+    /// (or missing) and emits `RATE/STALE_ALERT` when stale data is present.
+    pub fn check_rate_staleness(env: Env, pair: Symbol) -> bool {
+        let rate_data: RateData = match env
+            .storage()
+            .persistent()
+            .get(&OracleDataKey::Rate(pair.clone()))
+        {
+            Some(data) => data,
+            None => return true,
+        };
+
+        if Self::is_rate_stale(&env, &rate_data) {
+            env.events().publish(
+                (Symbol::new(&env, "RATE"), Symbol::new(&env, "STALE_ALERT")),
+                pair,
+            );
+            true
+        } else {
+            false
+        }
     }
 
     // SECURITY: Rate freshness relies on ledger wall-clock time (`env.ledger().timestamp()`),
@@ -175,6 +240,23 @@ impl FXOracle {
         rate_data: &RateData,
         pair: &Symbol,
     ) -> Result<(), FXOracleError> {
+        if Self::is_rate_stale(env, rate_data) {
+            let ledger_gap = env
+                .ledger()
+                .sequence()
+                .saturating_sub(rate_data.updated_sequence);
+            if ledger_gap > MAX_LEDGER_GAP {
+                env.events().publish(
+                    (Symbol::new(env, "RATE"), Symbol::new(env, "STALE_ALERT")),
+                    pair.clone(),
+                );
+            }
+            return Err(FXOracleError::RateStale);
+        }
+        Ok(())
+    }
+
+    fn is_rate_stale(env: &Env, rate_data: &RateData) -> bool {
         let configured_threshold: u64 = env
             .storage()
             .instance()
@@ -185,22 +267,14 @@ impl FXOracle {
 
         let now = env.ledger().timestamp();
         if now > rate_data.updated_at.saturating_add(effective_threshold) {
-            return Err(FXOracleError::RateStale);
+            return true;
         }
 
         let ledger_gap = env
             .ledger()
             .sequence()
             .saturating_sub(rate_data.updated_sequence);
-        if ledger_gap > MAX_LEDGER_GAP {
-            env.events().publish(
-                (Symbol::new(env, "RATE"), Symbol::new(env, "STALE_ALERT")),
-                pair.clone(),
-            );
-            return Err(FXOracleError::RateStale);
-        }
-
-        Ok(())
+        ledger_gap > MAX_LEDGER_GAP
     }
 
     pub fn get_settlement_amount(

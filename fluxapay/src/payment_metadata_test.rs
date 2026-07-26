@@ -144,6 +144,25 @@ fn test_create_payment_metadata_value_too_long() {
 }
 
 #[test]
+#[should_panic(expected = "Error(Contract, #47)")]
+fn test_create_payment_metadata_key_too_long() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, merchant, client) = setup(&env);
+
+    // 65-char key — one over the 64-char limit
+    let long_key = String::from_str(
+        &env,
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+    );
+
+    let mut meta: Map<String, String> = Map::new(&env);
+    meta.set(long_key, String::from_str(&env, "ok"));
+
+    client.create_payment(&payment_args(&env, &merchant, Some(meta)));
+}
+
+#[test]
 fn test_create_payment_metadata_in_event_payload() {
     let env = Env::default();
     env.mock_all_auths();

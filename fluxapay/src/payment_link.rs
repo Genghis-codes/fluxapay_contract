@@ -3,7 +3,8 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
-use crate::{PaymentCharge, PaymentStatus, format_id};
+use crate::utils;
+use crate::{format_id, PaymentCharge, PaymentStatus};
 
 /// Multi-currency fiat configuration for payment links (issue #413).
 #[contracttype]
@@ -65,6 +66,8 @@ pub struct PaymentLink {
     pub metadata: Option<Map<String, String>>,
     /// Fiat configuration for multi-currency invoicing (issue #413).
     pub fiat: MaybeFiatConfig,
+    /// Canonical shareable checkout URL: `{base_url}/pay/{link_id}`.
+    pub shareable_url: Option<String>,
 }
 
 /// Analytics summary for a payment link.
@@ -90,6 +93,8 @@ pub enum LinkDataKey {
     LinkPayments(String),
     /// Individual payment charge created from a link
     LinkPayment(String),
+    /// Admin-configured default base URL for shareable payment links.
+    PaymentBaseUrl,
 }
 
 #[contract]
@@ -139,6 +144,37 @@ impl PaymentLinkManager {
         Ok(())
     }
 
+    /// Set the default base URL used when `create_link` omits `base_url`.
+    pub fn set_payment_base_url(
+        env: Env,
+        admin: Address,
+        url: String,
+    ) -> Result<(), crate::Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&LinkDataKey::LinkAdmin)
+            .ok_or(crate::Error::Unauthorized)?;
+
+        if admin != stored_admin {
+            return Err(crate::Error::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&LinkDataKey::PaymentBaseUrl, &url);
+        Ok(())
+    }
+
+    /// Return the admin-configured default payment base URL, if any.
+    pub fn get_payment_base_url(env: Env) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get(&LinkDataKey::PaymentBaseUrl)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_link(
         env: Env,
@@ -152,6 +188,7 @@ impl PaymentLinkManager {
         direct_transfer: bool,
         metadata: Option<Map<String, String>>,
         fiat: MaybeFiatConfig,
+        base_url: Option<String>,
     ) -> Result<String, crate::Error> {
         merchant.require_auth();
 
@@ -159,15 +196,25 @@ impl PaymentLinkManager {
             return Err(crate::Error::InvalidPaymentId);
         }
         if let Some(ref meta_map) = metadata {
-            if meta_map.len() > 20 {
-                return Err(crate::Error::MetadataTooLarge);
-            }
-            for (_, value) in meta_map.iter() {
-                if value.len() > 256 {
-                    return Err(crate::Error::MetadataValueTooLong);
-                }
-            }
+            utils::validate_metadata(meta_map)?;
         }
+
+        let resolved_base = base_url.or_else(|| {
+            env.storage()
+                .persistent()
+                .get(&LinkDataKey::PaymentBaseUrl)
+        });
+
+        let shareable_url = resolved_base.map(|base| {
+            utils::concat_strings(
+                &env,
+                &[
+                    base,
+                    String::from_str(&env, "/pay/"),
+                    link_id.clone(),
+                ],
+            )
+        });
 
         let link = PaymentLink {
             link_id: link_id.clone(),
@@ -184,6 +231,7 @@ impl PaymentLinkManager {
             direct_transfer,
             metadata,
             fiat,
+            shareable_url,
         };
 
         env.storage()
@@ -197,6 +245,13 @@ impl PaymentLinkManager {
         );
 
         Ok(link_id)
+    }
+
+    /// Return the shareable URL for a link, if one was stored.
+    pub fn get_link_url(env: Env, link_id: String) -> Option<String> {
+        Self::get_link_internal(&env, &link_id)
+            .ok()
+            .and_then(|link| link.shareable_url)
     }
 
     /// Record a view of a payment link.
@@ -325,7 +380,7 @@ impl PaymentLinkManager {
         // Issue #111: If direct_transfer is true, transfer funds directly to the merchant,
         // bypassing the escrow/platform wallet.
         if link.direct_transfer {
-            let token_address = usdc_token.ok_or(crate::Error::Unauthorized)?;
+            let token_address = usdc_token.clone().ok_or(crate::Error::Unauthorized)?;
             let token_client = token::TokenClient::new(&env, &token_address);
             let merchant_muxed: MuxedAddress = (&link.merchant_id).into();
             token_client.transfer(&payer, &merchant_muxed, &resolved_amount);

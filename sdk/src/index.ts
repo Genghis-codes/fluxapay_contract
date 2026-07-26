@@ -31,6 +31,7 @@ import {
   type PaymentLink,
   type LinkAnalytics,
   type CreateLinkParams,
+  type CreatePaymentLinkResult,
 } from "./contracts/payment-link-manager.js";
 import { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
 
@@ -60,6 +61,17 @@ export interface CreatePaymentParams {
   memoType?: string;
   tokenAddress?: string;
   clientToken?: string;
+  /**
+   * Optional payment metadata map.
+   *
+   * Limits (enforced on-chain):
+   * - At most 20 keys
+   * - Each key ≤ 64 characters
+   * - Each value ≤ 256 characters
+   *
+   * Violations return `MetadataTooLarge` (#49) or `MetadataValueTooLong` (#47).
+   */
+  metadata?: Record<string, string>;
   /**
    * Optional per-payment fee-waiver code. If the code is valid at
    * settlement time (exists, not expired, still has remaining uses), the
@@ -122,6 +134,8 @@ export const FLUXAPAY_CONTRACT_ERROR_MAP: Record<number, string> = {
   37: "ArbitrationVotingThresholdNotMet",
   38: "FeeProposalNotReady",
   39: "NoFeeProposal",
+  47: "MetadataValueTooLong",
+  49: "MetadataTooLarge",
   404: "PaymentNotFound",
   405: "RefundNotFound",
   406: "InvalidAmount",
@@ -212,7 +226,7 @@ function toCreatePaymentArgs(params: CreatePaymentParams): CreatePaymentArgs {
     token_address: params.tokenAddress,
     client_token: params.clientToken,
     metadata_hash: undefined,
-    metadata: undefined,
+    metadata: params.metadata,
     fee_waiver_code: params.feeWaiverCode,
   };
 }
@@ -717,11 +731,29 @@ export class FluxapayClient {
    * @param params.merchant - The merchant's Stellar address
    * @param params.amount - Optional fixed amount in stroops
    * @param params.usdcToken - USDC token contract address
-   * @param params.metadata - Optional key/value metadata
+   * @param params.metadata - Optional key/value metadata (≤20 keys, key≤64, value≤256)
+   * @param params.baseUrl - Optional checkout base URL for shareable_url
    * @returns A promise resolving to the new link ID
    */
   async createLink(params: CreateLinkParams): Promise<string> {
     return this.getPaymentLinkManager().createLink(params);
+  }
+
+  /**
+   * Create a payment link and return shareable URL + QR code payload.
+   *
+   * @returns `{ linkId, shareableUrl, qrCodeData }` where `qrCodeData` is the
+   * shareable URL (or link ID fallback) suitable for QR generation.
+   */
+  async createPaymentLink(params: CreateLinkParams): Promise<CreatePaymentLinkResult> {
+    return this.getPaymentLinkManager().createPaymentLink(params);
+  }
+
+  /**
+   * Query the on-chain shareable URL for a payment link.
+   */
+  async getLinkUrl(linkId: string): Promise<string | null> {
+    return this.getPaymentLinkManager().getLinkUrl(linkId);
   }
 
   /**
@@ -844,6 +876,7 @@ export {
   type PaymentLink,
   type LinkAnalytics,
   type CreateLinkParams,
+  type CreatePaymentLinkResult,
 } from "./contracts/payment-link-manager.js";
 export { SEP10Authenticator, type SEP10ChallengeResponse, type SEP10AuthenticatedResponse } from "./sep10.js";
 

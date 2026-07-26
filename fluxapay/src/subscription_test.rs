@@ -227,7 +227,7 @@ fn test_cancel_subscription_by_payer_becomes_cancelled() {
     let payer = Address::generate(&env);
     let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
 
-    client.cancel_subscription(&payer, &sub_id);
+    client.cancel_subscription(&payer, &sub_id, &false);
 
     let sub = client.get_subscription(&sub_id);
     assert_eq!(sub.status, SubscriptionStatus::Cancelled);
@@ -277,4 +277,108 @@ fn test_deactivate_subscription_plan_by_merchant_marks_inactive() {
 
     let plan = client.get_subscription_plan(&plan_id);
     assert!(!plan.active, "Plan should be inactive after deactivation");
+}
+
+/// Mid-period cancel with proration creates a pending refund and emits events.
+#[test]
+fn test_cancel_subscription_mid_period_with_proration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _merchant, plan_id) = setup_with_plan(&env);
+
+    client.set_allow_prorated_refunds(&admin, &true);
+
+    let payer = Address::generate(&env);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+
+    // Simulate a successful billing tick by advancing and processing due subs.
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 7 * 86_400);
+    assert_eq!(client.process_due_subscriptions(&operator), 1);
+
+    let sub_before = client.get_subscription(&sub_id);
+    assert!(sub_before.last_payment_at.is_some());
+
+    // Advance 3 days into the 7-day period → 4 days remaining → 4/7 of amount.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 3 * 86_400);
+
+    client.cancel_subscription(&payer, &sub_id, &true);
+
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
+
+    // Synthetic payment + pending prorated refund must exist.
+    let payment_id = String::from_str(&env, "sub_pr_2");
+    let refunds = client.get_payment_refunds(&payment_id);
+    assert_eq!(refunds.len(), 1);
+    let refund = refunds.get(0).unwrap();
+    assert_eq!(refund.status, crate::RefundStatus::Pending);
+    // 4/7 of 1_000_000 = 571_428
+    assert_eq!(refund.amount, 571_428_i128);
+}
+
+/// Mid-period cancel without proration flag cancels but creates no refund.
+#[test]
+fn test_cancel_subscription_mid_period_without_proration() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _merchant, plan_id) = setup_with_plan(&env);
+
+    client.set_allow_prorated_refunds(&admin, &true);
+
+    let payer = Address::generate(&env);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 7 * 86_400);
+    assert_eq!(client.process_due_subscriptions(&operator), 1);
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 3 * 86_400);
+
+    client.cancel_subscription(&payer, &sub_id, &false);
+
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
+
+    let payment_id = String::from_str(&env, "sub_pr_2");
+    let refunds = client.get_payment_refunds(&payment_id);
+    assert_eq!(refunds.len(), 0);
+}
+
+/// End-of-period cancel (no days remaining) creates no prorated refund.
+#[test]
+fn test_cancel_subscription_end_of_period_no_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _merchant, plan_id) = setup_with_plan(&env);
+
+    client.set_allow_prorated_refunds(&admin, &true);
+
+    let payer = Address::generate(&env);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 7 * 86_400);
+    assert_eq!(client.process_due_subscriptions(&operator), 1);
+
+    // Jump to exactly next_payment_at (end of period).
+    let sub_before = client.get_subscription(&sub_id);
+    env.ledger().set_timestamp(sub_before.next_payment_at);
+
+    client.cancel_subscription(&payer, &sub_id, &true);
+
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
+
+    let payment_id = String::from_str(&env, "sub_pr_2");
+    let refunds = client.get_payment_refunds(&payment_id);
+    assert_eq!(refunds.len(), 0);
 }

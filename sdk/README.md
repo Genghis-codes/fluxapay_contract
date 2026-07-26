@@ -315,9 +315,20 @@ const linkId = await client.createLink({
   merchant: "G...",
   amount: 5_000_000n, // 0.5 USDC (7 decimals)
   usdcToken: "C...",
+  // metadata: ≤20 keys; key ≤64 chars; value ≤256 chars
   metadata: { product: "Coffee", ref: "order_42" }, // optional
+  baseUrl: "https://pay.example.com", // optional → shareable_url
 });
 console.log("Link created:", linkId);
+
+// Prefer createPaymentLink when you need QR / shareable URL
+const { linkId: payLinkId, shareableUrl, qrCodeData } = await client.createPaymentLink({
+  merchant: "G...",
+  amount: 5_000_000n,
+  usdcToken: "C...",
+  baseUrl: "https://pay.example.com",
+});
+console.log(shareableUrl, qrCodeData);
 
 // Open-amount link (payer sets the amount)
 const openLinkId = await client.createLink({

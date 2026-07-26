@@ -1471,6 +1471,11 @@ impl MerchantRegistry {
         merchant_id.require_auth();
 
         let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        let domain_for_event = match &anchor_config {
+            Some(cfg) => cfg.anchor_domain.clone(),
+            None => String::from_str(&env, ""),
+        };
+        merchant.anchor_config = MaybeAnchorConfig::from(anchor_config);
         merchant.anchor_config = MaybeAnchorConfig::from(anchor_config.clone());
         env.storage()
             .persistent()
@@ -1485,6 +1490,9 @@ impl MerchantRegistry {
                 Symbol::new(&env, "MERCHANT"),
                 Symbol::new(&env, "ANCHOR_UPDATED"),
             ),
+            (merchant_id, domain_for_event),
+        );
+
             (merchant_id, domain),
         );
         Ok(())
@@ -1560,6 +1568,7 @@ impl MerchantRegistry {
             (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "FEE_WAIVER_SET")),
             (merchant_id, expires_at_for_event),
         );
+
         Ok(())
     }
 

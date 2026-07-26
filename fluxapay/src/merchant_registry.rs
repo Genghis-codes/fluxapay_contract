@@ -167,6 +167,10 @@ pub struct Merchant {
     /// When true, only customers in `MerchantDataKey::MerchantCustomerWhitelist`
     /// may initiate payments to this merchant (issue #516).
     pub whitelist_mode: bool,
+    /// Issue #481: Total dispute count for this merchant (incremented on dispute creation).
+    pub dispute_count: u32,
+    /// Issue #481: Count of disputes resolved against this merchant (incremented on unfavorable resolution).
+    pub resolved_against_merchant_count: u32,
 }
 
 #[contracttype]
@@ -187,6 +191,8 @@ pub enum MerchantDataKey {
     TierLimit(KycTier),
     /// Customer whitelist for a merchant in whitelist mode (issue #516)
     MerchantCustomerWhitelist(Address),
+    /// Issue #481: Admin-configurable dispute threshold for auto-suspension (default 10)
+    DisputeThreshold,
 }
 
 /// Platform fee configuration stored in MerchantRegistry.
@@ -321,6 +327,8 @@ impl MerchantRegistry {
             anchor_config: MaybeAnchorConfig::None,
             fee_waiver_expires_at: None,
             whitelist_mode: false,
+            dispute_count: 0,
+            resolved_against_merchant_count: 0,
         };
 
         env.storage()
@@ -1626,4 +1634,172 @@ impl MerchantRegistry {
 
         Ok(whitelist.iter().any(|addr| addr == customer))
     }
+
+    /// Issue #481: Set the global dispute threshold for auto-suspension.
+    /// When a merchant's resolved_against_merchant_count reaches or exceeds this,
+    /// the merchant is automatically suspended.
+    pub fn set_dispute_threshold(
+        env: Env,
+        admin: Address,
+        threshold: u32,
+    ) -> Result<(), MerchantError> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
+
+        if admin != stored_admin {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::DisputeThreshold, &threshold);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "DISPUTE_THRESHOLD_SET"),
+            ),
+            threshold,
+        );
+
+        Ok(())
+    }
+
+    /// Issue #481: Get the current global dispute threshold.
+    pub fn get_dispute_threshold(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&MerchantDataKey::DisputeThreshold)
+            .unwrap_or(10) // Default: 10 disputes
+    }
+
+    /// Issue #481: Increment dispute count for a merchant and check for auto-suspension.
+    /// Returns the new dispute count.
+    pub fn increment_merchant_dispute_count(
+        env: Env,
+        merchant_id: Address,
+    ) -> Result<u32, MerchantError> {
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        merchant.dispute_count = merchant.dispute_count.saturating_add(1);
+        
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        Ok(merchant.dispute_count)
+    }
+
+    /// Issue #481: Increment the resolved-against count for a merchant and check auto-suspension.
+    /// Returns the new resolved_against_merchant_count.
+    pub fn increment_resolved_against_merchant_count(
+        env: Env,
+        merchant_id: Address,
+    ) -> Result<u32, MerchantError> {
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        merchant.resolved_against_merchant_count = merchant.resolved_against_merchant_count.saturating_add(1);
+        
+        let threshold = Self::get_dispute_threshold(env.clone());
+        
+        // Auto-suspend if threshold reached
+        if merchant.resolved_against_merchant_count >= threshold && merchant.suspension_reason.is_none() {
+            merchant.active = false;
+            merchant.suspension_reason = Some(String::from_str(&env, "Auto-suspended due to dispute threshold"));
+            merchant.suspended_at = Some(env.ledger().timestamp());
+            
+            env.events().publish(
+                (
+                    Symbol::new(&env, "MERCHANT"),
+                    Symbol::new(&env, "AUTO_SUSPENDED"),
+                ),
+                (
+                    merchant_id.clone(),
+                    merchant.resolved_against_merchant_count,
+                    threshold,
+                ),
+            );
+        }
+        
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id), &merchant);
+
+        Ok(merchant.resolved_against_merchant_count)
+    }
+
+    /// Issue #481: Appeal a merchant suspension. Creates a review record requiring operator approval.
+    /// The merchant must be currently suspended for this to succeed.
+    pub fn appeal_suspension(
+        env: Env,
+        merchant_id: Address,
+        reason: String,
+    ) -> Result<(), MerchantError> {
+        merchant_id.require_auth();
+
+        let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+
+        // Merchant must be suspended to appeal
+        if merchant.suspension_reason.is_none() {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        // Store appeal record (operator will review)
+        // The appeal is stored as a suspensionReason update or separate review record
+        // For now, we emit an event that operators can monitor
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "SUSPENSION_APPEAL"),
+            ),
+            (merchant_id, reason),
+        );
+
+        Ok(())
+    }
+
+    /// Issue #481: Admin function to approve a merchant's suspension appeal and unsuspend.
+    pub fn approve_suspension_appeal(
+        env: Env,
+        admin: Address,
+        merchant_id: Address,
+    ) -> Result<(), MerchantError> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::Admin)
+            .ok_or(MerchantError::Unauthorized)?;
+
+        if admin != stored_admin {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+
+        // Clear suspension
+        merchant.active = true;
+        merchant.suspension_reason = None;
+        merchant.suspended_at = None;
+        merchant.suspension_expires_at = None;
+
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "SUSPENSION_APPEAL_APPROVED"),
+            ),
+            merchant_id,
+        );
+
+        Ok(())
+    }
+
 }

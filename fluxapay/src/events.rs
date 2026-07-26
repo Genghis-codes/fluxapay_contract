@@ -699,3 +699,38 @@ pub struct MerchantSuspensionAppealed {
     pub merchant_id: Address,
     pub reason: String,
 }
+
+// ============================================================================
+// Router & Session Events (Issue #437, Issue #435)
+// ============================================================================
+
+/// Emitted when a DEX router is added to the allowlist.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RouterAdded {
+    pub router: Address,
+}
+
+/// Emitted when a DEX router is removed from the allowlist.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RouterRemoved {
+    pub router: Address,
+}
+
+/// Emitted when a session key is registered.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SessionRegistered {
+    pub account: Address,
+    pub session_key: Address,
+    pub expires_at: u64,
+}
+
+/// Emitted when a session key is revoked.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SessionRevoked {
+    pub account: Address,
+    pub session_key: Address,
+}

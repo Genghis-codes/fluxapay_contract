@@ -741,19 +741,6 @@ fn test_vote_dispute_non_arbitrator_blocked() {
 const VALID_CID_V0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
 const VALID_CID_V1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
 
-fn setup_confirmed_payment_for_dispute<'a>(
-    env: &'a Env,
-    payment_id_text: &str,
-    amount: i128,
-) -> (
-    Address,
-    Address,
-    Address,
-    PaymentProcessorClient<'a>,
-    RefundManagerClient<'a>,
-    String,
-) {
-    let (admin, payment_client, refund_client) = setup_contracts(env);
 fn valid_evidence(env: &Env) -> String {
     String::from_str(env, "f000000000000000000000000000000000")
 }

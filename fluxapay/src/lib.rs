@@ -354,10 +354,12 @@ pub enum Error {
     DirectTransferNotDisputable = 54,
     /// Issue #482: Maximum retry chain depth (3) exceeded for payment retry.
     MaxRetriesExceeded = 54,
-    /// Issue #478: FX oracle rate deviation exceeds configured limit.
-    RateDeviationExceeded = 55,
     /// Issue #505: Invalid payment status transition attempted.
     InvalidStatusTransition = 54,
+    /// Issue #437: DEX router is not in the allowed routers list.
+    RouterNotAllowed = 56,
+    /// Issue #436: Aggregate route output is less than minimum output amount.
+    RouteOutputInsufficient = 57,
 }
 
 #[contracttype]
@@ -433,6 +435,15 @@ pub struct SwapAndPayArgs {
     pub oracle_pair: Option<Symbol>,
     /// Maximum allowed deviation from oracle price in basis points (100 = 1%).
     pub max_deviation_bps: u32,
+}
+
+/// Issue #436: Single route for multi-DEX route splitting / aggregation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapRoute {
+    pub router: Address,
+    pub path: Vec<Address>,
+    pub amount_in: i128,
 }
 
 #[contracttype]
@@ -916,6 +927,12 @@ pub enum DataKey {
     MetadataHashPayment(BytesN<32>),
     /// Issue #492: Customer profile keyed by (merchant_id, customer_id) for CRM features.
     CustomerProfile(Address, Address),
+    /// Issue #437: Allowlisted DEX router address
+    AllowedRouter(Address),
+    /// Issue #437: List of allowlisted DEX router addresses
+    AllowedRoutersList,
+    /// Issue #434: Wrapped XLM (WXLM) token contract address
+    WrappedXlmContract,
 }
 
 /// Default initial contract version string.
@@ -4283,6 +4300,8 @@ impl RefundManager {
         );
 
         Ok(refund_id)
+    }
+
     /// Admin override to reactivate a subscription that was cancelled due to max retries.
     /// Resets retry_count to 0 and reschedules the next payment.
     pub fn admin_reactivate_subscription(
@@ -4801,6 +4820,8 @@ impl PaymentProcessor {
             .persistent()
             .get(&DataKey::AutoRefundOverpayment)
             .unwrap_or(true)
+    }
+
     /// Return the accumulated treasury balance collected via settlement fees
     /// and platform fees (when no custom fee_recipient).
     pub fn set_min_payment_duration_secs(env: Env, admin: Address, min_secs: u64) -> Result<(), Error> {
@@ -6271,6 +6292,7 @@ impl PaymentProcessor {
         }
 
         // Issue #162: Merchant-configurable partial payment policy.
+        if new_status == PaymentStatus::PartiallyPaid {
             let partial_allowed = if let Some(registry_address) = env
                 .storage()
                 .persistent()
@@ -6501,6 +6523,7 @@ impl PaymentProcessor {
         );
 
         Ok(())
+    }
 
     /// Issue #482: Create a retry payment for an expired or failed original payment.
     /// Returns the payment_id of the newly created payment, linked to the original.
@@ -7732,12 +7755,115 @@ impl PaymentProcessor {
     ///
     /// # Returns
     /// The created PaymentCharge on success
+    /// Add a router address to the allowlist (issue #437).
+    pub fn add_router(env: Env, admin: Address, router: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::AllowedRouter(router.clone()), &true);
+
+        let mut list: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AllowedRoutersList)
+            .unwrap_or_else(|| Vec::new(&env));
+        if !list.contains(&router) {
+            list.push_back(router.clone());
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllowedRoutersList, &list);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "ROUTER"),
+                Symbol::new(&env, "ADDED"),
+            ),
+            router,
+        );
+        Ok(())
+    }
+
+    /// Remove a router address from the allowlist (issue #437).
+    pub fn remove_router(env: Env, admin: Address, router: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AllowedRouter(router.clone()));
+
+        if let Some(list) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<Address>>(&DataKey::AllowedRoutersList)
+        {
+            let mut new_list: Vec<Address> = Vec::new(&env);
+            for r in list.iter() {
+                if r != router {
+                    new_list.push_back(r);
+                }
+            }
+            env.storage()
+                .persistent()
+                .set(&DataKey::AllowedRoutersList, &new_list);
+        }
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "ROUTER"),
+                Symbol::new(&env, "REMOVED"),
+            ),
+            router,
+        );
+        Ok(())
+    }
+
+    /// Check if a DEX router is allowed (issue #437).
+    pub fn is_router_allowed(env: Env, router: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowedRouter(router))
+            .unwrap_or(false)
+    }
+
+    /// Get all allowlisted DEX router addresses (issue #437).
+    pub fn get_allowed_routers(env: Env) -> Vec<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AllowedRoutersList)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Set the Wrapped XLM (WXLM) token contract address (issue #434).
+    pub fn set_wrapped_xlm_contract(env: Env, admin: Address, wxlm: Address) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::WrappedXlmContract, &wxlm);
+        Ok(())
+    }
+
+    /// Get the Wrapped XLM (WXLM) token contract address (issue #434).
+    pub fn get_wrapped_xlm_contract(env: Env) -> Option<Address> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::WrappedXlmContract)
+    }
+
+    /// Swaps tokens via a DEX router and executes a payment (issue #434, #437).
     #[allow(clippy::too_many_arguments)]
     pub fn swap_and_pay(env: Env, args: SwapAndPayArgs) -> Result<PaymentCharge, Error> {
         args.payer.require_auth();
         Self::require_creation_not_paused(&env)?;
 
-        // Validate inputs
         if args.amount <= 0 || args.amount_in <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -7748,11 +7874,31 @@ impl PaymentProcessor {
             return Err(Error::SwapPathInvalid);
         }
 
-        // Issue #226: check path returns before executing the swap.
+        // Issue #437: DEX router allowlist check
+        let allowed_list = Self::get_allowed_routers(env.clone());
+        if !allowed_list.is_empty() && !Self::is_router_allowed(env.clone(), args.dex_router.clone()) {
+            return Err(Error::RouterNotAllowed);
+        }
+
+        // Issue #434: XLM auto-wrapping detection
+        let native_xlm = Address::from_str(&env, ZERO_CONTRACT_STRKEY);
+        let mut actual_token_in = args.token_in.clone();
+
+        if args.token_in == native_xlm {
+            if let Some(wxlm) = Self::get_wrapped_xlm_contract(env.clone()) {
+                token::Client::new(&env, &wxlm).transfer(
+                    &args.payer,
+                    &env.current_contract_address(),
+                    &args.amount_in,
+                );
+                actual_token_in = wxlm;
+            }
+        }
+
         let quoted_amounts = Self::validate_path_returns(
             &env,
             &args.dex_router,
-            &args.token_in,
+            &actual_token_in,
             args.amount_in,
             args.amount_out_min,
             &args.path,
@@ -7772,12 +7918,9 @@ impl PaymentProcessor {
             )?;
         }
 
-        // Execute atomic swap via DEX router
-        let deadline = env.ledger().timestamp().saturating_add(3_600); // 1 hour deadline
-
+        let deadline = env.ledger().timestamp().saturating_add(3_600);
         let dex_client = DexRouterClient::new(&env, &args.dex_router);
 
-        // Perform the swap - this transfers tokens from payer and sends output to deposit_address
         let swap_result = dex_client.swap_exact_tokens_for_tokens(
             &args.amount_in,
             &args.amount_out_min,
@@ -7800,11 +7943,10 @@ impl PaymentProcessor {
             return Err(Error::ArbitrageDetected);
         }
 
-        // Now create the payment with the swapped amount
         let settlement_token = args
             .path
             .get(args.path.len() - 1)
-            .unwrap_or(args.token_in.clone());
+            .unwrap_or(actual_token_in.clone());
         let create_args = CreatePaymentArgs {
             payment_id: args.payment_id.clone(),
             merchant_id: args.merchant_id,
@@ -7825,16 +7967,13 @@ impl PaymentProcessor {
 
         let mut payment = Self::create_payment(env.clone(), create_args)?;
 
-        // Issue #173: Store original token and swap path for refund routing
         payment.original_token = Some(args.token_in.clone());
         payment.swap_path = Some(args.path.clone());
-        
-        // Persist updated payment with swap info
+
         env.storage()
             .persistent()
             .set(&DataKey::Payment(payment.payment_id.clone()), &payment);
 
-        // Emit SWAP/AND/PAY event
         env.events().publish(
             (
                 Symbol::new(&env, "SWAP"),
@@ -7849,6 +7988,109 @@ impl PaymentProcessor {
                 args.amount,
             ),
         );
+        Ok(payment)
+    }
+
+    /// Issue #436: Multi-DEX route splitting / aggregation.
+    pub fn swap_and_pay_multi_route(
+        env: Env,
+        args: SwapAndPayArgs,
+        routes: Vec<SwapRoute>,
+        min_output_amount: i128,
+    ) -> Result<PaymentCharge, Error> {
+        args.payer.require_auth();
+        Self::require_creation_not_paused(&env)?;
+
+        if args.amount <= 0 || routes.is_empty() {
+            return Err(Error::InvalidAmount);
+        }
+
+        let allowed_list = Self::get_allowed_routers(env.clone());
+        let mut total_route_input: i128 = 0;
+
+        for route in routes.iter() {
+            if route.amount_in <= 0 || route.path.is_empty() {
+                return Err(Error::InvalidAmount);
+            }
+            total_route_input = total_route_input.saturating_add(route.amount_in);
+            if !allowed_list.is_empty() && !Self::is_router_allowed(env.clone(), route.router.clone()) {
+                return Err(Error::RouterNotAllowed);
+            }
+        }
+
+        if total_route_input != args.amount_in {
+            return Err(Error::InvalidAmount);
+        }
+
+        let deadline = env.ledger().timestamp().saturating_add(3_600);
+        let mut total_output: i128 = 0;
+
+        for route in routes.iter() {
+            let dex_client = DexRouterClient::new(&env, &route.router);
+            let swap_result = dex_client.swap_exact_tokens_for_tokens(
+                &route.amount_in,
+                &0,
+                &route.path,
+                &args.deposit_address,
+                &deadline,
+            );
+            let route_out = swap_result
+                .get(route.path.len() - 1)
+                .ok_or(Error::SwapPathInvalid)?;
+            total_output = total_output.saturating_add(route_out);
+        }
+
+        if total_output < min_output_amount {
+            return Err(Error::RouteOutputInsufficient);
+        }
+
+        let first_route = routes.get(0).unwrap();
+        let settlement_token = first_route
+            .path
+            .get(first_route.path.len() - 1)
+            .unwrap_or(args.token_in.clone());
+
+        let create_args = CreatePaymentArgs {
+            payment_id: args.payment_id.clone(),
+            merchant_id: args.merchant_id,
+            payer: None,
+            amount: args.amount,
+            currency: args.currency,
+            deposit_address: args.deposit_address,
+            expires_at: args.expires_at,
+            duration_secs: None,
+            memo: None,
+            memo_type: None,
+            token_address: Some(settlement_token),
+            client_token: None,
+            metadata_hash: None,
+            metadata: None,
+            fee_waiver_code: None,
+        };
+
+        let mut payment = Self::create_payment(env.clone(), create_args)?;
+        payment.original_token = Some(args.token_in.clone());
+        payment.swap_path = Some(args.path);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Payment(payment.payment_id.clone()), &payment);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "SWAP"),
+                Symbol::new(&env, "AND"),
+                Symbol::new(&env, "PAY"),
+            ),
+            (
+                args.payment_id,
+                args.payer,
+                args.amount_in,
+                args.token_in,
+                args.amount,
+            ),
+        );
+
         Ok(payment)
     }
 
@@ -8102,7 +8344,8 @@ impl PaymentProcessor {
         }
 
         result
-    
+    }
+
     /// Issue #487: Query aggregate analytics for a merchant over a time range.
     /// Returns total_payments, confirmed_payments, failed_payments, total_volume,
     /// avg_payment_amount, dispute_count, refund_count, net_settled_volume.
@@ -8170,7 +8413,6 @@ impl PaymentProcessor {
             net_settled_volume,
         }
     }
-}
 
     /// Issue #399: Remove the idempotency key associated with a payment so the
     /// client_token can be reused after expiry or cancellation.
@@ -8871,8 +9113,6 @@ impl PaymentProcessor {
             .get::<DataKey, Vec<String>>(&DataKey::MerchantInvoices(merchant_id.clone()))
             .unwrap_or_else(|| Vec::new(env))
     }
-
-}
 
 /// Bumps the version string by incrementing the number after the last '.'.
 /// Works with versions like "1.0.0" → "1.0.1", "1" → "2", "v1" → "v2".

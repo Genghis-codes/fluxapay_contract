@@ -84,9 +84,6 @@ pub struct PaymentStream {
     /// When false, distributions (withdrawals) are locked until the sender
     /// explicitly approves milestones for this stream.
     pub milestones_approved: bool,
-    /// Floor for [`PaymentStreaming::decrease_rate_per_second`]; defaults to
-    /// `0` (no minimum) unless set via `set_stream_min_rate`.
-    pub min_rate_per_second: i128,
 }
 
 /// Storage key for a [`PaymentStream`].
@@ -323,8 +320,6 @@ impl PaymentStreaming {
             accrued_at_checkpoint: 0,
             status: StreamStatus::Active,
             milestones_approved: false,
-            min_rate_per_second: 0,
-            milestones_approved: true,
         };
 
         // Persist state before interaction (reentrancy protection)
@@ -540,7 +535,6 @@ impl PaymentStreaming {
             return Err(StreamError::RateNotDecreased);
         }
         if new_rate < stream.min_rate_per_second {
-            return Err(StreamError::InvalidRate);
             return Err(StreamError::RateBelowMinimum);
         }
 

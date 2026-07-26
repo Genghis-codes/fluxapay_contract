@@ -311,67 +311,65 @@ pub enum Error {
     /// Refund policy requires a receipt_hash but none was provided (Issue #176).
     MissingReceiptHash = 35,
     /// Refund's `expiry_at` deadline has passed (Issue #170).
-    RefundExpired = 34,
+    RefundExpired = 36,
     /// Arbitrator has already cast a vote on this dispute.
-    AlreadyVoted = 35,
+    AlreadyVoted = 37,
     /// Merchant has exceeded their KYC tier monthly processing volume cap.
-    TierVolumeLimitExceeded = 34,
+    TierVolumeLimitExceeded = 38,
     /// Refund requested before cooldown period elapsed.
     RefundCooldownNotElapsed = 42,
-    /// Refund request has expired and cannot be processed.
-    RefundExpired = 36,
     /// Batch payment request exceeds the supported maximum size.
-    BatchTooLarge = 35,
+    BatchTooLarge = 39,
     /// Insufficient arbitrators available for voting.
-    InsufficientArbitrators = 37,
+    InsufficientArbitrators = 40,
     /// Voting threshold not met for dispute resolution.
-    ArbitrationVotingThresholdNotMet = 38,
+    ArbitrationVotingThresholdNotMet = 41,
     /// Fee proposal has not matured for the required 7 days.
-    FeeProposalNotReady = 39,
+    FeeProposalNotReady = 43,
     /// No active fee proposal found.
     NoFeeProposal = 44,
     /// Issue #180: Evidence field is not a valid IPFS multihash (CIDv0/CIDv1).
-    InvalidEvidenceFormat = 40,
+    InvalidEvidenceFormat = 45,
     /// Dispute creation rate limit exceeded (per-payer open cap or global hourly cap).
-    DisputeRateLimitExceeded = 54,
+    DisputeRateLimitExceeded = 46,
     /// Issue #185: One or both collaborative settlement signatures are invalid.
-    InvalidSettlementSignature = 41,
+    InvalidSettlementSignature = 47,
     /// Issue #303: FX oracle rate is stale or unavailable.
-    StaleOracleRate = 45,
+    StaleOracleRate = 48,
     /// Issue #476: Payment link has expired.
-    LinkExpired = 46,
+    LinkExpired = 49,
     /// Issue #313: Reentrancy detected in process_refund_internal or settle_payment.
-    Reentrancy = 43,
+    Reentrancy = 50,
     /// Upgrade failed — WASM hash replacement rejected by the host.
-    UpgradeFailed = 48,
+    UpgradeFailed = 51,
     /// Treasury balance is smaller than the requested withdrawal amount.
-    InsufficientTreasuryBalance = 46,
+    InsufficientTreasuryBalance = 52,
     /// Metadata map has too many keys (> 20).
-    MetadataTooLarge = 49,
+    MetadataTooLarge = 53,
     /// A metadata value exceeds maximum length (> 256 chars).
-    MetadataValueTooLong = 47,
+    MetadataValueTooLong = 54,
     /// Issue #397: memo_type is not one of: Text, Id, Hash, Return.
-    InvalidMemoType = 50,
+    InvalidMemoType = 55,
     /// Issue #397: Text memo exceeds the 28-byte Stellar limit.
-    MemoTooLong = 51,
+    MemoTooLong = 56,
     /// Issue #397: Id memo is not parseable as a u64.
-    InvalidMemoId = 52,
+    InvalidMemoId = 57,
     /// Issue #516: Payer address is not on the merchant's customer whitelist.
-    PayerNotWhitelisted = 53,
+    PayerNotWhitelisted = 58,
     /// Payment link has reached its configured max_uses limit.
-    LinkMaxUsesReached = 54,
+    LinkMaxUsesReached = 59,
     /// Issue #485: Payment was created via a direct_transfer link and disputes are not allowed.
-    DirectTransferNotDisputable = 54,
+    DirectTransferNotDisputable = 60,
     /// Issue #482: Maximum retry chain depth (3) exceeded for payment retry.
-    MaxRetriesExceeded = 54,
+    MaxRetriesExceeded = 61,
     /// Issue #505: Invalid payment status transition attempted.
-    InvalidStatusTransition = 54,
+    InvalidStatusTransition = 62,
     /// Issue #450: Customer called `claim_refund` before an operator approved it.
-    RefundNotApproved = 56,
+    RefundNotApproved = 63,
     /// Issue #437: DEX router is not in the allowed routers list.
-    RouterNotAllowed = 56,
+    RouterNotAllowed = 64,
     /// Issue #436: Aggregate route output is less than minimum output amount.
-    RouteOutputInsufficient = 57,
+    RouteOutputInsufficient = 65,
 }
 
 #[contracttype]
@@ -544,6 +542,8 @@ pub enum ArbitratorVoteChoice {
 pub struct ArbitratorVoteTally {
     pub approve_count: u32,
     pub reject_count: u32,
+}
+
 /// Record of a single admin treasury withdrawal.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1213,33 +1213,9 @@ impl RefundManager {
             .get::<DataKey, bool>(&DataKey::Blacklisted(address.clone()))
             .unwrap_or(false)
         {
-            let payment = PaymentCharge {
-                payment_id: payment_id.clone(),
-                merchant_id,
-                amount,
-                currency,
-                deposit_address: env.current_contract_address(),
-                status: PaymentStatus::Confirmed,
-                payer_address: None,
-                transaction_hash: None,
-                created_at: env.ledger().timestamp(),
-                confirmed_at: None,
-                expires_at: 0,
-                amount_received: None,
-                memo: None,
-                memo_type: None,
-                token_address: None,
-                metadata_hash: None,
-                fx_rate: None,
-                fx_rate_at: None,
-                original_token: None,
-                swap_path: None,
-            };
-            env.storage()
-                .persistent()
-                .set(&DataKey::Payment(payment_id.clone()), &payment);
-            Self::bump_payment_ttl(&env, &payment_id, &payment.status);
+            return Err(Error::Unauthorized);
         }
+        Ok(())
     }
 
     /// Like `register_payment`, but also records the original token and swap
@@ -1254,7 +1230,7 @@ impl RefundManager {
         currency: Symbol,
         original_token: Address,
         swap_path: Vec<Address>,
-    ) {
+    ) -> Result<(), Error> {
         if !env
             .storage()
             .persistent()
@@ -1286,7 +1262,6 @@ impl RefundManager {
                 .persistent()
                 .set(&DataKey::Payment(payment_id.clone()), &payment);
             Self::bump_payment_ttl(&env, &payment_id, &payment.status);
-            return Err(Error::Unauthorized);
         }
         Ok(())
     }
@@ -1296,15 +1271,6 @@ impl RefundManager {
     /// `treasury_bps + developer_bps` must be ≤ 10 000; any remainder goes to treasury.
     pub fn configure_fee_split(
         env: Env,
-        payment_id: String,
-        refund_amount: i128,
-        reason: String,
-        requester: Address,
-        receipt_hash: Option<BytesN<32>>,
-    ) -> Result<String, Error> {
-        requester.require_auth();
-        Self::create_refund_internal(&env, payment_id, refund_amount, reason, requester, receipt_hash)
-    }
         admin: Address,
         treasury_bps: u32,
         developer_bps: u32,
@@ -1804,7 +1770,7 @@ impl RefundManager {
             .unwrap_or(false);
         if require_receipt_hash && refund.receipt_hash.is_none() {
             return Err(Error::MissingReceiptHash);
-        if env.ledger().timestamp() > refund.expiry_at {
+        }
         // Issue #170: Check refund expiration
         let now = env.ledger().timestamp();
         if now > refund.expiry_at {
@@ -1954,10 +1920,6 @@ impl RefundManager {
         // Interaction: Transfer net amount to requester (in USDC, unless already
         // routed back to the original token via the DEX above).
         if !routed_via_dex && token_client.try_transfer(&from, &to, &net_amount).is_err() {
-            // If transfer fails, we currently return Ok(()) but state is already updated.
-            // In a more robust system we might want to revert or handle failures differently.
-        // Interaction: Transfer net amount to requester
-        if token_client.try_transfer(&from, &to, &refund_amount_final).is_err() {
             return Ok(());
         }
 
@@ -2023,10 +1985,6 @@ impl RefundManager {
     /// payment's refundable balance. Callable by the same roles as
     /// `process_refund`/`reject_refund`.
     pub fn expire_refund(env: Env, operator: Address, refund_id: String) -> Result<(), Error> {
-    /// Issue #171: Approve a pending refund, allowing customer to claim it.
-    /// Operator marks the refund as approved without processing it immediately.
-    /// Customer can then call process_refund to claim the approved refund.
-    pub fn approve_refund(env: Env, operator: Address, refund_id: String) -> Result<(), Error> {
         operator.require_auth();
         let has_settlement =
             AccessControl::has_role(&env, &role_settlement_operator(&env), &operator);
@@ -2048,7 +2006,6 @@ impl RefundManager {
 
         refund.status = RefundStatus::Rejected;
         refund.processed_at = Some(env.ledger().timestamp());
-        refund.approved = true;
 
         env.storage()
             .persistent()
@@ -2057,6 +2014,39 @@ impl RefundManager {
 
         env.events().publish(
             (Symbol::new(&env, "REFUND"), Symbol::new(&env, "EXPIRED")),
+            (refund.payment_id, refund_id, refund.amount),
+        );
+
+        Ok(())
+    }
+
+    /// Issue #171: Approve a pending refund, allowing customer to claim it.
+    /// Operator marks the refund as approved without processing it immediately.
+    /// Customer can then call process_refund to claim the approved refund.
+    pub fn approve_refund(env: Env, operator: Address, refund_id: String) -> Result<(), Error> {
+        operator.require_auth();
+        let has_settlement =
+            AccessControl::has_role(&env, &role_settlement_operator(&env), &operator);
+        let has_oracle = AccessControl::has_role(&env, &role_oracle(&env), &operator);
+
+        if !has_settlement && !has_oracle {
+            return Err(Error::Unauthorized);
+        }
+
+        let mut refund = Self::get_refund_internal(&env, &refund_id)?;
+
+        if refund.status != RefundStatus::Pending {
+            return Err(Error::RefundAlreadyProcessed);
+        }
+
+        refund.approved = true;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Refund(refund_id.clone()), &refund);
+        Self::bump_refund_ttl(&env, &refund_id, &refund.status);
+
+        env.events().publish(
             (Symbol::new(&env, "REFUND"), Symbol::new(&env, "APPROVED")),
             (refund.payment_id, refund_id, refund.amount),
         );
@@ -2088,6 +2078,7 @@ impl RefundManager {
         }
 
         Self::process_refund_internal(&env, &requester, refund_id)
+    }
     /// Admin-configurable refund expiry window in seconds (Issue #170).
     /// Applies to refunds created after this call.
     pub fn set_refund_expiry(env: Env, admin: Address, secs: u64) -> Result<(), Error> {
@@ -2447,18 +2438,25 @@ impl RefundManager {
         let token_client = token::TokenClient::new(&env, &usdc_token_address);
         let contract_address = env.current_contract_address();
 
+        let bond_amount = Self::get_dispute_bond_amount(env.clone());
+
         if token_client
-            .try_transfer(&disputer, &contract_address, &DISPUTE_BOND_AMOUNT)
+            .try_transfer(&disputer, &contract_address, &bond_amount)
             .is_err()
         {
             return Err(Error::Unauthorized);
         }
         if token_client
-            .try_transfer(&payment.merchant_id, &contract_address, &DISPUTE_BOND_AMOUNT)
+            .try_transfer(&payment.merchant_id, &contract_address, &bond_amount)
             .is_err()
         {
             return Err(Error::Unauthorized);
         }
+
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "BOND_COLLECTED")),
+            (disputer.clone(), bond_amount),
+        );
 
         // Sum open disputes + prior refunds for the same payment_id
         let existing_disputes = Self::get_payment_disputes_internal(&env, &payment_id);
@@ -2514,7 +2512,6 @@ impl RefundManager {
             escalated: false,
             payout_splits: Vec::new(&env),
             computed_deadline_secs: Some(deadline_secs),
-            payout_splits,
         };
 
         env.storage()
@@ -3074,19 +3071,25 @@ impl RefundManager {
         let token_client = token::TokenClient::new(&env, &usdc_token_address);
         let contract_address = env.current_contract_address();
         let collector = AccessControl::get_admin(&env).unwrap_or_else(|| contract_address.clone());
+        let bond_amount = Self::get_dispute_bond_amount(env.clone());
 
         if token_client
-            .try_transfer(&contract_address, &dispute.disputer, &DISPUTE_BOND_AMOUNT)
+            .try_transfer(&contract_address, &dispute.disputer, &bond_amount)
             .is_err()
         {
             return Err(Error::Unauthorized);
         }
         if token_client
-            .try_transfer(&contract_address, &collector, &DISPUTE_BOND_AMOUNT)
+            .try_transfer(&contract_address, &collector, &bond_amount)
             .is_err()
         {
             return Err(Error::Unauthorized);
         }
+
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "BOND_RETURNED")),
+            (dispute.disputer.clone(), bond_amount),
+        );
 
         // Emit DISPUTE_RESOLVED event
         env.events().publish(
@@ -3120,48 +3123,28 @@ impl RefundManager {
             return Err(Error::DisputeAlreadyResolved);
         }
 
-        let now = env.ledger().timestamp();
-
-        // Persist operator note on-chain for full transparency.
-        let note = DisputeOperatorNote {
-            dispute_id: dispute_id.clone(),
-            operator: operator.clone(),
-            resolution_notes: resolution_notes.clone(),
-            operator_signature: operator_signature.clone(),
-            recorded_at: now,
-        };
-        env.storage()
-            .persistent()
-            .set(&DataKey::DisputeOperatorNote(dispute_id.clone()), &note);
-        Self::bump_ttl(
-            &env,
-            &DataKey::DisputeOperatorNote(dispute_id.clone()),
-            LONG_LIVE_TTL,
-        );
-
-        // Emit full note + signature so off-chain indexers have the complete record.
-        env.events().publish(
-            (
-                Symbol::new(&env, "DISPUTE"),
-                Symbol::new(&env, "OPERATOR_NOTE"),
-            ),
-            (
-                dispute_id.clone(),
-                operator.clone(),
-                resolution_notes.clone(),
-                operator_signature,
-            ),
-        );
-
-        // Effects before bond interactions.
         dispute.status = DisputeStatus::Rejected;
-        dispute.resolved_at = Some(now);
-        dispute.resolution_notes = Some(resolution_notes);
+        dispute.resolved_at = Some(env.ledger().timestamp());
+        dispute.resolution_notes = Some(resolution_notes.clone());
 
         env.storage()
             .persistent()
             .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+
+        // Store resolution note for record-keeping
+        let note = DisputeOperatorNote {
+            dispute_id: dispute_id.clone(),
+            operator: operator.clone(),
+            resolution_notes: resolution_notes.clone(),
+            operator_signature,
+            recorded_at: env.ledger().timestamp(),
+        };
+        env.storage().persistent().set(
+            &DataKey::DisputeOperatorNote(dispute_id.clone()),
+            &note,
+        );
+
         Self::release_open_dispute_slot(&env, &dispute.disputer);
 
         let usdc_token_address = env
@@ -3173,18 +3156,25 @@ impl RefundManager {
         let contract_address = env.current_contract_address();
         let collector = AccessControl::get_admin(&env).unwrap_or_else(|| contract_address.clone());
 
+        let bond_amount = Self::get_dispute_bond_amount(env.clone());
+
         if token_client
-            .try_transfer(&contract_address, &dispute.merchant_id, &DISPUTE_BOND_AMOUNT)
+            .try_transfer(&contract_address, &dispute.merchant_id, &bond_amount)
             .is_err()
         {
             return Err(Error::Unauthorized);
         }
         if token_client
-            .try_transfer(&contract_address, &collector, &DISPUTE_BOND_AMOUNT)
+            .try_transfer(&contract_address, &collector, &bond_amount)
             .is_err()
         {
             return Err(Error::Unauthorized);
         }
+
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "BOND_FORFEITED")),
+            (dispute.disputer.clone(), dispute.merchant_id.clone(), bond_amount),
+        );
 
         // Emit DISPUTE_REJECTED event
         env.events().publish(
@@ -5083,6 +5073,18 @@ impl PaymentProcessor {
     /// Admin: configure the FX oracle used to snapshot rates during
     /// `verify_payment` (Issue #304).
     pub fn set_fx_oracle(env: Env, admin: Address, fx_oracle: Address) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::FxOracleAddress, &fx_oracle);
+        Ok(())
+    }
+
     /// Set the settlement fee rate (in basis points) deducted from each payment
     /// during `settle_payment` and accumulated in `TreasuryBalance`.
     ///
@@ -5097,10 +5099,6 @@ impl PaymentProcessor {
         if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
             return Err(Error::Unauthorized);
         }
-
-        env.storage()
-            .persistent()
-            .set(&DataKey::FxOracleAddress, &fx_oracle);
         if bps < 0 || bps > 10_000 {
             return Err(Error::InvalidAmount);
         }
@@ -6616,6 +6614,7 @@ impl PaymentProcessor {
             PaymentStatus::Overpaid => Symbol::new(&env, "OVERPAID"),
             PaymentStatus::PartiallyPaid => Symbol::new(&env, "PARTIALLY_PAID"),
             _ => Symbol::new(&env, "FAILED"),
+        };
         let overpaid_refund_amount = if new_status == PaymentStatus::Overpaid {
             Some(amount_received.saturating_sub(payment.amount))
         } else {

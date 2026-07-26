@@ -244,6 +244,34 @@ pub struct ArbitratorVote {
     pub vote: String,
 }
 
+/// Emitted when a dispute bond is collected.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DisputeBondCollected {
+    pub dispute_id: String,
+    pub disputer: Address,
+    pub amount: i128,
+}
+
+/// Emitted when a dispute bond is returned.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DisputeBondReturned {
+    pub dispute_id: String,
+    pub disputer: Address,
+    pub amount: i128,
+}
+
+/// Emitted when a dispute bond is forfeited.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DisputeBondForfeited {
+    pub dispute_id: String,
+    pub disputer: Address,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
 // ============================================================================
 // Subscription Events
 // ============================================================================

@@ -3073,6 +3073,41 @@ fn test_process_refund_reentrancy_lock_cleared() {
 }
 
 #[test]
+fn test_process_refund_same_id_only_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_concurrent_refund");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+
+    let refund_id = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "once"),
+        &requester,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+
+    client.process_refund(&operator, &refund_id);
+    let second = client.try_process_refund(&operator, &refund_id);
+    assert!(second.is_err());
+
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Completed);
+}
+
+#[test]
 fn test_settle_payment_reentrancy_guard_normal_flow() {
     let env = Env::default();
     env.mock_all_auths();

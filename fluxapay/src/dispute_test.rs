@@ -22,6 +22,9 @@ fn setup_contracts(env: &Env) -> (Address, PaymentProcessorClient<'_>, RefundMan
     let token_admin_client = token::StellarAssetClient::new(env, &usdc_token);
     token_admin_client.mint(&refund_manager, &1_000_000_000_000i128);
 
+    // Existing suite uses free-form evidence; CID enforcement is covered by dedicated tests.
+    refund_client.set_require_evidence_cid(&admin, &false);
+
     payment_client.initialize_payment_processor(&admin);
 
     (admin, payment_client, refund_client)
@@ -598,6 +601,22 @@ fn test_resolve_dispute_with_only_operator_auth() {
     assert_eq!(refund.status, RefundStatus::Completed);
 }
 
+const VALID_CID_V0: &str = "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG";
+const VALID_CID_V1: &str = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi";
+
+fn setup_confirmed_payment_for_dispute<'a>(
+    env: &'a Env,
+    payment_id_text: &str,
+    amount: i128,
+) -> (
+    Address,
+    Address,
+    Address,
+    PaymentProcessorClient<'a>,
+    RefundManagerClient<'a>,
+    String,
+) {
+    let (admin, payment_client, refund_client) = setup_contracts(env);
 fn valid_evidence(env: &Env) -> String {
     String::from_str(env, "f000000000000000000000000000000000")
 }
@@ -614,15 +633,15 @@ fn setup_confirmed_payment_for_dispute(
     let customer = Address::generate(env);
     let payment_id = String::from_str(env, payment_id_text);
 
-    payment_client.grant_role(admin, &Symbol::new(env, "MERCHANT"), &merchant);
+    payment_client.grant_role(&admin, &Symbol::new(env, "MERCHANT"), &merchant);
     payment_client.create_payment(&create_payment_args(env, &payment_id, &merchant, amount));
 
     let oracle = Address::generate(env);
-    payment_client.grant_role(admin, &Symbol::new(env, "ORACLE"), &oracle);
+    payment_client.grant_role(&admin, &Symbol::new(env, "ORACLE"), &oracle);
     payment_client.verify_payment(
         &oracle,
         &payment_id,
-        &BytesN::from_array(env, &[9u8; 32]),
+        &BytesN::from_array(env, &[7u8; 32]),
         &customer,
         &amount,
     );
@@ -634,6 +653,251 @@ fn setup_confirmed_payment_for_dispute(
             .unwrap()
     });
     let token_admin_client = token::StellarAssetClient::new(env, &token_address);
+    token_admin_client.mint(&customer, &10_000_000);
+    token_admin_client.mint(&merchant, &10_000_000);
+
+    refund_client.register_payment(&payment_id, &merchant, &amount, &Symbol::new(env, "USDC"));
+
+    (admin, merchant, customer, payment_client, refund_client, payment_id)
+}
+
+#[test]
+fn test_dispute_rate_limit_sixth_open_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, _merchant, customer, payment_client, refund_client, _) =
+        setup_confirmed_payment_for_dispute(&env, "rl_base", 100i128);
+    // Raise global hourly so we only hit the per-payer open cap.
+    refund_client.set_dispute_rate_limits(&admin, &5u32, &1000u32);
+
+    for i in 0..5u32 {
+        let pid = match i {
+            0 => String::from_str(&env, "rl_pay_0"),
+            1 => String::from_str(&env, "rl_pay_1"),
+            2 => String::from_str(&env, "rl_pay_2"),
+            3 => String::from_str(&env, "rl_pay_3"),
+            _ => String::from_str(&env, "rl_pay_4"),
+        };
+        let amount = 100i128;
+        let merchant = Address::generate(&env);
+        payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+        payment_client.create_payment(&create_payment_args(&env, &pid, &merchant, amount));
+        let oracle = Address::generate(&env);
+        payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+        payment_client.verify_payment(
+            &oracle,
+            &pid,
+            &BytesN::from_array(&env, &[(i + 1) as u8; 32]),
+            &customer,
+            &amount,
+        );
+        let token_address = env.as_contract(&refund_client.address, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::UsdcToken)
+                .unwrap()
+        });
+        token::StellarAssetClient::new(&env, &token_address).mint(&merchant, &100_000);
+        refund_client.register_payment(&pid, &merchant, &amount, &Symbol::new(&env, "USDC"));
+        refund_client.create_dispute(
+            &pid,
+            &amount,
+            &String::from_str(&env, "reason"),
+            &String::from_str(&env, VALID_CID_V0),
+            &customer,
+            &vec![&env],
+        );
+    }
+
+    let pid6 = String::from_str(&env, "rl_pay_5");
+    let amount = 100i128;
+    let merchant = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+    payment_client.create_payment(&create_payment_args(&env, &pid6, &merchant, amount));
+    let oracle = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+    payment_client.verify_payment(
+        &oracle,
+        &pid6,
+        &BytesN::from_array(&env, &[9u8; 32]),
+        &customer,
+        &amount,
+    );
+    let token_address = env.as_contract(&refund_client.address, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .unwrap()
+    });
+    token::StellarAssetClient::new(&env, &token_address).mint(&merchant, &100_000);
+    refund_client.register_payment(&pid6, &merchant, &amount, &Symbol::new(&env, "USDC"));
+
+    let result = refund_client.try_create_dispute(
+        &pid6,
+        &amount,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V0),
+        &customer,
+        &vec![&env],
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_dispute_global_hourly_rate_limit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (admin, _m, customer, payment_client, refund_client, _) =
+        setup_confirmed_payment_for_dispute(&env, "g_base", 100i128);
+    refund_client.set_dispute_rate_limits(&admin, &50u32, &2u32);
+
+    for i in 0..2u32 {
+        let pid = if i == 0 {
+            String::from_str(&env, "g_pay_0")
+        } else {
+            String::from_str(&env, "g_pay_1")
+        };
+        let amount = 100i128;
+        let merchant = Address::generate(&env);
+        payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+        payment_client.create_payment(&create_payment_args(&env, &pid, &merchant, amount));
+        let oracle = Address::generate(&env);
+        payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+        payment_client.verify_payment(
+            &oracle,
+            &pid,
+            &BytesN::from_array(&env, &[(i + 1) as u8; 32]),
+            &customer,
+            &amount,
+        );
+        let token_address = env.as_contract(&refund_client.address, || {
+            env.storage()
+                .persistent()
+                .get::<DataKey, Address>(&DataKey::UsdcToken)
+                .unwrap()
+        });
+        token::StellarAssetClient::new(&env, &token_address).mint(&merchant, &100_000);
+        refund_client.register_payment(&pid, &merchant, &amount, &Symbol::new(&env, "USDC"));
+        refund_client.create_dispute(
+            &pid,
+            &amount,
+            &String::from_str(&env, "reason"),
+            &String::from_str(&env, VALID_CID_V1),
+            &customer,
+            &vec![&env],
+        );
+    }
+
+    let pid3 = String::from_str(&env, "g_pay_2");
+    let amount = 100i128;
+    let merchant = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+    payment_client.create_payment(&create_payment_args(&env, &pid3, &merchant, amount));
+    let oracle = Address::generate(&env);
+    payment_client.grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+    payment_client.verify_payment(
+        &oracle,
+        &pid3,
+        &BytesN::from_array(&env, &[3u8; 32]),
+        &customer,
+        &amount,
+    );
+    let token_address = env.as_contract(&refund_client.address, || {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .unwrap()
+    });
+    token::StellarAssetClient::new(&env, &token_address).mint(&merchant, &100_000);
+    refund_client.register_payment(&pid3, &merchant, &amount, &Symbol::new(&env, "USDC"));
+
+    let result = refund_client.try_create_dispute(
+        &pid3,
+        &amount,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V1),
+        &customer,
+        &vec![&env],
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_dispute_evidence_valid_cid_v0() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _, customer, _, refund_client, payment_id) =
+        setup_confirmed_payment_for_dispute(&env, "ev_v0", 1000i128);
+    refund_client.set_require_evidence_cid(&admin, &true);
+
+    let dispute_id = refund_client.create_dispute(
+        &payment_id,
+        &500i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V0),
+        &customer,
+        &vec![&env],
+    );
+    assert!(!dispute_id.is_empty());
+}
+
+#[test]
+fn test_create_dispute_evidence_valid_cid_v1() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _, customer, _, refund_client, payment_id) =
+        setup_confirmed_payment_for_dispute(&env, "ev_v1", 1000i128);
+    refund_client.set_require_evidence_cid(&admin, &true);
+
+    let dispute_id = refund_client.create_dispute(
+        &payment_id,
+        &500i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, VALID_CID_V1),
+        &customer,
+        &vec![&env],
+    );
+    assert!(!dispute_id.is_empty());
+}
+
+#[test]
+fn test_create_dispute_evidence_invalid_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _, customer, _, refund_client, payment_id) =
+        setup_confirmed_payment_for_dispute(&env, "ev_bad", 1000i128);
+    refund_client.set_require_evidence_cid(&admin, &true);
+
+    let result = refund_client.try_create_dispute(
+        &payment_id,
+        &500i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, "not-a-cid"),
+        &customer,
+        &vec![&env],
+    );
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_create_dispute_evidence_empty_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, _, customer, _, refund_client, payment_id) =
+        setup_confirmed_payment_for_dispute(&env, "ev_empty", 1000i128);
+    refund_client.set_require_evidence_cid(&admin, &true);
+
+    let dispute_id = refund_client.create_dispute(
+        &payment_id,
+        &500i128,
+        &String::from_str(&env, "reason"),
+        &String::from_str(&env, ""),
+        &customer,
+        &vec![&env],
+    );
+    assert!(!dispute_id.is_empty());
     token_admin_client.mint(&customer, &1_000_000);
     token_admin_client.mint(&merchant, &1_000_000);
 

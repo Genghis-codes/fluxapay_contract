@@ -306,8 +306,10 @@ pub enum Error {
     FeeProposalNotReady = 39,
     /// No active fee proposal found.
     NoFeeProposal = 44,
-    /// Issue #180: Evidence field is not a valid IPFS multihash.
-    InvalidEvidence = 40,
+    /// Issue #180: Evidence field is not a valid IPFS multihash (CIDv0/CIDv1).
+    InvalidEvidenceFormat = 40,
+    /// Dispute creation rate limit exceeded (per-payer open cap or global hourly cap).
+    DisputeRateLimitExceeded = 54,
     /// Issue #185: One or both collaborative settlement signatures are invalid.
     InvalidSettlementSignature = 41,
     /// Issue #303: FX oracle rate is stale or unavailable.
@@ -711,6 +713,46 @@ impl<'a> Drop for ReentrancyGuard<'a> {
     }
 }
 
+/// Per-refund reentrancy lock cleared on drop (checks-effects-interactions).
+struct RefundLockGuard<'a> {
+    env: &'a Env,
+    refund_id: String,
+}
+
+impl<'a> Drop for RefundLockGuard<'a> {
+    fn drop(&mut self) {
+        self.env
+            .storage()
+            .persistent()
+            .remove(&DataKey::RefundLock(self.refund_id.clone()));
+    }
+}
+
+/// Admin-configurable dispute creation rate limits.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRateLimitConfig {
+    /// Max open (Open + UnderReview) disputes per disputer address.
+    pub per_payer_open: u32,
+    /// Max dispute creations per rolling hour across all disputers.
+    pub global_per_hour: u32,
+}
+
+/// Fixed-window counter for global dispute creation rate limiting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeCreationRateState {
+    pub window_started_at: u64,
+    pub count: u32,
+}
+
+/// Default: max 5 open disputes per payer.
+pub const DEFAULT_DISPUTE_PER_PAYER_OPEN: u32 = 5;
+/// Default: max 100 dispute creations per hour globally.
+pub const DEFAULT_DISPUTE_GLOBAL_PER_HOUR: u32 = 100;
+/// Global dispute creation window length (1 hour).
+pub const DISPUTE_GLOBAL_WINDOW_SECS: u64 = 3600;
+
 #[contracttype]
 pub enum DataKey {
     Payment(String),
@@ -779,6 +821,16 @@ pub enum DataKey {
     SubscriptionTickCounter,
     /// Issue #313: Reentrancy lock for process_refund_internal and settle_payment.
     ReentrancyLock,
+    /// Per-refund reentrancy flag set for the duration of `process_refund_internal`.
+    RefundLock(String),
+    /// Admin-configurable dispute rate limits (`DisputeRateLimitConfig`).
+    DisputeRateLimits,
+    /// Number of open/under-review disputes for a disputer address.
+    PayerOpenDisputeCount(Address),
+    /// Fixed-window global dispute creation counter (`DisputeCreationRateState`).
+    GlobalDisputeCreationRate,
+    /// When true, non-empty dispute evidence must be a valid IPFS CID.
+    RequireEvidenceCid,
     /// Contract version string, updated on each successful upgrade.
     ContractVersion,
     /// Configurable settlement fee rate in basis points (issue: settle_payment fee).
@@ -1519,10 +1571,25 @@ impl RefundManager {
         {
             return Err(Error::Reentrancy);
         }
+        // Per-refund lock: reject concurrent/reentrant process_refund for the same ID.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::RefundLock(refund_id.clone()))
+        {
+            return Err(Error::Reentrancy);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::ReentrancyLock, &true);
+        env.storage()
+            .persistent()
+            .set(&DataKey::RefundLock(refund_id.clone()), &true);
         let _guard = ReentrancyGuard { env };
+        let _refund_lock = RefundLockGuard {
+            env,
+            refund_id: refund_id.clone(),
+        };
 
         let mut refund = Self::get_refund_internal(env, &refund_id)?;
 
@@ -1625,6 +1692,7 @@ impl RefundManager {
         let from = env.current_contract_address();
         let to: MuxedAddress = (&refund.requester).into();
 
+        // Effects before interactions: mark Completed before any token transfer.
         refund.status = RefundStatus::Completed;
         refund.processed_at = Some(env.ledger().timestamp());
 
@@ -2014,10 +2082,19 @@ impl RefundManager {
             return Err(Error::InvalidAmount);
         }
 
-        // Issue #180: Validate that evidence is a valid IPFS multihash (CIDv0 or CIDv1)
-        if !validate_ipfs_multihash(&evidence) {
-            return Err(Error::InvalidEvidence);
+        // IPFS CID validation when require_evidence_cid is enabled (default: true).
+        // Empty evidence is always allowed; non-empty must be CIDv0/CIDv1 when flag is on.
+        let require_cid = env
+            .storage()
+            .persistent()
+            .get::<DataKey, bool>(&DataKey::RequireEvidenceCid)
+            .unwrap_or(true);
+        if require_cid && evidence.len() > 0 && !validate_ipfs_multihash(&evidence) {
+            return Err(Error::InvalidEvidenceFormat);
         }
+
+        // Rate limits: max open disputes per payer + global hourly creation cap.
+        Self::enforce_dispute_rate_limits(&env, &disputer)?;
 
         // Issue #77: Load payment and cap dispute amount to confirmed payment amount
         let payment: PaymentCharge = env
@@ -2107,7 +2184,7 @@ impl RefundManager {
             reason,
             evidence,
             status: DisputeStatus::Open,
-            disputer,
+            disputer: disputer.clone(),
             created_at: env.ledger().timestamp(),
             resolved_at: None,
             resolution_notes: None,
@@ -2127,6 +2204,9 @@ impl RefundManager {
             &DataKey::PaymentDisputes(payment_id.clone()),
             &payment_disputes,
         );
+
+        // Record rate-limit counters after successful dispute creation.
+        Self::record_dispute_creation(&env, &disputer);
         Self::bump_ttl(
             &env,
             &DataKey::PaymentDisputes(payment_id.clone()),
@@ -2245,6 +2325,130 @@ impl RefundManager {
         );
 
         Ok(())
+    }
+
+    /// Configure dispute creation rate limits (admin only).
+    ///
+    /// * `per_payer` — max concurrent open/under-review disputes per disputer
+    /// * `global_per_hour` — max dispute creations per hour across all disputers
+    pub fn set_dispute_rate_limits(
+        env: Env,
+        admin: Address,
+        per_payer: u32,
+        global_per_hour: u32,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        let config = DisputeRateLimitConfig {
+            per_payer_open: per_payer,
+            global_per_hour,
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeRateLimits, &config);
+        Ok(())
+    }
+
+    /// Toggle whether non-empty dispute evidence must be a valid IPFS CID.
+    /// Set `false` for testnet/dev to accept arbitrary evidence strings.
+    pub fn set_require_evidence_cid(
+        env: Env,
+        admin: Address,
+        require_cid: bool,
+    ) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::RequireEvidenceCid, &require_cid);
+        Ok(())
+    }
+
+    fn get_dispute_rate_limits(env: &Env) -> DisputeRateLimitConfig {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeRateLimits)
+            .unwrap_or(DisputeRateLimitConfig {
+                per_payer_open: DEFAULT_DISPUTE_PER_PAYER_OPEN,
+                global_per_hour: DEFAULT_DISPUTE_GLOBAL_PER_HOUR,
+            })
+    }
+
+    fn enforce_dispute_rate_limits(env: &Env, disputer: &Address) -> Result<(), Error> {
+        let limits = Self::get_dispute_rate_limits(env);
+
+        let open: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PayerOpenDisputeCount(disputer.clone()))
+            .unwrap_or(0);
+        if open >= limits.per_payer_open {
+            return Err(Error::DisputeRateLimitExceeded);
+        }
+
+        let now = env.ledger().timestamp();
+        let mut state: DisputeCreationRateState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GlobalDisputeCreationRate)
+            .unwrap_or(DisputeCreationRateState {
+                window_started_at: now,
+                count: 0,
+            });
+
+        if now.saturating_sub(state.window_started_at) >= DISPUTE_GLOBAL_WINDOW_SECS {
+            state.window_started_at = now;
+            state.count = 0;
+        }
+
+        if state.count >= limits.global_per_hour {
+            return Err(Error::DisputeRateLimitExceeded);
+        }
+
+        Ok(())
+    }
+
+    fn record_dispute_creation(env: &Env, disputer: &Address) {
+        let open_key = DataKey::PayerOpenDisputeCount(disputer.clone());
+        let open: u32 = env.storage().persistent().get(&open_key).unwrap_or(0);
+        env.storage()
+            .persistent()
+            .set(&open_key, &open.saturating_add(1));
+        Self::bump_ttl(env, &open_key, SHORT_LIVE_TTL);
+
+        let now = env.ledger().timestamp();
+        let mut state: DisputeCreationRateState = env
+            .storage()
+            .persistent()
+            .get(&DataKey::GlobalDisputeCreationRate)
+            .unwrap_or(DisputeCreationRateState {
+                window_started_at: now,
+                count: 0,
+            });
+
+        if now.saturating_sub(state.window_started_at) >= DISPUTE_GLOBAL_WINDOW_SECS {
+            state.window_started_at = now;
+            state.count = 0;
+        }
+        state.count = state.count.saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&DataKey::GlobalDisputeCreationRate, &state);
+        Self::bump_ttl(env, &DataKey::GlobalDisputeCreationRate, SHORT_LIVE_TTL);
+    }
+
+    fn release_open_dispute_slot(env: &Env, disputer: &Address) {
+        let open_key = DataKey::PayerOpenDisputeCount(disputer.clone());
+        let open: u32 = env.storage().persistent().get(&open_key).unwrap_or(0);
+        if open > 0 {
+            env.storage()
+                .persistent()
+                .set(&open_key, &(open - 1));
+        }
     }
 
     /// Operator-only: set or update the review deadline for an open or under-review dispute.
@@ -2400,30 +2604,8 @@ impl RefundManager {
             None,
         )?;
 
-        // Process the refund immediately
+        // Process the refund immediately (CEI: status=Completed before token transfer)
         Self::process_refund_internal(&env, &operator, refund_id.clone())?;
-
-        let usdc_token_address = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::UsdcToken)
-            .ok_or(Error::Unauthorized)?;
-        let token_client = token::TokenClient::new(&env, &usdc_token_address);
-        let contract_address = env.current_contract_address();
-        let collector = AccessControl::get_admin(&env).unwrap_or_else(|| contract_address.clone());
-
-        if token_client
-            .try_transfer(&contract_address, &dispute.disputer, &DISPUTE_BOND_AMOUNT)
-            .is_err()
-        {
-            return Err(Error::Unauthorized);
-        }
-        if token_client
-            .try_transfer(&contract_address, &collector, &DISPUTE_BOND_AMOUNT)
-            .is_err()
-        {
-            return Err(Error::Unauthorized);
-        }
 
         let now = env.ledger().timestamp();
 
@@ -2458,7 +2640,7 @@ impl RefundManager {
             ),
         );
 
-        // Update dispute status
+        // Effects before bond interactions: mark dispute resolved first.
         dispute.status = DisputeStatus::Resolved;
         dispute.refund_id = Some(refund_id.clone());
         dispute.resolved_at = Some(now);
@@ -2468,6 +2650,30 @@ impl RefundManager {
             .persistent()
             .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+        Self::release_open_dispute_slot(&env, &dispute.disputer);
+
+        // Interactions: return bonds after effects are persisted.
+        let usdc_token_address = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .ok_or(Error::Unauthorized)?;
+        let token_client = token::TokenClient::new(&env, &usdc_token_address);
+        let contract_address = env.current_contract_address();
+        let collector = AccessControl::get_admin(&env).unwrap_or_else(|| contract_address.clone());
+
+        if token_client
+            .try_transfer(&contract_address, &dispute.disputer, &DISPUTE_BOND_AMOUNT)
+            .is_err()
+        {
+            return Err(Error::Unauthorized);
+        }
+        if token_client
+            .try_transfer(&contract_address, &collector, &DISPUTE_BOND_AMOUNT)
+            .is_err()
+        {
+            return Err(Error::Unauthorized);
+        }
 
         // Emit DISPUTE_RESOLVED event
         env.events().publish(
@@ -2503,28 +2709,6 @@ impl RefundManager {
 
         let now = env.ledger().timestamp();
 
-        let usdc_token_address = env
-            .storage()
-            .persistent()
-            .get::<DataKey, Address>(&DataKey::UsdcToken)
-            .ok_or(Error::Unauthorized)?;
-        let token_client = token::TokenClient::new(&env, &usdc_token_address);
-        let contract_address = env.current_contract_address();
-        let collector = AccessControl::get_admin(&env).unwrap_or_else(|| contract_address.clone());
-
-        if token_client
-            .try_transfer(&contract_address, &dispute.merchant_id, &DISPUTE_BOND_AMOUNT)
-            .is_err()
-        {
-            return Err(Error::Unauthorized);
-        }
-        if token_client
-            .try_transfer(&contract_address, &collector, &DISPUTE_BOND_AMOUNT)
-            .is_err()
-        {
-            return Err(Error::Unauthorized);
-        }
-
         // Persist operator note on-chain for full transparency.
         let note = DisputeOperatorNote {
             dispute_id: dispute_id.clone(),
@@ -2556,6 +2740,7 @@ impl RefundManager {
             ),
         );
 
+        // Effects before bond interactions.
         dispute.status = DisputeStatus::Rejected;
         dispute.resolved_at = Some(now);
         dispute.resolution_notes = Some(resolution_notes);
@@ -2564,6 +2749,29 @@ impl RefundManager {
             .persistent()
             .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+        Self::release_open_dispute_slot(&env, &dispute.disputer);
+
+        let usdc_token_address = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Address>(&DataKey::UsdcToken)
+            .ok_or(Error::Unauthorized)?;
+        let token_client = token::TokenClient::new(&env, &usdc_token_address);
+        let contract_address = env.current_contract_address();
+        let collector = AccessControl::get_admin(&env).unwrap_or_else(|| contract_address.clone());
+
+        if token_client
+            .try_transfer(&contract_address, &dispute.merchant_id, &DISPUTE_BOND_AMOUNT)
+            .is_err()
+        {
+            return Err(Error::Unauthorized);
+        }
+        if token_client
+            .try_transfer(&contract_address, &collector, &DISPUTE_BOND_AMOUNT)
+            .is_err()
+        {
+            return Err(Error::Unauthorized);
+        }
 
         // Emit DISPUTE_REJECTED event
         env.events().publish(
@@ -2686,6 +2894,7 @@ impl RefundManager {
             .persistent()
             .set(&DataKey::Dispute(dispute_id.clone()), &dispute);
         Self::bump_dispute_ttl(&env, &dispute_id, &dispute.status);
+        Self::release_open_dispute_slot(&env, &dispute.disputer);
 
         // Emit event
         env.events().publish(
@@ -3001,6 +3210,7 @@ impl RefundManager {
                 .persistent()
                 .set(&DataKey::Dispute(dispute_id.clone()), &d);
             Self::bump_dispute_ttl(&env, &dispute_id, &d.status);
+            Self::release_open_dispute_slot(&env, &d.disputer);
         } else {
             let mut d = Self::get_dispute_internal(&env, &dispute_id)?;
             d.status = DisputeStatus::Rejected;
@@ -3009,6 +3219,7 @@ impl RefundManager {
                 .persistent()
                 .set(&DataKey::Dispute(dispute_id.clone()), &d);
             Self::bump_dispute_ttl(&env, &dispute_id, &d.status);
+            Self::release_open_dispute_slot(&env, &d.disputer);
         }
 
         env.events().publish(

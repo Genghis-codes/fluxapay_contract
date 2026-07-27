@@ -951,6 +951,10 @@ pub enum DataKey {
     AllowedRoutersList,
     /// Issue #434: Wrapped XLM (WXLM) token contract address
     WrappedXlmContract,
+    /// Issue #504: Payment IDs grouped by approximate expiry ledger bucket.
+    PaymentsByExpiry(u32),
+    /// Issue #504: Sorted set of expiry buckets that currently contain payment IDs.
+    PaymentExpiryBuckets,
 }
 
 /// Default initial contract version string.
@@ -5927,6 +5931,68 @@ impl PaymentProcessor {
     }
 
     /// Returns true if the given token address is on the allowlist.
+
+    fn expiry_bucket_for(expires_at: u64) -> u32 {
+        (expires_at / 5).min(u32::MAX as u64) as u32
+    }
+
+    fn index_payment_expiry(env: &Env, payment_id: &String, expires_at: u64) {
+        let bucket = Self::expiry_bucket_for(expires_at);
+        let key = DataKey::PaymentsByExpiry(bucket);
+        let mut ids: Vec<String> = env.storage().persistent().get(&key).unwrap_or_else(|| vec![env]);
+        if !ids.contains(payment_id) {
+            ids.push_back(payment_id.clone());
+            env.storage().persistent().set(&key, &ids);
+            Self::bump_ttl(env, &key, LONG_LIVE_TTL);
+        }
+
+        let buckets_key = DataKey::PaymentExpiryBuckets;
+        let mut buckets: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&buckets_key)
+            .unwrap_or_else(|| vec![env]);
+        if !buckets.contains(&bucket) {
+            buckets.push_back(bucket);
+            env.storage().persistent().set(&buckets_key, &buckets);
+            Self::bump_ttl(env, &buckets_key, LONG_LIVE_TTL);
+        }
+    }
+
+    fn remove_payment_from_expiry_bucket(env: &Env, payment_id: &String, expires_at: u64) {
+        let bucket = Self::expiry_bucket_for(expires_at);
+        let key = DataKey::PaymentsByExpiry(bucket);
+        if let Some(ids) = env.storage().persistent().get::<DataKey, Vec<String>>(&key) {
+            let mut remaining = vec![env];
+            for id in ids.iter() {
+                if id != *payment_id {
+                    remaining.push_back(id);
+                }
+            }
+            if remaining.is_empty() {
+                env.storage().persistent().remove(&key);
+                let buckets_key = DataKey::PaymentExpiryBuckets;
+                if let Some(buckets) = env.storage().persistent().get::<DataKey, Vec<u32>>(&buckets_key) {
+                    let mut kept = vec![env];
+                    for candidate in buckets.iter() {
+                        if candidate != bucket {
+                            kept.push_back(candidate);
+                        }
+                    }
+                    if kept.is_empty() {
+                        env.storage().persistent().remove(&buckets_key);
+                    } else {
+                        env.storage().persistent().set(&buckets_key, &kept);
+                        Self::bump_ttl(env, &buckets_key, LONG_LIVE_TTL);
+                    }
+                }
+            } else {
+                env.storage().persistent().set(&key, &remaining);
+                Self::bump_ttl(env, &key, LONG_LIVE_TTL);
+            }
+        }
+    }
+
     pub fn is_token_allowed(env: Env, token_address: Address) -> bool {
         env.storage()
             .persistent()
@@ -6141,6 +6207,7 @@ impl PaymentProcessor {
             .persistent()
             .set(&DataKey::Payment(args.payment_id.clone()), &payment);
         Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
+        Self::index_payment_expiry(&env, &args.payment_id, payment.expires_at);
 
         // Issue #489: Store reverse index for metadata_hash → payment_id lookup
         if let Some(ref hash) = args.metadata_hash {
@@ -6402,6 +6469,7 @@ impl PaymentProcessor {
                 .persistent()
                 .set(&DataKey::Payment(args.payment_id.clone()), &payment);
             Self::bump_payment_ttl(&env, &args.payment_id, &payment.status);
+            Self::index_payment_expiry(&env, &args.payment_id, payment.expires_at);
 
             // Issue #489: Store reverse index for metadata_hash → payment_id lookup in batch
             if let Some(ref hash) = args.metadata_hash {
@@ -7309,6 +7377,7 @@ impl PaymentProcessor {
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
         // Issue #399: free idempotency key so client_token can be reused after cancellation.
         Self::remove_idempotency_key(&env, &payment_id);
+        Self::remove_payment_from_expiry_bucket(&env, &payment_id, payment.expires_at);
 
         // Issue #166: Optimize event topics
         env.events().publish(
@@ -7343,6 +7412,7 @@ impl PaymentProcessor {
         Self::bump_payment_ttl(&env, &payment_id, &payment.status);
         // Issue #399: free idempotency key so client_token can be reused.
         Self::remove_idempotency_key(&env, &payment_id);
+        Self::remove_payment_from_expiry_bucket(&env, &payment_id, payment.expires_at);
 
         // Issue #166: Optimize event topics
         env.events().publish(
@@ -7360,19 +7430,43 @@ impl PaymentProcessor {
     pub fn batch_expire_payments(env: Env, payment_ids: Vec<String>) -> Result<u32, Error> {
         Self::require_not_paused(&env)?;
 
+        let current_bucket = Self::expiry_bucket_for(env.ledger().timestamp());
+        let mut selected_bucket: Option<u32> = None;
+        if let Some(buckets) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&DataKey::PaymentExpiryBuckets)
+        {
+            for bucket in buckets.iter() {
+                if bucket <= current_bucket
+                    && selected_bucket.map_or(true, |lowest| bucket < lowest)
+                {
+                    selected_bucket = Some(bucket);
+                }
+            }
+        }
+
+        let candidates: Vec<String> = if let Some(bucket) = selected_bucket {
+            env.storage()
+                .persistent()
+                .get(&DataKey::PaymentsByExpiry(bucket))
+                .unwrap_or_else(|| vec![&env])
+        } else {
+            payment_ids
+        };
+
         let mut count = 0;
+        let max = if candidates.len() > 50 { 50 } else { candidates.len() };
         let mut i = 0;
-        let len = payment_ids.len();
-        let max = if len > 50 { 50 } else { len };
-        
         while i < max {
-            if let Some(payment_id) = payment_ids.get(i) {
+            if let Some(payment_id) = candidates.get(i) {
                 if Self::expire_payment(env.clone(), payment_id).is_ok() {
                     count += 1;
                 }
             }
             i += 1;
         }
+
         Ok(count)
     }
 

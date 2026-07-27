@@ -1,4 +1,4 @@
-use soroban_sdk::{contracterror, contracttype, Address, Bytes, Env, Symbol};
+use soroban_sdk::{contracterror, contracttype, Address, Bytes, BytesN, Env, Symbol};
 
 /// Error types for account abstraction operations
 #[contracterror]
@@ -25,7 +25,7 @@ pub struct SessionKeyMetadata {
 pub struct SessionExecutedEvent {
     pub account: Address,
     pub session_key: Address,
-    pub payload_hash: Bytes,
+    pub payload_hash: BytesN<32>,
 }
 
 /// Account abstraction data keys for persistent storage
@@ -126,7 +126,7 @@ pub fn execute_with_session(
             Symbol::new(&env, "EXECUTED"),
             account,
         ),
-        (session_key, payload.clone()),
+        (session_key, env.crypto().sha256(&payload)),
     );
 
     Ok(Bytes::new(&env))
@@ -155,12 +155,7 @@ mod tests {
         .is_ok());
 
         let payload = Bytes::from_slice(&env, b"test_payload");
-        let res = execute_with_session(
-            env.clone(),
-            account.clone(),
-            session_key.clone(),
-            payload,
-        );
+        let res = execute_with_session(env.clone(), account.clone(), session_key.clone(), payload);
         assert!(res.is_ok());
     }
 
@@ -183,6 +178,17 @@ mod tests {
         let payload = Bytes::from_slice(&env, b"test_payload");
         let res = execute_with_session(env, account, session_key, payload);
         assert_eq!(res, Err(AccountAbstractionError::SessionExpired));
+    }
+
+    #[test]
+    fn test_session_payload_hash_is_deterministic_and_distinct() {
+        let env = Env::default();
+        let first = Bytes::from_slice(&env, b"same_payload");
+        let second = Bytes::from_slice(&env, b"same_payload");
+        let different = Bytes::from_slice(&env, b"different_payload");
+
+        assert_eq!(env.crypto().sha256(&first), env.crypto().sha256(&second));
+        assert_ne!(env.crypto().sha256(&first), env.crypto().sha256(&different));
     }
 
     #[test]

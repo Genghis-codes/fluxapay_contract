@@ -465,9 +465,7 @@ pub struct MerchantRegistered {
     pub settlement_currency: String,
 }
 
-
 /// Emitted when a merchant is verified.
-
 
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -761,4 +759,17 @@ pub struct SessionRegistered {
 pub struct SessionRevoked {
     pub account: Address,
     pub session_key: Address,
+}
+
+// ============================================================================
+// Account Abstraction Events
+// ============================================================================
+
+/// Emitted when a session key executes a payload.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SessionExecutedEvent {
+    pub account: Address,
+    pub session_key: Address,
+    pub payload_hash: BytesN<32>,
 }

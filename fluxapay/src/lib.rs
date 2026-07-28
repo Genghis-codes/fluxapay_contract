@@ -24,10 +24,12 @@ const SETTLEMENT_DAILY_INTERVAL_SECS: u64 = 86_400;
 const SETTLEMENT_WEEKLY_INTERVAL_SECS: u64 = 604_800;
 /// Issue #480: Minimum pending balance required to trigger a settlement.
 const SETTLEMENT_MIN_AMOUNT: i128 = 1_000_000; // 0.1 USDC (7 decimals)
-/// Minimum number of arbitrators required for dispute resolution voting.
-const ARBITRATOR_VOTING_THRESHOLD: u32 = 3;
 /// Fixed dispute bond in the contract's stablecoin denomination.
 const DISPUTE_BOND_AMOUNT: i128 = 100_000;
+/// Default threshold separating small and large disputes: 100 USDC (7 decimals).
+pub const DEFAULT_DISPUTE_DEADLINE_THRESHOLD_AMOUNT: i128 = 1_000_000_000;
+pub const SMALL_DISPUTE_DEADLINE_SECS: u64 = 3 * 24 * 60 * 60;
+pub const LARGE_DISPUTE_DEADLINE_SECS: u64 = 7 * 24 * 60 * 60;
 
 // Issue #167: Tiered refund fees based on merchant KYC tier
 const REFUND_FEE_BPS_BASIC: i128 = 100;     // 1.0% for Basic tier
@@ -65,8 +67,6 @@ pub mod merchant_auth;
 mod payment_state_machine;
 use access_control::{
     role_admin, role_arbitrator, role_merchant, role_oracle, role_settlement_operator, AccessControl,
-    role_admin, role_merchant, role_oracle, role_settlement_operator, role_arbitrator, AccessControl,
-    AdminAction, AdminProposal,
 };
 // Re-export for tests
 #[allow(unused_imports)]
@@ -249,23 +249,6 @@ pub struct Dispute {
     pub payout_splits: Vec<SettlementSplit>,
 }
 
-/// Arbitrator vote on a dispute resolution (Issue #178).
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ArbitratorVoteChoice {
-    Approve,
-    Reject,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ArbitratorVote {
-    pub dispute_id: String,
-    pub arbitrator: Address,
-    pub vote: ArbitratorVoteChoice,
-    pub voted_at: u64,
-}
-
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -401,8 +384,6 @@ pub struct CreatePaymentArgs {
     pub payer: Option<Address>,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 /// Arguments for a single dispute in `batch_create_disputes` / `create_dispute`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,6 +515,15 @@ pub const ARBITRATOR_VOTING_THRESHOLD: u32 = 3;
 pub enum ArbitratorVoteChoice {
     Approve,
     Reject,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArbitratorVote {
+    pub dispute_id: String,
+    pub arbitrator: Address,
+    pub vote: ArbitratorVoteChoice,
+    pub voted_at: u64,
 }
 
 /// Accumulated vote counts for the `ARBITRATOR`-role voting flow.
@@ -840,8 +830,6 @@ pub enum DataKey {
     StreamCounter,
     /// Stores operator notes keyed by dispute_id for on-chain transparency.
     DisputeOperatorNote(String),
-    /// Stores arbitrator vote on a dispute (keyed by (dispute_id, arbitrator)).
-    ArbitratorVote(String, Address),
     /// Stores all arbitrators who have voted on a dispute.
     DisputeArbitratorVotes(String),
     /// Locked stake for a dispute arbitrator: (dispute_id, arbitrator) → amount
@@ -908,6 +896,8 @@ pub enum DataKey {
     SettlementFeeRate,
     /// Configurable dispute bond amount in stablecoin stroops (overrides DISPUTE_BOND_AMOUNT const).
     DisputeBondAmount,
+    /// Admin-configurable amount threshold for 3-day versus 7-day dispute deadlines.
+    DisputeDeadlineThresholdAmount,
     /// Configurable monthly volume cap per KYC tier in stablecoin stroops (overrides TIER_CAP_* const).
     TierVolumeCap(KycTier),
     /// Configurable refund fee in basis points (overrides REFUND_FEE_BPS const).
@@ -2491,13 +2481,9 @@ impl RefundManager {
         let counter = Self::get_next_dispute_id(&env);
         let dispute_id = Self::build_dispute_id(&env, counter);
 
-        // Issue #177: Compute dynamic deadline based on dispute amount
-        // Small disputes (<= 1000 USDC): 3 days, Large disputes (> 1000 USDC): 7 days
-        let deadline_secs = if amount <= 1_000_0000000 { // 1000 USDC with 7 decimals
-            3 * 24 * 60 * 60 // 3 days in seconds
-        } else {
-            7 * 24 * 60 * 60 // 7 days in seconds
-        };
+        // Issue #177: Compute dynamic deadline based on dispute amount.
+        // Small disputes (<= configured threshold, default 100 USDC): 3 days; larger: 7 days.
+        let deadline_secs = Self::computed_dispute_deadline_secs(&env, amount);
 
         let dispute = Dispute {
             dispute_id: dispute_id.clone(),
@@ -2692,6 +2678,40 @@ impl RefundManager {
         Ok(())
     }
 
+
+    pub fn set_dispute_threshold(env: Env, admin: Address, amount: i128) -> Result<(), Error> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::DisputeDeadlineThresholdAmount, &amount);
+        env.events().publish(
+            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "THRESHOLD_SET")),
+            amount,
+        );
+        Ok(())
+    }
+
+    fn get_dispute_deadline_threshold(env: &Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::DisputeDeadlineThresholdAmount)
+            .unwrap_or(DEFAULT_DISPUTE_DEADLINE_THRESHOLD_AMOUNT)
+    }
+
+    fn computed_dispute_deadline_secs(env: &Env, amount: i128) -> u64 {
+        if amount <= Self::get_dispute_deadline_threshold(env) {
+            SMALL_DISPUTE_DEADLINE_SECS
+        } else {
+            LARGE_DISPUTE_DEADLINE_SECS
+        }
+    }
+
     fn get_dispute_rate_limits(env: &Env) -> DisputeRateLimitConfig {
         env.storage()
             .persistent()
@@ -2884,7 +2904,12 @@ impl RefundManager {
             return Ok(false);
         }
 
-        let Some(deadline) = dispute.review_deadline else {
+        let deadline = dispute.review_deadline.or_else(|| {
+            dispute
+                .computed_deadline_secs
+                .map(|secs| dispute.created_at.saturating_add(secs))
+        });
+        let Some(deadline) = deadline else {
             return Ok(false);
         };
 

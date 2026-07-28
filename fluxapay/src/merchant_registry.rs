@@ -1,3 +1,4 @@
+use crate::access_control::{role_admin, role_arbitrator, AccessControl};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, map, vec, Address, BytesN, Env, Map, String,
     Symbol, Vec,
@@ -207,6 +208,10 @@ pub enum MerchantDataKey {
     MerchantPendingSettlement(Address),
     /// Issue #481: Admin-configurable dispute threshold for auto-suspension (default 10)
     DisputeThreshold,
+    SuspensionProposal(u64),
+    SuspensionVote(u64, Address),
+    SuspensionProposalCounter,
+    SuspensionThreshold,
 }
 
 /// Platform fee configuration stored in MerchantRegistry.
@@ -217,6 +222,23 @@ pub struct PlatformFeeConfig {
     pub fee_bps: i128,
     /// Address that receives the platform fee.
     pub fee_recipient: Address,
+}
+
+pub const DEFAULT_SUSPENSION_THRESHOLD: u32 = 3;
+pub const SUSPENSION_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SuspensionProposal {
+    pub proposal_id: u64,
+    pub proposer: Address,
+    pub merchant_id: Address,
+    pub reason: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub approve_votes: u32,
+    pub reject_votes: u32,
+    pub executed: bool,
 }
 
 #[contracterror]
@@ -233,6 +255,9 @@ pub enum MerchantError {
     WhitelistModeRequiresBusinessTier = 7,
     /// Payer is not in the merchant's customer whitelist (issue #516)
     PayerNotWhitelisted = 8,
+    ProposalNotFound = 9,
+    ProposalExpired = 10,
+    DuplicateVote = 11,
 }
 
 #[cfg_attr(
@@ -253,6 +278,7 @@ impl MerchantRegistry {
         env.storage()
             .persistent()
             .set(&MerchantDataKey::Admin, &admin);
+        AccessControl::initialize(&env, admin.clone());
 
         // Default limits for Unverified tier (max 100 USDC in stroops, assuming 7 decimals: 100 * 10^7)
         env.storage().persistent().set(
@@ -263,6 +289,19 @@ impl MerchantRegistry {
             },
         );
 
+        Ok(())
+    }
+
+    pub fn grant_role(env: Env, admin: Address, role: Symbol, account: Address) -> Result<(), MerchantError> {
+        AccessControl::grant_role(&env, admin, role, account).map_err(|_| MerchantError::Unauthorized)
+    }
+
+    pub fn set_suspension_threshold(env: Env, admin: Address, threshold: u32) -> Result<(), MerchantError> {
+        admin.require_auth();
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(MerchantError::Unauthorized);
+        }
+        env.storage().persistent().set(&MerchantDataKey::SuspensionThreshold, &threshold);
         Ok(())
     }
 
@@ -879,6 +918,114 @@ impl MerchantRegistry {
             merchant_id,
         );
 
+        Ok(())
+    }
+
+    fn get_suspension_threshold(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&MerchantDataKey::SuspensionThreshold)
+            .unwrap_or(DEFAULT_SUSPENSION_THRESHOLD)
+    }
+
+    fn next_suspension_proposal_id(env: &Env) -> u64 {
+        let id = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::SuspensionProposalCounter)
+            .unwrap_or(0u64)
+            .saturating_add(1);
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::SuspensionProposalCounter, &id);
+        id
+    }
+
+    pub fn propose_merchant_suspension(
+        env: Env,
+        proposer: Address,
+        merchant_id: Address,
+        reason: String,
+    ) -> Result<u64, MerchantError> {
+        proposer.require_auth();
+        if !AccessControl::has_role(&env, &role_arbitrator(&env), &proposer) {
+            return Err(MerchantError::Unauthorized);
+        }
+        let _merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        let proposal_id = Self::next_suspension_proposal_id(&env);
+        let now = env.ledger().timestamp();
+        let proposal = SuspensionProposal {
+            proposal_id,
+            proposer: proposer.clone(),
+            merchant_id: merchant_id.clone(),
+            reason,
+            created_at: now,
+            expires_at: now.saturating_add(SUSPENSION_PROPOSAL_TTL_SECS),
+            approve_votes: 0,
+            reject_votes: 0,
+            executed: false,
+        };
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::SuspensionProposal(proposal_id), &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "SUSPENSION_PROPOSED")),
+            (proposal_id, proposer, merchant_id),
+        );
+        Ok(proposal_id)
+    }
+
+    pub fn vote_suspension(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        approve: bool,
+    ) -> Result<(), MerchantError> {
+        voter.require_auth();
+        if !AccessControl::has_role(&env, &role_arbitrator(&env), &voter) {
+            return Err(MerchantError::Unauthorized);
+        }
+        let vote_key = MerchantDataKey::SuspensionVote(proposal_id, voter.clone());
+        if env.storage().persistent().has(&vote_key) {
+            return Err(MerchantError::DuplicateVote);
+        }
+        let mut proposal: SuspensionProposal = env
+            .storage()
+            .persistent()
+            .get(&MerchantDataKey::SuspensionProposal(proposal_id))
+            .ok_or(MerchantError::ProposalNotFound)?;
+        if env.ledger().timestamp() > proposal.expires_at {
+            return Err(MerchantError::ProposalExpired);
+        }
+        env.storage().persistent().set(&vote_key, &approve);
+        if approve {
+            proposal.approve_votes = proposal.approve_votes.saturating_add(1);
+        } else {
+            proposal.reject_votes = proposal.reject_votes.saturating_add(1);
+        }
+        let threshold = Self::get_suspension_threshold(&env);
+        if !proposal.executed && proposal.approve_votes >= threshold {
+            let mut merchant = Self::get_merchant_internal(&env, &proposal.merchant_id)?;
+            merchant.active = false;
+            merchant.suspension_reason = Some(proposal.reason.clone());
+            merchant.suspended_at = Some(env.ledger().timestamp());
+            merchant.suspension_expires_at = None;
+            proposal.executed = true;
+            env.storage()
+                .persistent()
+                .set(&MerchantDataKey::Merchant(proposal.merchant_id.clone()), &merchant);
+            env.events().publish(
+                (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "SUSPENDED")),
+                proposal.merchant_id.clone(),
+            );
+        }
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::SuspensionProposal(proposal_id), &proposal);
+        env.events().publish(
+            (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "SUSPENSION_VOTED")),
+            (proposal_id, voter, approve, proposal.approve_votes, proposal.reject_votes),
+        );
         Ok(())
     }
 

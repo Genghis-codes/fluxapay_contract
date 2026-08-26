@@ -5,7 +5,8 @@ use crate::{
     ZERO_CONTRACT_STRKEY,
 };
 use soroban_sdk::{
-    testutils::Address as _, testutils::Events as _, vec, Address, Env, String, Symbol, Vec,
+    testutils::Address as _, testutils::Events as _, token, vec, Address, Env, String, Symbol,
+    Vec,
 };
 
 fn setup_swap_test_env(
@@ -28,11 +29,21 @@ fn setup_swap_test_env(
     merchant_client.initialize(&admin);
     payment_client.set_merchant_registry_address(&admin, &merchant_registry);
 
-    let token_in = Address::generate(env);
-    let token_out = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_in = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_out = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     payment_client.allow_token(&admin, &token_out);
 
     (admin, payment_client, merchant_client, token_in, token_out)
+}
+
+fn mint_swap_input(env: &Env, token_in: &Address, payer: &Address, amount: i128) {
+    let token_client = token::StellarAssetClient::new(env, token_in);
+    token_client.mint(payer, &amount);
 }
 
 fn register_verified_merchant(
@@ -113,6 +124,7 @@ fn test_swap_and_pay_happy_path_with_mock_dex() {
         9_900,
         10_000,
     );
+    mint_swap_input(&env, &token_in, &payer, 10_000);
 
     let events_before = env.events().all().len();
     let payment = payment_client.swap_and_pay(&args);
@@ -169,9 +181,11 @@ fn test_swap_and_pay_failure_with_mock_dex_insufficient_output() {
         9_900,
         10_000,
     );
+    mint_swap_input(&env, &token_in, &payer, 10_000);
 
     let result = payment_client.try_swap_and_pay(&args);
     assert!(result.is_err(), "expected swap_and_pay to fail");
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
     assert!(
         payment_client.try_get_payment(&payment_id).is_err(),
         "payment should not be stored when swap fails"
@@ -204,6 +218,7 @@ fn test_swap_and_pay_failure_when_mock_dex_swap_errors() {
         9_900,
         10_000,
     );
+    mint_swap_input(&env, &token_in, &payer, 10_000);
 
     let result = payment_client.try_swap_and_pay(&args);
     assert!(

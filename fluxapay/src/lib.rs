@@ -3985,11 +3985,57 @@ impl RefundManager {
         Ok(())
     }
 
+    /// Create a billing plan with an explicit interval in seconds.
+    pub fn create_plan(
+        env: Env,
+        merchant: Address,
+        plan_id: String,
+        name: String,
+        description: String,
+        amount: i128,
+        currency: Symbol,
+        interval_secs: u64,
+    ) -> Result<(), Error> {
+        merchant.require_auth();
+
+        if !AccessControl::has_role(&env, &role_merchant(&env), &merchant) {
+            return Err(Error::Unauthorized);
+        }
+
+        if amount <= 0 || interval_secs == 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let plan = SubscriptionPlan {
+            plan_id: plan_id.clone(),
+            merchant_id: merchant,
+            name,
+            description,
+            amount,
+            currency,
+            interval_secs,
+            billing_interval: BillingInterval::Daily,
+            active: true,
+            payout_splits: Vec::new(&env),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::SubscriptionPlan(plan_id), &plan);
+
+        Ok(())
+    }
+
     pub fn get_subscription_plan(env: Env, plan_id: String) -> Result<SubscriptionPlan, Error> {
         env.storage()
             .persistent()
             .get(&DataKey::SubscriptionPlan(plan_id))
             .ok_or(Error::PaymentNotFound)
+    }
+
+    /// Alias for `get_subscription_plan`.
+    pub fn get_plan(env: Env, plan_id: String) -> Result<SubscriptionPlan, Error> {
+        Self::get_subscription_plan(env, plan_id)
     }
 
     pub fn deactivate_subscription_plan(
@@ -4086,6 +4132,80 @@ impl RefundManager {
         );
 
         Ok(subscription_id)
+    }
+
+    /// Subscribe to a plan using a caller-supplied subscription identifier.
+    pub fn subscribe_to_plan(
+        env: Env,
+        payer: Address,
+        subscription_id: String,
+        plan_id: String,
+    ) -> Result<(), Error> {
+        payer.require_auth();
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Subscription(subscription_id.clone()))
+        {
+            return Err(Error::PaymentAlreadyExists);
+        }
+
+        let plan: SubscriptionPlan = env
+            .storage()
+            .persistent()
+            .get(&DataKey::SubscriptionPlan(plan_id.clone()))
+            .ok_or(Error::PaymentNotFound)?;
+
+        if !plan.active {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        let now = env.ledger().timestamp();
+        let subscription = Subscription {
+            subscription_id: subscription_id.clone(),
+            merchant_id: plan.merchant_id.clone(),
+            payer_address: payer.clone(),
+            plan_id: plan_id.clone(),
+            amount: plan.amount,
+            currency: plan.currency,
+            interval_secs: plan.interval_secs,
+            next_payment_at: now.saturating_add(plan.interval_secs),
+            status: SubscriptionStatus::Active,
+            created_at: now,
+            last_payment_at: None,
+            total_payments: 0,
+            max_payments: None,
+            retry_count: 0,
+            next_retry_at: None,
+            resume_at: None,
+            affiliate: None,
+            affiliate_fee_bps: None,
+        };
+
+        env.storage().persistent().set(
+            &DataKey::Subscription(subscription_id.clone()),
+            &subscription,
+        );
+
+        let mut payer_subscriptions = Self::get_payer_subscriptions_internal(&env, &payer);
+        payer_subscriptions.push_back(subscription_id.clone());
+        env.storage().persistent().set(
+            &DataKey::PayerSubscriptions(payer.clone()),
+            &payer_subscriptions,
+        );
+
+        Self::add_active_subscription(&env, &subscription_id);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "SUBSCRIPTION"),
+                Symbol::new(&env, "CREATED"),
+            ),
+            (subscription_id, payer, plan_id),
+        );
+
+        Ok(())
     }
 
     pub fn get_subscription(env: Env, subscription_id: String) -> Result<Subscription, Error> {
@@ -4417,6 +4537,38 @@ impl RefundManager {
         Ok(subscription.status)
     }
 
+    /// Trigger a recurring subscription charge when the billing date is due.
+    pub fn process_subscription(
+        env: Env,
+        operator: Address,
+        subscription_id: String,
+    ) -> Result<SubscriptionStatus, Error> {
+        operator.require_auth();
+
+        if !AccessControl::has_role(&env, &role_oracle(&env), &operator)
+            && !AccessControl::has_role(&env, &role_settlement_operator(&env), &operator)
+        {
+            return Err(Error::Unauthorized);
+        }
+
+        let subscription = Self::get_subscription_internal(&env, &subscription_id)?;
+        let now = env.ledger().timestamp();
+        let due = subscription
+            .next_retry_at
+            .unwrap_or(subscription.next_payment_at);
+        if now < due {
+            return Err(Error::PaymentAlreadyProcessed);
+        }
+
+        let token: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsdcToken)
+            .ok_or(Error::PaymentNotFound)?;
+
+        Self::charge_subscription(env, operator, subscription_id, token)
+    }
+
     pub fn resume_subscription(
         env: Env,
         payer: Address,
@@ -4456,15 +4608,17 @@ impl RefundManager {
     /// refund is created for the unused portion of the period (by whole days).
     pub fn cancel_subscription(
         env: Env,
-        payer: Address,
+        payer_or_merchant: Address,
         subscription_id: String,
         refund_remaining: bool,
     ) -> Result<(), Error> {
-        payer.require_auth();
+        payer_or_merchant.require_auth();
 
         let mut subscription = Self::get_subscription_internal(&env, &subscription_id)?;
 
-        if subscription.payer_address != payer {
+        if subscription.payer_address != payer_or_merchant
+            && subscription.merchant_id != payer_or_merchant
+        {
             return Err(Error::Unauthorized);
         }
 
@@ -4515,7 +4669,7 @@ impl RefundManager {
 
         env.events().publish(
             (Symbol::new(&env, "SUBSCRIPTION"), Symbol::new(&env, "CANCELLED")),
-            (subscription_id, payer),
+            (subscription_id, payer_or_merchant),
         );
 
         Ok(())
@@ -8159,7 +8313,7 @@ impl PaymentProcessor {
 
         let quoted_out = amounts.get(path.len() - 1).ok_or(Error::SwapPathInvalid)?;
         if quoted_out < amount_out_min {
-            return Err(Error::SwapPathInvalid);
+            return Err(Error::InvalidAmount);
         }
 
         Ok(amounts)
@@ -8404,7 +8558,7 @@ impl PaymentProcessor {
             .get(args.path.len() - 1)
             .ok_or(Error::SwapPathInvalid)?;
         if actual_out < args.amount_out_min {
-            return Err(Error::SwapPathInvalid);
+            return Err(Error::InvalidAmount);
         }
 
         let quoted_out = quoted_amounts
@@ -8448,15 +8602,13 @@ impl PaymentProcessor {
         env.events().publish(
             (
                 Symbol::new(&env, "SWAP"),
-                Symbol::new(&env, "AND"),
-                Symbol::new(&env, "PAY"),
+                Symbol::new(&env, "EXECUTED"),
             ),
             (
-                args.payment_id,
-                args.payer,
+                args.payment_id.clone(),
+                args.payer.clone(),
                 args.amount_in,
-                args.token_in,
-                args.amount,
+                actual_out,
             ),
         );
         Ok(payment)

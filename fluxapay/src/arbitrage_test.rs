@@ -2,7 +2,7 @@ use crate::{
     merchant_registry::{MerchantRegistry, MerchantRegistryClient},
     DexRouter, DexRouterClient, PaymentProcessor, PaymentProcessorClient, SwapAndPayArgs,
 };
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String, Symbol};
+use soroban_sdk::{testutils::Address as _, token, vec, Address, Env, String, Symbol};
 
 fn setup_swap_env(
     env: &Env,
@@ -27,8 +27,13 @@ fn setup_swap_env(
     merchant_client.initialize(&admin);
     payment_client.set_merchant_registry_address(&admin, &merchant_registry);
 
-    let token_a = Address::generate(env);
-    let token_b = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     payment_client.allow_token(&admin, &token_b);
 
     (
@@ -164,6 +169,8 @@ fn test_swap_and_pay_accepts_valid_path_returns() {
     );
     merchant_client.verify_merchant(&admin, &merchant);
     payment_client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    token::StellarAssetClient::new(&env, &token_a).mint(&payer, &10_000);
 
     let path = vec![&env, token_a.clone(), token_b.clone()];
     let args = SwapAndPayArgs {

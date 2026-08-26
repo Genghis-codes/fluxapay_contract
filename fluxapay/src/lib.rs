@@ -185,6 +185,20 @@ pub enum RefundStatus {
     Cancelled,
 }
 
+/// Issue #676: consolidated read-only view of all refund configuration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundPolicy {
+    /// Whether `process_refund` requires a `receipt_hash` (Issue #176).
+    pub require_receipt_hash: bool,
+    /// Refund request expiry window in seconds (Issue #170).
+    pub refund_expiry_secs: u64,
+    /// Refund processing fee in basis points.
+    pub refund_fee_bps: i128,
+    /// Cooldown period after payment confirmation before refunds can be requested, in seconds.
+    pub cooldown_secs: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InvoiceStatus {
@@ -1062,6 +1076,26 @@ impl RefundManager {
             .persistent()
             .set(&DataKey::RequireReceiptHash, &require_receipt_hash);
         Ok(())
+    }
+
+    /// Issue #676: read-only view of all refund configuration in one call —
+    /// `require_receipt_hash` (Issue #176), `refund_expiry_secs` (Issue #170),
+    /// `refund_fee_bps`, and `cooldown_secs`. Lets integrators check policy
+    /// before submitting a refund without having to know every individual
+    /// storage key / setter.
+    pub fn get_refund_policy(env: Env) -> RefundPolicy {
+        let require_receipt_hash: bool = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RequireReceiptHash)
+            .unwrap_or(false);
+
+        RefundPolicy {
+            require_receipt_hash,
+            refund_expiry_secs: Self::get_refund_expiry_secs(&env),
+            refund_fee_bps: Self::get_refund_fee_bps_internal(&env),
+            cooldown_secs: Self::get_refund_cooldown_secs(&env),
+        }
     }
 
     pub fn grant_role(
@@ -3121,9 +3155,13 @@ impl RefundManager {
             return Err(Error::Unauthorized);
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "BOND_RETURNED")),
-            (dispute.disputer.clone(), bond_amount),
+        // Issue #677: bond is released back to the disputer (winner) after
+        // the dispute is resolved with a refund in their favor.
+        events::emit_dispute_bond_returned(
+            &env,
+            dispute_id.clone(),
+            dispute.disputer.clone(),
+            bond_amount,
         );
 
         // Emit DISPUTE_RESOLVED event
@@ -3206,10 +3244,17 @@ impl RefundManager {
             return Err(Error::Unauthorized);
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "DISPUTE"), Symbol::new(&env, "BOND_FORFEITED")),
-            (dispute.disputer.clone(), dispute.merchant_id.clone(), bond_amount),
+        // Issue #677: merchant's counter-bond is released back to them since
+        // the dispute was rejected in their favor.
+        events::emit_dispute_bond_returned(
+            &env,
+            dispute_id.clone(),
+            dispute.merchant_id.clone(),
+            bond_amount,
         );
+        // Issue #677: disputer's bond is forfeited to the treasury/collector
+        // when the dispute is rejected.
+        events::emit_dispute_bond_forfeited(&env, dispute_id.clone(), collector.clone(), bond_amount);
 
         // Emit DISPUTE_REJECTED event
         env.events().publish(

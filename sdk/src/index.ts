@@ -64,6 +64,50 @@ export interface FluxapayConfig {
   merchantRegistryContractId?: string;
   /** PaymentLinkManager contract ID for payment link operations. */
   paymentLinkContractId?: string;
+  /**
+   * Issue #680: Base URL of the FluxaPay backend API, used for off-chain
+   * invoice management (`getInvoice`, `createInvoice`, etc). Required only
+   * when invoice methods are used.
+   */
+  apiUrl?: string;
+}
+
+/**
+ * Issue #680: A single line item on an invoice.
+ */
+export interface LineItem {
+  description: string;
+  quantity: number;
+  unitAmount: bigint;
+}
+
+/**
+ * Issue #680: Lifecycle status of an invoice.
+ */
+export type InvoiceStatus = "draft" | "sent" | "paid" | "void" | "expired";
+
+/**
+ * Issue #680: An invoice issued by a merchant, optionally linked to an
+ * on-chain payment once paid.
+ */
+export interface Invoice {
+  invoiceId: string;
+  merchantId: string;
+  customerId?: string;
+  lineItems: LineItem[];
+  currency: string;
+  status: InvoiceStatus;
+  paymentId?: string;
+  createdAt: string;
+  dueAt?: string;
+}
+
+export interface CreateInvoiceParams {
+  merchantId: string;
+  customerId?: string;
+  lineItems: LineItem[];
+  currency: string;
+  dueAt?: string;
 }
 
 export interface CreatePaymentParams {
@@ -720,6 +764,14 @@ export class FluxapayClient {
   }
 
   /**
+   * Issue #676: Read the consolidated refund policy — `require_receipt_hash`,
+   * `refund_expiry_secs`, `refund_fee_bps`, and `cooldown_secs` — in one call.
+   */
+  async getRefundPolicy() {
+    return withMappedContractError(() => this.contract.get_refund_policy());
+  }
+
+  /**
    * Get refund details by ID
    */
   async getRefund(refundId: string) {
@@ -973,6 +1025,68 @@ export class FluxapayClient {
     return withMappedContractError(() =>
       this.contract.bulk_bump_payment_ttls({ payment_ids: paymentIds }),
     );
+  }
+
+  /**
+   * Issue #680: Resolve the configured backend API URL, throwing a clear
+   * error if invoice methods are used without one.
+   */
+  private getApiUrl(): string {
+    if (!this.config.apiUrl) {
+      throw new Error(
+        "apiUrl is required in FluxapayConfig to use invoice methods.",
+      );
+    }
+    return this.config.apiUrl.replace(/\/$/, "");
+  }
+
+  /**
+   * Issue #680: Fetch a single invoice by id from the FluxaPay backend.
+   */
+  async getInvoice(invoiceId: string): Promise<Invoice> {
+    const res = await fetch(`${this.getApiUrl()}/invoices/${invoiceId}`);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch invoice ${invoiceId}: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Issue #680: List invoice ids for a merchant from the FluxaPay backend.
+   */
+  async getMerchantInvoices(merchantId: string): Promise<string[]> {
+    const res = await fetch(`${this.getApiUrl()}/merchants/${merchantId}/invoices`);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch invoices for merchant ${merchantId}: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Issue #680: Create a new invoice via the FluxaPay backend.
+   */
+  async createInvoice(params: CreateInvoiceParams): Promise<Invoice> {
+    const res = await fetch(`${this.getApiUrl()}/invoices`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to create invoice: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Issue #680: Mark an invoice as paid via the FluxaPay backend.
+   */
+  async markInvoicePaid(invoiceId: string): Promise<void> {
+    const res = await fetch(`${this.getApiUrl()}/invoices/${invoiceId}/mark-paid`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to mark invoice ${invoiceId} as paid: ${res.status}`);
+    }
   }
 
   private getPaymentLinkManager(): PaymentLinkManagerClient {

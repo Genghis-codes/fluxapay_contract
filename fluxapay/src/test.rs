@@ -1783,7 +1783,7 @@ fn test_cancel_refund_emits_event() {
 
     // Verify REFUND/CANCELLED event was emitted
     let events = env.events().all();
-    assert!(!events.is_empty());
+    assert!(!events.events().is_empty());
 }
 
 #[test]

@@ -108,12 +108,15 @@ fn setup_open_dispute<'a>(
 }
 
 fn has_dispute_event(env: &Env, event_name: &str) -> bool {
-    env.events().all().iter().any(|(_, topics, _)| {
+    use soroban_sdk::xdr::{ContractEventBody, ScVal};
+    env.events().all().events().iter().any(|event| {
+        let ContractEventBody::V0(v0) = &event.body;
+        let topics = &v0.topics;
         if topics.len() != 2 {
             return false;
         }
-        let namespace: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(env);
-        let name: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(env);
+        let namespace: Result<Symbol, _> = ScVal::from(topics[0].clone()).try_into_val(env);
+        let name: Result<Symbol, _> = ScVal::from(topics[1].clone()).try_into_val(env);
         matches!(
             (namespace, name),
             (Ok(namespace), Ok(name))
@@ -332,22 +335,22 @@ fn test_check_dispute_deadline_escalates_once() {
     let now = env.ledger().timestamp();
     refund_client.set_dispute_deadline(&operator, &dispute_id, &(now + 10));
 
-    let events_after_deadline = env.events().all().len();
+    let events_after_deadline = env.events().all().events().len();
 
     refund_client.check_dispute_deadline(&dispute_id);
     let dispute = refund_client.get_dispute(&dispute_id);
     assert!(!dispute.escalated);
-    assert_eq!(env.events().all().len(), events_after_deadline);
+    assert_eq!(env.events().all().events().len(), events_after_deadline);
 
     env.ledger().set_timestamp(now + 11);
     refund_client.check_dispute_deadline(&dispute_id);
 
     let escalated = refund_client.get_dispute(&dispute_id);
     assert!(escalated.escalated);
-    assert_eq!(env.events().all().len(), events_after_deadline + 1);
+    assert_eq!(env.events().all().events().len(), events_after_deadline + 1);
 
     refund_client.check_dispute_deadline(&dispute_id);
-    assert_eq!(env.events().all().len(), events_after_deadline + 1);
+    assert_eq!(env.events().all().events().len(), events_after_deadline + 1);
 }
 
 #[test]

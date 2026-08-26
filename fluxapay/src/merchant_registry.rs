@@ -1621,7 +1621,6 @@ impl MerchantRegistry {
             Some(cfg) => cfg.anchor_domain.clone(),
             None => String::from_str(&env, ""),
         };
-        merchant.anchor_config = MaybeAnchorConfig::from(anchor_config);
         merchant.anchor_config = MaybeAnchorConfig::from(anchor_config.clone());
         env.storage()
             .persistent()
@@ -1639,6 +1638,35 @@ impl MerchantRegistry {
             (merchant_id, domain),
         );
         Ok(())
+    }
+
+    /// Issue #669: Set (or replace) a merchant's SEP-6/SEP-24 anchor
+    /// configuration. Thin, always-set wrapper around `set_merchant_anchor`
+    /// (which also supports clearing via `None`) that additionally requires
+    /// the merchant to hold at least `KycTier::Basic` before an anchor may be
+    /// attached, per the SEP-6/SEP-24 integration guide.
+    ///
+    /// Requires the merchant's own signature (same auth as `set_merchant_anchor`).
+    pub fn set_anchor_config(
+        env: Env,
+        merchant_id: Address,
+        config: AnchorConfig,
+    ) -> Result<(), MerchantError> {
+        let merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        if merchant.kyc_tier == KycTier::Unverified {
+            return Err(MerchantError::NotVerified);
+        }
+
+        Self::set_merchant_anchor(env, merchant_id, Some(config))
+    }
+
+    /// Issue #669: Public read-only accessor for a merchant's anchor
+    /// configuration. Returns `None` if the merchant has not configured an
+    /// anchor (or does not exist).
+    pub fn get_anchor_config(env: Env, merchant_id: Address) -> Option<AnchorConfig> {
+        Self::get_merchant_internal(&env, &merchant_id)
+            .ok()
+            .and_then(|m| m.anchor_config.into_option())
     }
 
     /// Enable/disable whitelist mode for a merchant (issue #516).

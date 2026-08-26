@@ -3,7 +3,7 @@ use crate::{
     merchant_registry::{MerchantRegistry, MerchantRegistryClient},
     DexRouter, DexRouterClient, PaymentProcessor, PaymentProcessorClient, SwapAndPayArgs,
 };
-use soroban_sdk::{testutils::Address as _, vec, Address, Env, String, Symbol};
+use soroban_sdk::{testutils::Address as _, token, vec, Address, Env, String, Symbol};
 
 fn setup_oracle_swap_env(
     env: &Env,
@@ -36,8 +36,13 @@ fn setup_oracle_swap_env(
     let oracle_operator = Address::generate(env);
     oracle_client.oracle_grant_role(&admin, &Symbol::new(env, "ORACLE"), &oracle_operator);
 
-    let token_a = Address::generate(env);
-    let token_b = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     payment_client.allow_token(&admin, &token_b);
 
     (
@@ -131,6 +136,8 @@ fn test_oracle_sanitization_accepts_aligned_dex_quote() {
     let pair = Symbol::new(&env, "USDC_USD");
     // Match DEX stub quote: 10000 in -> 9900 out (rate 9900 with 4 decimals)
     oracle_client.set_rate(&oracle_operator, &pair, &9_900i128, &4);
+
+    token::StellarAssetClient::new(&env, &token_a).mint(&payer, &10_000);
 
     let path = vec![&env, token_a.clone(), token_b.clone()];
     let args = SwapAndPayArgs {

@@ -14,6 +14,11 @@
 - **Moved to instance storage**: `DataKey::RefundFeeBps` — initialized to 100 bps during `initialize_refund_manager`; previously read from persistent storage via multi-sig only.
 
 ### Added (prior) `settle_payment` correctly handles non-empty `splits` by distributing USDC according to `SettlementSplit.amount` and handles empty splits by transferring the full net amount directly to the merchant.
+- **Issue #375**: `swap_and_pay` DEX integration — transfers input tokens to the router, enforces `amount_out_min` slippage and `expires_at` deadline, creates the payment after swap, and emits `SWAP/EXECUTED`.
+- **Issue #376**: Subscription entry points on `RefundManager` — `create_plan`, `subscribe_to_plan`, `process_subscription`, `get_plan`, and merchant-aware `cancel_subscription`; subscription charge/cancel events documented in `EVENTS.md`.
+- **Issue #373**: DexRouter stub cleanup — prefixed unused swap parameters and added TODO comments for real router integration.
+- **Issue #372**: Removed unused test setup variables in `test.rs` to satisfy Clippy `-D warnings`.
+- **Issue #390**: `settle_payment` correctly handles non-empty `splits` by distributing USDC according to `SettlementSplit.amount` and handles empty splits by transferring the full net amount directly to the merchant.
 - **Issue #391**: Implemented `batch_expire_payments` for permissionless expiry sweeps up to 50 payments per call; fixed `expire_payment` to return `PaymentExpired` when attempting to expire a non-expired payment.
 - **Issue #392**: Dispute Escalation logic: implemented `escalate_expired_disputes` to flag disputes past their `review_deadline` as escalated, processing up to 20 disputes permissionlessly.
 - **Issue #393**: KYC Tier-Based Payment Limits: `MerchantRegistry` now supports `set_tier_limits` and `get_tier_limits`; `PaymentProcessor.create_payment` enforces `AmountBelowMin` and `AmountAboveMax` based on the merchant's tier limits.

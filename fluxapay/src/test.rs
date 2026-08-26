@@ -127,8 +127,6 @@ fn test_create_payment() {
     let merchant_id = Address::generate(&env);
     let amount = 1000000000i128; // 1000 USDC (6 decimals)
     let currency = Symbol::new(&env, "USDC");
-    let _deposit_address = Address::generate(&env);
-    let _expires_at = env.ledger().timestamp() + 3600;
     client.grant_role(&admin, &role_merchant(&env), &merchant_id);
 
     let args = create_payment_args(&env, &payment_id, &merchant_id, amount);

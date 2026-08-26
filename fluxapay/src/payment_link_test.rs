@@ -80,6 +80,35 @@ fn test_use_link_fixed_amount() {
 }
 
 #[test]
+fn test_use_link_unique_payment_ids_same_ledger() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (merchant, client) = setup_payment_link(&env);
+    let payer1 = Address::generate(&env);
+    let payer2 = Address::generate(&env);
+
+    let link_id = String::from_str(&env, "unique_pay_link");
+    let amount = 100i128;
+    client.create_link(
+        &merchant,
+        &link_id,
+        &Some(amount),
+        &Symbol::new(&env, "USDC"),
+        &String::from_str(&env, "Unique IDs"),
+        &None,
+        &Some(10),
+        &false,
+        &None,
+        &MaybeFiatConfig::None,
+        &None,
+    );
+
+    let payment_id_1 = client.use_link(&payer1, &link_id, &amount, &None);
+    let payment_id_2 = client.use_link(&payer2, &link_id, &amount, &None);
+    assert_ne!(payment_id_1, payment_id_2);
+}
+
+#[test]
 #[should_panic(expected = "Error(Contract, #406)")]
 fn test_use_link_wrong_amount() {
     let env = Env::default();

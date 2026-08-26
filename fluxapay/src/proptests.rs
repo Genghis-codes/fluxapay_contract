@@ -367,7 +367,7 @@ proptest! {
         let refunds = client.get_payment_refunds(&payment_id);
         let mut tracked_total: i128 = 0;
         for r in refunds.iter() {
-            if r.status != RefundStatus::Rejected {
+            if r.status != RefundStatus::Rejected && r.status != RefundStatus::Cancelled {
                 tracked_total += r.amount;
             }
         }
@@ -417,7 +417,7 @@ proptest! {
         let refunds = client.get_payment_refunds(&payment_id);
         let tracked_total: i128 = refunds
             .iter()
-            .filter(|r| r.status != RefundStatus::Rejected)
+            .filter(|r| r.status != RefundStatus::Rejected && r.status != RefundStatus::Cancelled)
             .map(|r| r.amount)
             .sum();
         prop_assert!(tracked_total <= payment_amount);

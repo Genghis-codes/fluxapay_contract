@@ -1658,13 +1658,13 @@ fn test_cancel_refund_by_requester() {
 
     client.cancel_refund(&requester, &refund_id);
 
-    // Refund record should be gone
-    let result = client.try_get_refund(&refund_id);
-    assert_eq!(result, Err(Ok(Error::RefundNotFound)));
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Cancelled);
 
-    // Payment refund list should be empty
+    // Payment refund list still tracks the cancelled refund
     let refunds = client.get_payment_refunds(&payment_id);
-    assert_eq!(refunds.len(), 0);
+    assert_eq!(refunds.len(), 1);
+    assert_eq!(refunds.get(0).unwrap().status, RefundStatus::Cancelled);
 }
 
 #[test]
@@ -1692,8 +1692,8 @@ fn test_cancel_refund_by_admin() {
 
     client.cancel_refund(&admin, &refund_id);
 
-    let result = client.try_get_refund(&refund_id);
-    assert_eq!(result, Err(Ok(Error::RefundNotFound)));
+    let refund = client.get_refund(&refund_id);
+    assert_eq!(refund.status, RefundStatus::Cancelled);
 }
 
 #[test]
@@ -1784,6 +1784,150 @@ fn test_cancel_refund_emits_event() {
     // Verify REFUND/CANCELLED event was emitted
     let events = env.events().all();
     assert!(!events.is_empty());
+}
+
+#[test]
+fn test_cancel_refund_already_cancelled() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_cancel_6");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &5000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+    let refund_id = client.create_refund(
+        &payment_id,
+        &500i128,
+        &String::from_str(&env, "reason"),
+        &requester,
+        &None,
+    );
+
+    client.cancel_refund(&requester, &refund_id);
+
+    let result = client.try_cancel_refund(&requester, &refund_id);
+    assert_eq!(result, Err(Ok(Error::RefundCancelled)));
+}
+
+#[test]
+fn test_cancel_refund_does_not_count_toward_total() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup_refund_manager(&env);
+
+    let payment_id = String::from_str(&env, "payment_cancel_7");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &1000i128,
+        &Symbol::new(&env, "USDC"),
+    );
+    let refund_id = client.create_refund(
+        &payment_id,
+        &600i128,
+        &String::from_str(&env, "will cancel"),
+        &requester,
+        &None,
+    );
+
+    client.cancel_refund(&requester, &refund_id);
+
+    // A second refund up to the full payment amount should succeed
+    let refund_id_2 = client.create_refund(
+        &payment_id,
+        &1000i128,
+        &String::from_str(&env, "full after cancel"),
+        &requester,
+        &None,
+    );
+    assert!(!refund_id_2.is_empty());
+}
+
+#[test]
+fn test_refund_fee_bps_default_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup_refund_manager(&env);
+
+    assert_eq!(client.get_refund_fee_bps(), 100);
+}
+
+#[test]
+fn test_set_refund_fee_bps_by_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    client.set_refund_fee_bps(&admin, &200);
+    assert_eq!(client.get_refund_fee_bps(), 200);
+}
+
+#[test]
+fn test_set_refund_fee_bps_rejected_by_non_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_, client) = setup_refund_manager(&env);
+
+    let random = Address::generate(&env);
+    let result = client.try_set_refund_fee_bps(&random, &50);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_set_refund_fee_bps_rejects_out_of_range() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_refund_manager(&env);
+
+    let result = client.try_set_refund_fee_bps(&admin, &1_001);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+#[test]
+fn test_refund_fee_bps_applied_on_process() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, usdc_token) = setup_refund_manager_with_token(&env);
+
+    client.set_refund_fee_bps(&admin, &200); // 2%
+
+    let payment_id = String::from_str(&env, "pay_fee_bps");
+    let merchant_id = Address::generate(&env);
+    let requester = Address::generate(&env);
+    let refund_amount = 10_000i128;
+
+    client.register_payment(
+        &payment_id,
+        &merchant_id,
+        &refund_amount,
+        &Symbol::new(&env, "USDC"),
+    );
+    let refund_id = client.create_refund(
+        &payment_id,
+        &refund_amount,
+        &String::from_str(&env, "fee test"),
+        &requester,
+        &None,
+    );
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_settlement_operator(&env), &operator);
+    client.process_refund(&operator, &refund_id);
+
+    let token_client = token::TokenClient::new(&env, &usdc_token);
+    let fee = refund_amount * 200 / 10_000;
+
+    assert_eq!(token_client.balance(&admin), fee);
 }
 
 // ── Issue #114: Total Refund Validation ──────────────────────────────────────

@@ -182,6 +182,7 @@ pub enum RefundStatus {
     Pending,
     Completed,
     Rejected,
+    Cancelled,
 }
 
 #[contracttype]
@@ -1005,6 +1006,27 @@ impl RefundManager {
         env.storage()
             .persistent()
             .set(&DataKey::UsdcToken, &usdc_token_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundFeeBps, &REFUND_FEE_BPS);
+        Ok(())
+    }
+
+    /// Admin-only: set the refund processing fee in basis points (0–1000, max 10%).
+    pub fn set_refund_fee_bps(env: Env, admin: Address, bps: i128) -> Result<(), Error> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(Error::Unauthorized);
+        }
+
+        if bps < 0 || bps > 1_000 {
+            return Err(Error::InvalidAmount);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RefundFeeBps, &bps);
         Ok(())
     }
 
@@ -1532,7 +1554,7 @@ impl RefundManager {
         let mut total_refunded: i128 = 0;
         for id in existing_refunds.iter() {
             if let Ok(r) = Self::get_refund_internal(env, &id) {
-                if r.status != RefundStatus::Rejected {
+                if r.status != RefundStatus::Rejected && r.status != RefundStatus::Cancelled {
                     total_refunded += r.amount;
                 }
             }
@@ -1786,11 +1808,7 @@ impl RefundManager {
             .ok_or(Error::PaymentNotFound)?;
 
         // Issue #167: Query merchant's KYC tier and apply tiered refund fee
-        let default_fee_bps = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CurrentFee)
-            .unwrap_or(REFUND_FEE_BPS);
+        let default_fee_bps = Self::get_refund_fee_bps_internal(env);
 
         let fee_bps = if let Some(registry_address) = env
             .storage()
@@ -1806,13 +1824,13 @@ impl RefundManager {
                         KycTier::Business => REFUND_FEE_BPS_BUSINESS,
                         KycTier::Full => REFUND_FEE_BPS_FULL,
                         KycTier::Basic => REFUND_FEE_BPS_BASIC,
-                        KycTier::Unverified => default_fee_bps, // Default 1% dynamically updated
+                        KycTier::Unverified => default_fee_bps,
                     }
                 }
-                _ => default_fee_bps, // Default if registry lookup fails
+                _ => default_fee_bps,
             }
         } else {
-            default_fee_bps // Default if no registry configured
+            default_fee_bps
         };
 
         let fee = refund.amount * fee_bps / 10_000;
@@ -2170,11 +2188,7 @@ impl RefundManager {
             .ok_or(Error::Unauthorized)?;
         let token_client = token::TokenClient::new(&env, &usdc_token_address);
 
-        let default_fee_bps = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CurrentFee)
-            .unwrap_or(REFUND_FEE_BPS);
+        let default_fee_bps = Self::get_refund_fee_bps_internal(&env);
         let fee = refund_amount * default_fee_bps / 10_000;
         let net_amount = refund_amount - fee;
 
@@ -2210,10 +2224,12 @@ impl RefundManager {
     pub fn cancel_refund(env: Env, caller: Address, refund_id: String) -> Result<(), Error> {
         caller.require_auth();
 
-        let refund = Self::get_refund_internal(&env, &refund_id)?;
+        let mut refund = Self::get_refund_internal(&env, &refund_id)?;
 
-        if refund.status != RefundStatus::Pending {
-            return Err(Error::RefundAlreadyProcessed);
+        match refund.status {
+            RefundStatus::Pending => {}
+            RefundStatus::Cancelled => return Err(Error::RefundCancelled),
+            _ => return Err(Error::RefundAlreadyProcessed),
         }
 
         let is_requester = caller == refund.requester;
@@ -2222,23 +2238,13 @@ impl RefundManager {
             return Err(Error::Unauthorized);
         }
 
-        // Remove from payment's refund list
-        let existing = Self::get_payment_refunds_internal(&env, &refund.payment_id);
-        let mut updated = vec![&env];
-        for id in existing.iter() {
-            if id != refund_id {
-                updated.push_back(id);
-            }
-        }
-        env.storage().persistent().set(
-            &DataKey::PaymentRefunds(refund.payment_id.clone()),
-            &updated,
-        );
+        refund.status = RefundStatus::Cancelled;
+        refund.processed_at = Some(env.ledger().timestamp());
 
-        // Remove the refund record
         env.storage()
             .persistent()
-            .remove(&DataKey::Refund(refund_id.clone()));
+            .set(&DataKey::Refund(refund_id.clone()), &refund);
+        Self::bump_refund_ttl(&env, &refund_id, &refund.status);
 
         env.events().publish(
             (Symbol::new(&env, "REFUND"), Symbol::new(&env, "CANCELLED")),
@@ -2467,7 +2473,7 @@ impl RefundManager {
         let mut total_refunded: i128 = 0;
         for id in existing_refunds.iter() {
             if let Ok(r) = Self::get_refund_internal(&env, &id) {
-                if r.status != RefundStatus::Rejected {
+                if r.status != RefundStatus::Rejected && r.status != RefundStatus::Cancelled {
                     total_refunded += r.amount;
                 }
             }
@@ -5102,7 +5108,9 @@ impl RefundManager {
     fn refund_ttl(status: &RefundStatus) -> u32 {
         match status {
             RefundStatus::Pending => SHORT_LIVE_TTL,
-            RefundStatus::Completed | RefundStatus::Rejected => LONG_LIVE_TTL,
+            RefundStatus::Completed
+            | RefundStatus::Rejected
+            | RefundStatus::Cancelled => LONG_LIVE_TTL,
         }
     }
 
@@ -7412,11 +7420,7 @@ impl PaymentProcessor {
         let mut total_refunds: i128 = 0;
         let mut dispute_adjustments: i128 = 0;
 
-        let default_fee_bps = env
-            .storage()
-            .persistent()
-            .get(&DataKey::CurrentFee)
-            .unwrap_or(REFUND_FEE_BPS);
+        let default_fee_bps = Self::get_refund_fee_bps_internal(&env);
 
         let merchant_fee_bps = if let Some(registry_address) = env
             .storage()
@@ -9495,11 +9499,11 @@ impl PaymentProcessor {
                     Symbol::new(&env, "SET_VOLUME_CAP")
                 }
                 AdminAction::SetRefundFeeBps(bps) => {
-                    if *bps < 0 || *bps > 10_000 {
+                    if *bps < 0 || *bps > 1_000 {
                         return Err(Error::InvalidAmount);
                     }
                     env.storage()
-                        .persistent()
+                        .instance()
                         .set(&DataKey::RefundFeeBps, bps);
                     Symbol::new(&env, "SET_REFUND_FEE")
                 }
@@ -9576,11 +9580,15 @@ impl PaymentProcessor {
         }
     }
 
-    /// Read the effective refund fee in basis points.
-    /// Falls back to the compile-time constant if not overridden by a proposal.
+    /// Read the effective refund fee in basis points from instance storage.
+    /// Falls back to the compile-time default (100 bps) if not yet configured.
     pub fn get_refund_fee_bps(env: Env) -> i128 {
+        Self::get_refund_fee_bps_internal(&env)
+    }
+
+    fn get_refund_fee_bps_internal(env: &Env) -> i128 {
         env.storage()
-            .persistent()
+            .instance()
             .get::<DataKey, i128>(&DataKey::RefundFeeBps)
             .unwrap_or(REFUND_FEE_BPS)
     }

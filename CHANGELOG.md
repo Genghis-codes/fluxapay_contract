@@ -3,6 +3,17 @@
 ## [Unreleased]
 
 ### Added
+- **Issue #378**: `cancel_refund` entry point — adds `RefundStatus::Cancelled`, transitions pending refunds to cancelled (requester or admin only), emits `REFUND/CANCELLED`, and excludes cancelled refunds from payment refund totals.
+- **Issue #379**: Admin-configurable refund fee — `RefundFeeBps` stored in instance storage (default 100 bps at init); new `set_refund_fee_bps(admin, bps)` setter (0–1000 bps) and `get_refund_fee_bps()` getter; `process_refund` reads fee from storage.
+
+### Fixed
+- **Issue #374**: Removed unnecessary `mut` on `processed_count` and unused `now` in `process_due_subscriptions` batch processor (Clippy clean).
+- **Issue #377**: `use_link` payment IDs now combine ledger timestamp with link `use_count` to prevent same-ledger collisions.
+
+### Storage key layout changes (Issue #379)
+- **Moved to instance storage**: `DataKey::RefundFeeBps` — initialized to 100 bps during `initialize_refund_manager`; previously read from persistent storage via multi-sig only.
+
+### Added (prior) `settle_payment` correctly handles non-empty `splits` by distributing USDC according to `SettlementSplit.amount` and handles empty splits by transferring the full net amount directly to the merchant.
 - **Issue #375**: `swap_and_pay` DEX integration — transfers input tokens to the router, enforces `amount_out_min` slippage and `expires_at` deadline, creates the payment after swap, and emits `SWAP/EXECUTED`.
 - **Issue #376**: Subscription entry points on `RefundManager` — `create_plan`, `subscribe_to_plan`, `process_subscription`, `get_plan`, and merchant-aware `cancel_subscription`; subscription charge/cancel events documented in `EVENTS.md`.
 - **Issue #373**: DexRouter stub cleanup — prefixed unused swap parameters and added TODO comments for real router integration.

@@ -149,7 +149,8 @@ export type FluxaDataKey =
 export type RefundStatus =
   | { tag: "Pending"; values: void }
   | { tag: "Completed"; values: void }
-  | { tag: "Rejected"; values: void };
+  | { tag: "Rejected"; values: void }
+  | { tag: "Cancelled"; values: void };
 
 export type DisputeStatus =
   | { tag: "Open"; values: void }

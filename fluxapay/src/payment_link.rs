@@ -393,8 +393,13 @@ impl PaymentLinkManager {
             );
         }
 
-        // Generate a virtual payment ID for tracking
-        let payment_id = format_id(&env, "lnk_pay_", env.ledger().timestamp());
+        // Generate a globally unique payment ID: combine ledger timestamp with the
+        // post-increment use_count so multiple use_link calls within the same ledger
+        // (same timestamp) never collide.
+        let unique_id = (env.ledger().timestamp() as u128)
+            .saturating_mul(1_000_000)
+            .saturating_add(link.use_count as u128) as u64;
+        let payment_id = format_id(&env, "lnk_pay_", unique_id);
 
         // Create and store a PaymentCharge record for this payment
         let now = env.ledger().timestamp();

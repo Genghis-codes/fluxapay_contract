@@ -3,7 +3,17 @@
 ## [Unreleased]
 
 ### Added
-- **Issue #390**: `settle_payment` correctly handles non-empty `splits` by distributing USDC according to `SettlementSplit.amount` and handles empty splits by transferring the full net amount directly to the merchant.
+- **Issue #378**: `cancel_refund` entry point — adds `RefundStatus::Cancelled`, transitions pending refunds to cancelled (requester or admin only), emits `REFUND/CANCELLED`, and excludes cancelled refunds from payment refund totals.
+- **Issue #379**: Admin-configurable refund fee — `RefundFeeBps` stored in instance storage (default 100 bps at init); new `set_refund_fee_bps(admin, bps)` setter (0–1000 bps) and `get_refund_fee_bps()` getter; `process_refund` reads fee from storage.
+
+### Fixed
+- **Issue #374**: Removed unnecessary `mut` on `processed_count` and unused `now` in `process_due_subscriptions` batch processor (Clippy clean).
+- **Issue #377**: `use_link` payment IDs now combine ledger timestamp with link `use_count` to prevent same-ledger collisions.
+
+### Storage key layout changes (Issue #379)
+- **Moved to instance storage**: `DataKey::RefundFeeBps` — initialized to 100 bps during `initialize_refund_manager`; previously read from persistent storage via multi-sig only.
+
+### Added (prior) `settle_payment` correctly handles non-empty `splits` by distributing USDC according to `SettlementSplit.amount` and handles empty splits by transferring the full net amount directly to the merchant.
 - **Issue #391**: Implemented `batch_expire_payments` for permissionless expiry sweeps up to 50 payments per call; fixed `expire_payment` to return `PaymentExpired` when attempting to expire a non-expired payment.
 - **Issue #392**: Dispute Escalation logic: implemented `escalate_expired_disputes` to flag disputes past their `review_deadline` as escalated, processing up to 20 disputes permissionlessly.
 - **Issue #393**: KYC Tier-Based Payment Limits: `MerchantRegistry` now supports `set_tier_limits` and `get_tier_limits`; `PaymentProcessor.create_payment` enforces `AmountBelowMin` and `AmountAboveMax` based on the merchant's tier limits.

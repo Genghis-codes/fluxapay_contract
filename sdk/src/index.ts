@@ -212,6 +212,31 @@ export const MerchantAuthError = {
   6: { message: "AuthorizationAlreadyExists" },
 } as const;
 
+/**
+ * Issue #185 / #665: Record of a dispute settled off-chain by mutual
+ * agreement between buyer and merchant, mirroring `CollaborativeSettlement`
+ * in `fluxapay/src/lib.rs`.
+ */
+export interface CollaborativeSettlement {
+  dispute_id: string;
+  settlement_amount: bigint;
+  buyer_pubkey: Buffer;
+  merchant_pubkey: Buffer;
+  settled_at: bigint;
+}
+
+/**
+ * Issue #664: A single usage-metering record for a subscription, mirroring
+ * `UsageMetrics` in `fluxapay/src/lib.rs`.
+ */
+export interface UsageMetrics {
+  subscription_id: string;
+  units_used: bigint;
+  unit_price: bigint;
+  amount: bigint;
+  recorded_at: bigint;
+}
+
 export interface UpdateMerchantParams {
   merchantId: string;
   businessName?: string;
@@ -973,6 +998,107 @@ export class FluxapayClient {
     return withMappedContractError(() =>
       this.contract.bulk_bump_payment_ttls({ payment_ids: paymentIds }),
     );
+  }
+
+  /**
+   * Issue #665: Close a dispute instantly when both the buyer and merchant
+   * have agreed on a settlement amount off-chain and submit their Ed25519
+   * signatures over `SHA-256(dispute_id || settlement_amount_le16)`.
+   *
+   * Wraps `RefundManager::settle_dispute_collaboratively`. Note: bindings
+   * for this entry point haven't been regenerated yet (TODO: `npm run
+   * generate`), so this calls through `this.contract` untyped.
+   *
+   * @returns The refund ID created for the settlement.
+   */
+  async settleDisputeCollaboratively(params: {
+    disputeId: string;
+    settlementAmount: bigint;
+    buyerPubkey: Buffer;
+    signatureBuyer: Buffer;
+    merchantPubkey: Buffer;
+    signatureMerchant: Buffer;
+  }): Promise<string> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).settle_dispute_collaboratively({
+        dispute_id: params.disputeId,
+        settlement_amount: params.settlementAmount,
+        buyer_pubkey: params.buyerPubkey,
+        signature_buyer: params.signatureBuyer,
+        merchant_pubkey: params.merchantPubkey,
+        signature_merchant: params.signatureMerchant,
+      });
+      return tx.result;
+    });
+  }
+
+  /**
+   * Issue #665: Retrieve the collaborative settlement record for a dispute,
+   * or `null` if the dispute has no such record (or doesn't exist —
+   * `DisputeNotFound`).
+   */
+  async getCollaborativeSettlement(disputeId: string): Promise<CollaborativeSettlement | null> {
+    try {
+      return await withMappedContractError(async () => {
+        const tx = await (this.contract as any).get_collaborative_settlement({
+          dispute_id: disputeId,
+        });
+        return tx.result;
+      });
+    } catch (error) {
+      if (error instanceof FluxapayError && error.contractErrorName === "DisputeNotFound") {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Issue #664: Submit usage metrics for a metered subscription. The
+   * subscription's charge amount is overridden to `units * unitPrice` and
+   * charged immediately. Throws a mapped `InvalidStatusTransition` error if
+   * the subscription is Cancelled/Expired (not currently billable).
+   *
+   * Wraps `RefundManager::submit_usage_metrics`. Note: bindings for this
+   * entry point haven't been regenerated yet (TODO: `npm run generate`),
+   * so this calls through `this.contract` untyped.
+   */
+  async submitUsageMetrics(params: {
+    subscriptionId: string;
+    units: bigint;
+    unitPrice: bigint;
+    token: string;
+    caller: string;
+  }): Promise<void> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).submit_usage_metrics({
+        operator: params.caller,
+        subscription_id: params.subscriptionId,
+        units_used: params.units,
+        unit_price: params.unitPrice,
+        token: params.token,
+      });
+      return tx.result;
+    });
+  }
+
+  /**
+   * Issue #664: Retrieve usage-metric records for a subscription recorded
+   * within `[fromTimestamp, toTimestamp]` (inclusive), oldest first.
+   */
+  async getUsageMetrics(
+    subscriptionId: string,
+    fromTimestamp: number,
+    toTimestamp: number,
+  ): Promise<UsageMetrics[]> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).get_usage_metrics({
+        subscription_id: subscriptionId,
+        from_timestamp: BigInt(fromTimestamp),
+        to_timestamp: BigInt(toTimestamp),
+      });
+      return tx.result;
+    });
   }
 
   private getPaymentLinkManager(): PaymentLinkManagerClient {

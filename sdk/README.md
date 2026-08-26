@@ -231,6 +231,26 @@ const dispute = await client.getDispute("dispute_001");
 const paymentDisputes = await client.getPaymentDisputes("pay_123");
 ```
 
+## Partial / Overpaid Payments (FluxapayClient)
+
+When `verifyPayment` sees an amount that doesn't match the expected total, the
+payment moves to `PaymentStatus.PartiallyPaid` (underpaid) or
+`PaymentStatus.Overpaid` (overpaid) instead of `Confirmed`.
+
+```typescript
+// Merchant accepts the partial amount actually received (no refund issued
+// for the shortfall) — moves the payment to Confirmed.
+await client.acceptPartialPayment("G...MERCHANT", "pay_123");
+
+// Customer tops up a PartiallyPaid payment instead — moves it back to
+// Pending so a following verifyPayment call can confirm it with the
+// combined amount.
+await client.completePartialPayment("G...CUSTOMER", "pay_123", 250000n);
+```
+
+Both calls throw `FluxapayError` with `contractErrorName: "PaymentAlreadyProcessed"`
+if the payment isn't currently `PartiallyPaid`.
+
 ## Merchant Pre-Authorization (Pull Billing)
 
 `MerchantPreAuth` lets a customer grant a merchant permission to pull up to a

@@ -77,6 +77,8 @@ impl DexRouter {
         Ok(())
     }
 
+    /// TODO: delegate token transfers to the real Soroswap router contract and
+    /// pull liquidity from on-chain pools instead of simulated quotes.
     pub fn swap_exact_tokens_for_tokens(
         env: Env,
         amount_in: i128,
@@ -124,6 +126,10 @@ impl DexRouter {
         to: Address,
         deadline: u64,
     ) -> Result<Vec<i128>, DexRouterError> {
+        if env.ledger().timestamp() > deadline {
+            return Err(DexRouterError::SwapFailed);
+        }
+
         let amounts = Self::get_amounts_out(env.clone(), amount_in, path.clone());
         if amounts.is_empty() {
             return Err(DexRouterError::NoOutputAmount);
@@ -154,6 +160,9 @@ impl DexRouter {
     /// path: array of token addresses [token_in, token_out]
     /// to: address to receive output tokens
     /// deadline: Unix timestamp after which the swap reverts
+    ///
+    /// TODO: invoke the real router's swap_tokens_for_exact_tokens, enforce
+    /// deadline and amount_in_max, transfer tokens, and emit SWAP/EXECUTED.
     pub fn swap_tokens_for_exact_tokens(
         env: Env,
         amount_out: i128,
@@ -162,10 +171,6 @@ impl DexRouter {
         _to: Address,
         _deadline: u64,
     ) -> Vec<i128> {
-        // Similar to swap_exact_tokens_for_tokens but for exact output
-        Symbol::new(&env, "SWAP");
-        Symbol::new(&env, "EXECUTED");
-
         let mut amounts = Vec::new(&env);
         for _ in 0..path.len() {
             amounts.push_back(amount_out);

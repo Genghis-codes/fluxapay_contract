@@ -175,6 +175,27 @@ Emitted when a new subscription is created.
 - **Topics**: `(SUBSCRIPTION, CREATED)`
 - **Data**: `(subscription_id: String, payer: Address, plan_id: String)`
 
+### SUBSCRIPTION/CHARGED
+Emitted when a recurring subscription payment is successfully processed.
+- **Topics**: `(SUBSCRIPTION, CHARGED)`
+- **Data**: `(subscription_id: String, payer: Address, merchant_id: Address, amount: i128, total_payments: u32)`
+
+### SUBSCRIPTION/CANCELLED
+Emitted when an active subscription is cancelled by the payer or merchant.
+- **Topics**: `(SUBSCRIPTION, CANCELLED)`
+- **Data**: `(subscription_id: String, cancelled_by: Address)`
+
+---
+
+## Swap Events
+
+Emitted by the `PaymentProcessor` contract.
+
+### SWAP/EXECUTED
+Emitted when a DEX swap completes as part of `swap_and_pay`.
+- **Topics**: `(SWAP, EXECUTED)`
+- **Data**: `(payment_id: String, sender: Address, amount_in: i128, amount_out: i128)`
+
 ---
 
 ## Stream Events

@@ -1442,6 +1442,31 @@ impl MerchantRegistry {
         env: Env,
         merchant_id: Address,
         anchor_config: Option<AnchorConfig>,
+    ) -> Result<(), MerchantError> {
+        merchant_id.require_auth();
+
+        let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
+        merchant.anchor_config = MaybeAnchorConfig::from(anchor_config.clone());
+        env.storage()
+            .persistent()
+            .set(&MerchantDataKey::Merchant(merchant_id.clone()), &merchant);
+
+        let anchor_domain = anchor_config
+            .as_ref()
+            .map(|config| config.anchor_domain.clone())
+            .unwrap_or_else(|| String::from_str(&env, ""));
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "MERCHANT"),
+                Symbol::new(&env, "ANCHOR_UPDATED"),
+            ),
+            (merchant_id, anchor_domain),
+        );
+
+        Ok(())
+    }
+
     /// Enable/disable whitelist mode for a merchant (issue #516).
     /// Only Business-tier merchants may enable whitelist mode.
     pub fn set_merchant_whitelist_mode(
@@ -1452,8 +1477,6 @@ impl MerchantRegistry {
         merchant_id.require_auth();
 
         let mut merchant = Self::get_merchant_internal(&env, &merchant_id)?;
-        merchant.anchor_config = MaybeAnchorConfig::from(anchor_config.clone());
-
 
         if enabled && merchant.kyc_tier != KycTier::Business {
             return Err(MerchantError::WhitelistModeRequiresBusinessTier);
@@ -1513,6 +1536,11 @@ impl MerchantRegistry {
         env.events().publish(
             (Symbol::new(&env, "MERCHANT"), Symbol::new(&env, "FEE_WAIVER_SET")),
             (merchant_id, expires_at_for_event),
+        );
+
+        Ok(())
+    }
+
     /// Add a customer address to the merchant's payment whitelist (issue #516).
     pub fn add_to_customer_whitelist(
         env: Env,

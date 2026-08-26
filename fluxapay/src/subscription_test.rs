@@ -2,11 +2,14 @@ use crate::{
     access_control::role_oracle, BillingInterval, Error, RefundManager, RefundManagerClient,
     SubscriptionStatus,
 };
-use soroban_sdk::{testutils::Address as _, testutils::Events, testutils::Ledger as _, Address, Env, String, Symbol, vec, TryIntoVal};
+use soroban_sdk::{
+    testutils::Address as _, testutils::Events, testutils::Ledger as _, token, Address, Env,
+    String, Symbol, vec, TryIntoVal,
+};
 
 // ── Shared setup helpers ──────────────────────────────────────────────────────
 
-fn setup_refund_manager(env: &Env) -> (Address, RefundManagerClient<'_>) {
+fn setup_refund_manager(env: &Env) -> (Address, RefundManagerClient<'_>, Address) {
     let contract_id = env.register(RefundManager, ());
     let client = RefundManagerClient::new(env, &contract_id);
     let admin = Address::generate(env);
@@ -17,13 +20,13 @@ fn setup_refund_manager(env: &Env) -> (Address, RefundManagerClient<'_>) {
 
     client.initialize_refund_manager(&admin, &usdc_token);
 
-    (admin, client)
+    (admin, client, usdc_token)
 }
 
 /// Create a merchant with MERCHANT role and a subscription plan, returning
 /// `(client, admin, merchant, plan_id)`.
-fn setup_with_plan(env: &Env) -> (RefundManagerClient<'_>, Address, Address, String) {
-    let (admin, client) = setup_refund_manager(env);
+fn setup_with_plan(env: &Env) -> (RefundManagerClient<'_>, Address, Address, String, Address) {
+    let (admin, client, usdc_token) = setup_refund_manager(env);
 
     let merchant = Address::generate(env);
     client.grant_role(&admin, &Symbol::new(env, "MERCHANT"), &merchant);
@@ -39,7 +42,7 @@ fn setup_with_plan(env: &Env) -> (RefundManagerClient<'_>, Address, Address, Str
         &BillingInterval::Weekly,
     );
 
-    (client, admin, merchant, plan_id)
+    (client, admin, merchant, plan_id, usdc_token)
 }
 
 // ── process_due_subscriptions stub tests ─────────────────────────────────────
@@ -51,7 +54,7 @@ fn setup_with_plan(env: &Env) -> (RefundManagerClient<'_>, Address, Address, Str
 fn test_process_due_subscriptions_operator_gets_zero_when_none_due() {
     let env = Env::default();
     env.mock_all_auths();
-    let (admin, client) = setup_refund_manager(&env);
+    let (admin, client, _usdc_token) = setup_refund_manager(&env);
     let operator = Address::generate(&env);
 
     client.grant_role(&admin, &role_oracle(&env), &operator);
@@ -68,7 +71,7 @@ fn test_process_due_subscriptions_operator_gets_zero_when_none_due() {
 fn test_process_due_subscriptions_rejects_non_operator() {
     let env = Env::default();
     env.mock_all_auths();
-    let (_admin, client) = setup_refund_manager(&env);
+    let (_admin, client, _usdc_token) = setup_refund_manager(&env);
     let non_operator = Address::generate(&env);
 
     let result = client.try_process_due_subscriptions(&non_operator);
@@ -83,7 +86,7 @@ fn test_process_due_subscriptions_rejects_non_operator() {
 fn test_create_subscription_plan_by_merchant_stores_plan() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, merchant, plan_id) = setup_with_plan(&env);
+    let (client, _admin, merchant, plan_id, _usdc_token) = setup_with_plan(&env);
 
     let plan = client.get_subscription_plan(&plan_id);
     assert_eq!(plan.plan_id, plan_id);
@@ -97,7 +100,7 @@ fn test_create_subscription_plan_by_merchant_stores_plan() {
 fn test_create_subscription_plan_by_non_merchant_is_unauthorized() {
     let env = Env::default();
     env.mock_all_auths();
-    let (_admin, client) = setup_refund_manager(&env);
+    let (_admin, client, _usdc_token) = setup_refund_manager(&env);
     let non_merchant = Address::generate(&env);
 
     let result = client.try_create_subscription_plan(
@@ -118,7 +121,7 @@ fn test_create_subscription_plan_by_non_merchant_is_unauthorized() {
 fn test_subscribe_to_active_plan_creates_subscription_and_emits_event() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _merchant, plan_id) = setup_with_plan(&env);
+    let (client, _admin, _merchant, plan_id, _usdc_token) = setup_with_plan(&env);
 
     let payer = Address::generate(&env);
     let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
@@ -157,7 +160,7 @@ fn test_subscribe_to_active_plan_creates_subscription_and_emits_event() {
 fn test_subscribe_to_inactive_plan_fails() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, merchant, plan_id) = setup_with_plan(&env);
+    let (client, _admin, merchant, plan_id, _usdc_token) = setup_with_plan(&env);
 
     // Deactivate the plan first
     client.deactivate_subscription_plan(&merchant, &plan_id);
@@ -175,7 +178,7 @@ fn test_subscribe_to_inactive_plan_fails() {
 fn test_pause_subscription_by_payer_becomes_paused() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _merchant, plan_id) = setup_with_plan(&env);
+    let (client, _admin, _merchant, plan_id, _usdc_token) = setup_with_plan(&env);
 
     let payer = Address::generate(&env);
     let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
@@ -191,7 +194,7 @@ fn test_pause_subscription_by_payer_becomes_paused() {
 fn test_resume_subscription_by_payer_becomes_active_with_updated_payment_at() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _merchant, plan_id) = setup_with_plan(&env);
+    let (client, _admin, _merchant, plan_id, _usdc_token) = setup_with_plan(&env);
 
     let payer = Address::generate(&env);
     let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
@@ -222,7 +225,7 @@ fn test_resume_subscription_by_payer_becomes_active_with_updated_payment_at() {
 fn test_cancel_subscription_by_payer_becomes_cancelled() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _merchant, plan_id) = setup_with_plan(&env);
+    let (client, _admin, _merchant, plan_id, _usdc_token) = setup_with_plan(&env);
 
     let payer = Address::generate(&env);
     let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
@@ -238,7 +241,7 @@ fn test_cancel_subscription_by_payer_becomes_cancelled() {
 fn test_get_payer_subscriptions_returns_all_for_payer() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _merchant, plan_id) = setup_with_plan(&env);
+    let (client, _admin, _merchant, plan_id, _usdc_token) = setup_with_plan(&env);
 
     let payer = Address::generate(&env);
 
@@ -271,10 +274,114 @@ fn test_get_payer_subscriptions_returns_all_for_payer() {
 fn test_deactivate_subscription_plan_by_merchant_marks_inactive() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, merchant, plan_id) = setup_with_plan(&env);
+    let (client, _admin, merchant, plan_id, _usdc_token) = setup_with_plan(&env);
 
     client.deactivate_subscription_plan(&merchant, &plan_id);
 
     let plan = client.get_subscription_plan(&plan_id);
     assert!(!plan.active, "Plan should be inactive after deactivation");
+}
+
+/// Operator can charge a subscription once its next_payment_at has passed.
+#[test]
+fn test_process_subscription_charges_on_due_date() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _merchant, plan_id, usdc_token) = setup_with_plan(&env);
+
+    let payer = Address::generate(&env);
+    let sub_id = String::from_str(&env, "sub_due_charge");
+    client.subscribe_to_plan(&payer, &sub_id, &plan_id);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+
+    let sub_before = client.get_subscription(&sub_id);
+    env.ledger()
+        .set_timestamp(sub_before.next_payment_at.saturating_add(1));
+
+    let token_client = token::StellarAssetClient::new(&env, &usdc_token);
+    token_client.mint(&payer, &2_000_000_i128);
+
+    let status = client.process_subscription(&operator, &sub_id);
+    assert_eq!(status, SubscriptionStatus::Active);
+
+    let sub_after = client.get_subscription(&sub_id);
+    assert_eq!(sub_after.total_payments, 1);
+    assert!(sub_after.last_payment_at.is_some());
+}
+
+/// process_subscription rejects charges before the billing date.
+#[test]
+fn test_process_subscription_rejects_early_charge() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _merchant, plan_id, _usdc_token) = setup_with_plan(&env);
+
+    let payer = Address::generate(&env);
+    let sub_id = String::from_str(&env, "sub_early_charge");
+    client.subscribe_to_plan(&payer, &sub_id, &plan_id);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+
+    let result = client.try_process_subscription(&operator, &sub_id);
+    assert_eq!(result, Err(Ok(Error::PaymentAlreadyProcessed)));
+
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.total_payments, 0);
+}
+
+/// Subscriptions auto-cancel after reaching max_payments.
+#[test]
+fn test_process_subscription_respects_max_payments() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _merchant, plan_id, usdc_token) = setup_with_plan(&env);
+
+    let payer = Address::generate(&env);
+    let sub_id = client.subscribe(&payer, &plan_id, &Some(1u32), &None, &None);
+
+    let operator = Address::generate(&env);
+    client.grant_role(&admin, &role_oracle(&env), &operator);
+
+    let token_client = token::StellarAssetClient::new(&env, &usdc_token);
+    token_client.mint(&payer, &5_000_000_i128);
+
+    let sub = client.get_subscription(&sub_id);
+    env.ledger()
+        .set_timestamp(sub.next_payment_at.saturating_add(1));
+
+    let status = client.process_subscription(&operator, &sub_id);
+    assert_eq!(status, SubscriptionStatus::Expired);
+
+    let sub_after = client.get_subscription(&sub_id);
+    assert_eq!(sub_after.total_payments, 1);
+    assert_eq!(sub_after.status, SubscriptionStatus::Expired);
+}
+
+/// create_plan and get_plan expose plan metadata with custom interval_secs.
+#[test]
+fn test_create_plan_and_get_plan() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client, _usdc_token) = setup_refund_manager(&env);
+
+    let merchant = Address::generate(&env);
+    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
+
+    let plan_id = String::from_str(&env, "plan_custom");
+    client.create_plan(
+        &merchant,
+        &plan_id,
+        &String::from_str(&env, "Custom"),
+        &String::from_str(&env, "Every 2 hours"),
+        &500_i128,
+        &Symbol::new(&env, "USDC"),
+        &7_200_u64,
+    );
+
+    let plan = client.get_plan(&plan_id);
+    assert_eq!(plan.interval_secs, 7_200);
+    assert_eq!(plan.amount, 500);
 }

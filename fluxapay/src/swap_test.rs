@@ -4,7 +4,8 @@ use crate::{
     Error, PaymentProcessor, PaymentProcessorClient, PaymentStatus, SwapAndPayArgs,
 };
 use soroban_sdk::{
-    testutils::Address as _, testutils::Events as _, vec, Address, Env, String, Symbol, Vec,
+    testutils::Address as _, testutils::Events as _, token, vec, Address, Env, String, Symbol,
+    Vec,
 };
 
 fn setup_swap_test_env(
@@ -27,11 +28,21 @@ fn setup_swap_test_env(
     merchant_client.initialize(&admin);
     payment_client.set_merchant_registry_address(&admin, &merchant_registry);
 
-    let token_in = Address::generate(env);
-    let token_out = Address::generate(env);
+    let token_admin = Address::generate(env);
+    let token_in = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_out = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
     payment_client.allow_token(&admin, &token_out);
 
     (admin, payment_client, merchant_client, token_in, token_out)
+}
+
+fn mint_swap_input(env: &Env, token_in: &Address, payer: &Address, amount: i128) {
+    let token_client = token::StellarAssetClient::new(env, token_in);
+    token_client.mint(payer, &amount);
 }
 
 fn register_verified_merchant(
@@ -112,6 +123,7 @@ fn test_swap_and_pay_happy_path_with_mock_dex() {
         9_900,
         10_000,
     );
+    mint_swap_input(&env, &token_in, &payer, 10_000);
 
     let events_before = env.events().all().len();
     let payment = payment_client.swap_and_pay(&args);
@@ -168,9 +180,11 @@ fn test_swap_and_pay_failure_with_mock_dex_insufficient_output() {
         9_900,
         10_000,
     );
+    mint_swap_input(&env, &token_in, &payer, 10_000);
 
     let result = payment_client.try_swap_and_pay(&args);
     assert!(result.is_err(), "expected swap_and_pay to fail");
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
     assert!(
         payment_client.try_get_payment(&payment_id).is_err(),
         "payment should not be stored when swap fails"
@@ -203,6 +217,7 @@ fn test_swap_and_pay_failure_when_mock_dex_swap_errors() {
         9_900,
         10_000,
     );
+    mint_swap_input(&env, &token_in, &payer, 10_000);
 
     let result = payment_client.try_swap_and_pay(&args);
     assert!(
@@ -254,4 +269,83 @@ fn test_swap_and_pay_rejects_invalid_amount() {
     assert!(payment_client
         .try_get_payment(&zero_amount_args.payment_id)
         .is_err());
+}
+
+#[test]
+fn test_swap_and_pay_rejects_expired_deadline() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, merchant_client, token_in, token_out) = setup_swap_test_env(&env);
+
+    let mock_dex = env.register(MockDexRouter, ());
+    configure_mock_dex(&env, &mock_dex, 10_000, false);
+
+    let merchant = register_verified_merchant(&env, &admin, &payment_client, &merchant_client);
+    let payer = Address::generate(&env);
+    let deposit_address = Address::generate(&env);
+
+    let mut args = build_swap_args(
+        &env,
+        "SWAP_TEST_EXPIRED",
+        &payer,
+        &merchant,
+        &deposit_address,
+        &token_in,
+        &token_out,
+        &mock_dex,
+        9_900,
+        10_000,
+    );
+    args.expires_at = Some(env.ledger().timestamp().saturating_sub(1));
+
+    let result = payment_client.try_swap_and_pay(&args);
+    assert_eq!(result, Err(Ok(Error::PaymentExpired)));
+    assert!(payment_client
+        .try_get_payment(&args.payment_id)
+        .is_err());
+}
+
+#[test]
+fn test_swap_and_pay_emits_swap_executed_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, payment_client, merchant_client, token_in, token_out) = setup_swap_test_env(&env);
+
+    let mock_dex = env.register(MockDexRouter, ());
+    configure_mock_dex(&env, &mock_dex, 10_000, false);
+
+    let merchant = register_verified_merchant(&env, &admin, &payment_client, &merchant_client);
+    let payer = Address::generate(&env);
+    let deposit_address = Address::generate(&env);
+
+    let args = build_swap_args(
+        &env,
+        "SWAP_TEST_EVENT",
+        &payer,
+        &merchant,
+        &deposit_address,
+        &token_in,
+        &token_out,
+        &mock_dex,
+        9_900,
+        10_000,
+    );
+    mint_swap_input(&env, &token_in, &payer, 10_000);
+
+    payment_client.swap_and_pay(&args);
+
+    let found = env.events().all().iter().any(|e| {
+        let topics: soroban_sdk::Vec<soroban_sdk::Val> = e.1;
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0: Result<Symbol, _> = topics.get(0).unwrap().try_into_val(&env);
+        let t1: Result<Symbol, _> = topics.get(1).unwrap().try_into_val(&env);
+        matches!(
+            (t0, t1),
+            (Ok(a), Ok(b))
+                if a == Symbol::new(&env, "SWAP") && b == Symbol::new(&env, "EXECUTED")
+        )
+    });
+    assert!(found, "SWAP/EXECUTED event not emitted");
 }

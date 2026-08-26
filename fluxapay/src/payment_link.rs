@@ -3,7 +3,8 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
-use crate::{PaymentCharge, PaymentStatus, format_id};
+use crate::utils;
+use crate::{format_id, PaymentCharge, PaymentStatus};
 
 /// Multi-currency fiat configuration for payment links (issue #413).
 #[contracttype]
@@ -65,6 +66,8 @@ pub struct PaymentLink {
     pub metadata: Option<Map<String, String>>,
     /// Fiat configuration for multi-currency invoicing (issue #413).
     pub fiat: MaybeFiatConfig,
+    /// Canonical shareable checkout URL: `{base_url}/pay/{link_id}`.
+    pub shareable_url: Option<String>,
 }
 
 /// Analytics summary for a payment link.
@@ -90,6 +93,8 @@ pub enum LinkDataKey {
     LinkPayments(String),
     /// Individual payment charge created from a link
     LinkPayment(String),
+    /// Admin-configured default base URL for shareable payment links.
+    PaymentBaseUrl,
 }
 
 #[contract]
@@ -139,6 +144,37 @@ impl PaymentLinkManager {
         Ok(())
     }
 
+    /// Set the default base URL used when `create_link` omits `base_url`.
+    pub fn set_payment_base_url(
+        env: Env,
+        admin: Address,
+        url: String,
+    ) -> Result<(), crate::Error> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&LinkDataKey::LinkAdmin)
+            .ok_or(crate::Error::Unauthorized)?;
+
+        if admin != stored_admin {
+            return Err(crate::Error::Unauthorized);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&LinkDataKey::PaymentBaseUrl, &url);
+        Ok(())
+    }
+
+    /// Return the admin-configured default payment base URL, if any.
+    pub fn get_payment_base_url(env: Env) -> Option<String> {
+        env.storage()
+            .persistent()
+            .get(&LinkDataKey::PaymentBaseUrl)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_link(
         env: Env,
@@ -152,19 +188,33 @@ impl PaymentLinkManager {
         direct_transfer: bool,
         metadata: Option<Map<String, String>>,
         fiat: MaybeFiatConfig,
+        base_url: Option<String>,
     ) -> Result<String, crate::Error> {
         merchant.require_auth();
 
-        if let Some(ref meta_map) = metadata {
-            if meta_map.len() > 20 {
-                return Err(crate::Error::MetadataTooLarge);
-            }
-            for (_, value) in meta_map.iter() {
-                if value.len() > 256 {
-                    return Err(crate::Error::MetadataValueTooLong);
-                }
-            }
+        if !crate::utils::validate_id(&link_id) {
+            return Err(crate::Error::InvalidPaymentId);
         }
+        if let Some(ref meta_map) = metadata {
+            utils::validate_metadata(meta_map)?;
+        }
+
+        let resolved_base = base_url.or_else(|| {
+            env.storage()
+                .persistent()
+                .get(&LinkDataKey::PaymentBaseUrl)
+        });
+
+        let shareable_url = resolved_base.map(|base| {
+            utils::concat_strings(
+                &env,
+                &[
+                    base,
+                    String::from_str(&env, "/pay/"),
+                    link_id.clone(),
+                ],
+            )
+        });
 
         let link = PaymentLink {
             link_id: link_id.clone(),
@@ -181,6 +231,7 @@ impl PaymentLinkManager {
             direct_transfer,
             metadata,
             fiat,
+            shareable_url,
         };
 
         env.storage()
@@ -194,6 +245,13 @@ impl PaymentLinkManager {
         );
 
         Ok(link_id)
+    }
+
+    /// Return the shareable URL for a link, if one was stored.
+    pub fn get_link_url(env: Env, link_id: String) -> Option<String> {
+        Self::get_link_internal(&env, &link_id)
+            .ok()
+            .and_then(|link| link.shareable_url)
     }
 
     /// Record a view of a payment link.
@@ -241,13 +299,13 @@ impl PaymentLinkManager {
 
         if let Some(expires_at) = link.expires_at {
             if env.ledger().timestamp() > expires_at {
-                return Err(crate::Error::PaymentExpired);
+                return Err(crate::Error::LinkExpired);
             }
         }
 
         if let Some(max_uses) = link.max_uses {
             if link.use_count >= max_uses {
-                return Err(crate::Error::PaymentAlreadyProcessed);
+                return Err(crate::Error::LinkMaxUsesReached);
             }
         }
 
@@ -294,20 +352,45 @@ impl PaymentLinkManager {
             amount
         };
 
-        link.use_count += 1;
+        // Atomic read-check-increment: use_count was checked above against the
+        // in-memory snapshot; the single storage write below commits the bump
+        // in the same transaction (Soroban tx isolation prevents mid-tx races).
+        link.use_count = link.use_count.saturating_add(1);
+        let hit_max_uses = link
+            .max_uses
+            .map(|m| link.use_count == m)
+            .unwrap_or(false);
+
         // Accumulate revenue from this payment.
         link.total_revenue = link.total_revenue.saturating_add(resolved_amount);
         env.storage()
             .persistent()
             .set(&LinkDataKey::Link(link_id.clone()), &link);
 
+        if hit_max_uses {
+            env.events().publish(
+                (
+                    Symbol::new(&env, "LINK"),
+                    Symbol::new(&env, "MAX_USES_REACHED"),
+                ),
+                (link_id.clone(), link.use_count, link.max_uses),
+            );
+        }
+
         // Issue #111: If direct_transfer is true, transfer funds directly to the merchant,
         // bypassing the escrow/platform wallet.
         if link.direct_transfer {
-            let token_address = usdc_token.ok_or(crate::Error::Unauthorized)?;
+            let token_address = usdc_token.clone().ok_or(crate::Error::Unauthorized)?;
             let token_client = token::TokenClient::new(&env, &token_address);
             let merchant_muxed: MuxedAddress = (&link.merchant_id).into();
             token_client.transfer(&payer, &merchant_muxed, &resolved_amount);
+        }
+        // Emit LINK/DIRECT_TRANSFER_USED event for audit trail when direct transfer is used
+        if link.direct_transfer {
+            env.events().publish(
+                (Symbol::new(&env, "LINK"), Symbol::new(&env, "DIRECT_TRANSFER_USED")),
+                (link_id.clone(), payer.clone(), resolved_amount),
+            );
         }
 
         // Generate a virtual payment ID for tracking
@@ -337,12 +420,22 @@ impl PaymentLinkManager {
             fx_rate: None,
             fx_rate_at: None,
             metadata: link.metadata.clone(),
+            fee_waiver_code: None,
+            retry_of_payment_id: None,
+            payer_muxed_id: None,
         };
 
         // Store the payment charge
         env.storage()
             .persistent()
             .set(&LinkDataKey::LinkPayment(payment_id.clone()), &payment);
+        // If this is a direct transfer payment, mark it in the main contract storage
+        // to prevent future disputes (issue #485)
+        if link.direct_transfer {
+            env.storage()
+                .persistent()
+                .set(&crate::DataKey::DirectTransferPayment(payment_id.clone()), &true);
+        }
 
         // Track payment ID in the link's payment list
         let mut payment_ids: Vec<String> = env
@@ -410,15 +503,91 @@ impl PaymentLinkManager {
         Ok(())
     }
 
+    /// Permissionless entry point that deactivates an expired payment link.
+    /// If the link has not expired or is already inactive, the call is idempotent
+    /// (succeeds without changing state). Emits LINK/EXPIRED on actual deactivation.
+    pub fn expire_link(env: Env, link_id: String) -> Result<(), crate::Error> {
+        let mut link = match Self::get_link_internal(&env, &link_id) {
+            Ok(link) => link,
+            Err(_) => return Ok(()), // Idempotent: missing link is not an error.
+        };
+
+        if !link.active {
+            return Ok(()); // Already inactive — nothing to do.
+        }
+
+        let expired = link
+            .expires_at
+            .map_or(false, |exp| env.ledger().timestamp() > exp);
+
+        if !expired {
+            return Ok(()); // Not expired — nothing to do.
+        }
+
+        link.active = false;
+        env.storage()
+            .persistent()
+            .set(&LinkDataKey::Link(link_id.clone()), &link);
+
+        env.events().publish(
+            (Symbol::new(&env, "LINK"), Symbol::new(&env, "EXPIRED")),
+            link_id,
+        );
+
+        Ok(())
+    }
+
+    /// Batch deactivate expired payment links (max 20 per call).
+    /// Iterates over the provided link IDs and calls expire_link for each.
+    /// Returns the count of links that were actually deactivated.
+    pub fn batch_expire_links(env: Env, link_ids: Vec<String>) -> Result<u32, crate::Error> {
+        if link_ids.len() > 20 {
+            return Err(crate::Error::BatchTooLarge);
+        }
+
+        let mut deactivated: u32 = 0;
+        for link_id in link_ids.iter() {
+            // Use expire_link directly to emit individual events.
+            if let Ok(()) = Self::expire_link(env.clone(), link_id.clone()) {
+                // Check if the link was actually deactivated by reading it back.
+                if let Ok(link) = Self::get_link_internal(&env, &link_id) {
+                    if !link.active && link.expires_at.map_or(false, |exp| env.ledger().timestamp() > exp) {
+                        deactivated += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(deactivated)
+    }
+
     pub fn get_link(env: Env, link_id: String) -> Result<PaymentLink, crate::Error> {
         Self::get_link_internal(&env, &link_id)
     }
 
+    /// Retrieve a payment link, automatically deactivating it if expired.
+    /// Returns the link with `active: false` when the expiry timestamp has passed,
+    /// even if `expire_link` has not been called explicitly.
     fn get_link_internal(env: &Env, link_id: &String) -> Result<PaymentLink, crate::Error> {
-        env.storage()
+        let mut link: PaymentLink = env
+            .storage()
             .persistent()
             .get(&LinkDataKey::Link(link_id.clone()))
-            .ok_or(crate::Error::PaymentNotFound)
+            .ok_or(crate::Error::PaymentNotFound)?;
+
+        // Auto-deactivate expired links on read.
+        if link.active {
+            if let Some(expires_at) = link.expires_at {
+                if env.ledger().timestamp() > expires_at {
+                    link.active = false;
+                    env.storage()
+                        .persistent()
+                        .set(&LinkDataKey::Link(link_id.clone()), &link);
+                }
+            }
+        }
+
+        Ok(link)
     }
 
     /// Retrieve analytics for a payment link.

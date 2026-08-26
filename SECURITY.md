@@ -190,6 +190,25 @@ The `FXOracle` contract (`fluxapay/src/fx_oracle.rs`) provides exchange rates us
 
 ---
 
+## 🔒 Refund Reentrancy Protection
+
+`process_refund` / `process_refund_internal` follow the **checks → effects → interactions** pattern to prevent double-refund via malicious token callbacks or nested cross-contract calls:
+
+1. **Checks** — auth, role, refund exists, status is `Pending`, not expired.
+2. **Effects** — set `refund.status = Completed` and persist under `DataKey::Refund` *before* any token transfer.
+3. **Interactions** — call `token::transfer` only after effects are committed.
+
+### Explicit locks
+
+| Lock | Scope | Behavior |
+|------|-------|----------|
+| `DataKey::ReentrancyLock` | Contract-wide | Set for the duration of `process_refund_internal` / settle paths; cleared via `Drop` guard. |
+| `DataKey::RefundLock(refund_id)` | Per refund ID | Set while processing that refund; concurrent/nested calls for the same ID return `Error::Reentrancy`. |
+
+A second `process_refund` for an already-completed refund returns `RefundAlreadyProcessed`. `resolve_dispute_with_refund` persists dispute resolution effects before returning dispute bonds.
+
+---
+
 ## 🤝 Responsible Disclosure Commitment
 
 We commit to:

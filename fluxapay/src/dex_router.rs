@@ -97,23 +97,10 @@ impl DexRouter {
             return primary_result;
         }
 
-        let mut fallback_path: Vec<Address> = Vec::new(&env);
-        for i in 0..path.len() {
-            fallback_path.push_back(path.get(path.len() - 1 - i).unwrap());
-        }
-        if fallback_path == path {
-            Self::refund_caller(&env, to.clone(), amount_in)?;
-            return Err(DexRouterError::SwapFailed);
-        }
-        let fallback_result = Self::execute_swap(&env, amount_in, amount_out_min, &fallback_path, to.clone(), deadline);
-        if fallback_result.is_ok() {
-            env.events().publish(
-                (Symbol::new(&env, "SWAP"), Symbol::new(&env, "FALLBACK")),
-                (amount_in, to.clone()),
-            );
-            return fallback_result;
-        }
-
+        // Return the primary swap error directly. Reversing the path does not produce a valid
+        // fallback swap — it would attempt to trade the output token back for the input token
+        // (opposite direction). If a fallback strategy is desired, use swap_with_fallback_router
+        // with a different router from the allowlist using the same path.
         Self::refund_caller(&env, to.clone(), amount_in)?;
         Err(DexRouterError::SwapFailed)
     }

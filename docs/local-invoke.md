@@ -338,9 +338,32 @@ stellar contract invoke \
   --payment_id "inv_20260329_001" \
   --amount 1000000000 \
   --reason "Item not received" \
-  --evidence "Order #12345 shows no delivery confirmation" \
+  --evidence "QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG" \
   --disputer $TEST_CUSTOMER_ADDRESS
 ```
+
+#### Evidence format (IPFS CID)
+
+When `require_evidence_cid` is enabled (default), non-empty `--evidence` must be a valid IPFS multihash:
+
+| Format | Rule | Example |
+|--------|------|---------|
+| CIDv0 | Starts with `Qm`, exactly 46 characters | `QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG` |
+| CIDv1 | Starts with `bafy` (or `BAFY` / `f…`), length ≥ 59 (or ≥ 34 for hex `f`) | `bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi` |
+
+Empty evidence is always allowed. For local/testnet convenience, disable enforcement:
+
+```bash
+stellar contract invoke \
+  --id $REFUND_MANAGER_ID \
+  --network testnet \
+  --source $ADMIN_ADDRESS \
+  -- set_require_evidence_cid \
+  --admin $ADMIN_ADDRESS \
+  --require_cid false
+```
+
+Invalid non-empty evidence returns `InvalidEvidenceFormat`.
 
 #### Expected Output
 
@@ -357,6 +380,8 @@ Returns the new dispute ID:
 | `PaymentAlreadyProcessed` | Payment is not in `Confirmed` state | Only confirmed payments can be disputed |
 | `InvalidAmount` | Amount ≤ 0 or exceeds payment amount | Use a positive amount within the original payment amount |
 | `RefundExceedsPayment` | Combined disputes + refunds exceed payment | Reduce dispute amount |
+| `InvalidEvidenceFormat` | Evidence is not a CIDv0/CIDv1 IPFS multihash | Pass a CID or disable `require_evidence_cid` |
+| `DisputeRateLimitExceeded` | Too many open disputes for payer or global hourly cap | Wait, resolve open disputes, or ask admin to adjust limits |
 
 ---
 

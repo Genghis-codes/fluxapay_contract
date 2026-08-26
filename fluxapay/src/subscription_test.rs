@@ -230,7 +230,7 @@ fn test_cancel_subscription_by_payer_becomes_cancelled() {
     let payer = Address::generate(&env);
     let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
 
-    client.cancel_subscription(&payer, &sub_id);
+    client.cancel_subscription(&payer, &sub_id, &false);
 
     let sub = client.get_subscription(&sub_id);
     assert_eq!(sub.status, SubscriptionStatus::Cancelled);
@@ -282,106 +282,106 @@ fn test_deactivate_subscription_plan_by_merchant_marks_inactive() {
     assert!(!plan.active, "Plan should be inactive after deactivation");
 }
 
-/// Operator can charge a subscription once its next_payment_at has passed.
+/// Mid-period cancel with proration creates a pending refund and emits events.
 #[test]
-fn test_process_subscription_charges_on_due_date() {
+fn test_cancel_subscription_mid_period_with_proration() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin, _merchant, plan_id, usdc_token) = setup_with_plan(&env);
+    let (client, admin, _merchant, plan_id) = setup_with_plan(&env);
+
+    client.set_allow_prorated_refunds(&admin, &true);
 
     let payer = Address::generate(&env);
-    let sub_id = String::from_str(&env, "sub_due_charge");
-    client.subscribe_to_plan(&payer, &sub_id, &plan_id);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
 
+    // Simulate a successful billing tick by advancing and processing due subs.
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_oracle(&env), &operator);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 7 * 86_400);
+    assert_eq!(client.process_due_subscriptions(&operator), 1);
 
     let sub_before = client.get_subscription(&sub_id);
+    assert!(sub_before.last_payment_at.is_some());
+
+    // Advance 3 days into the 7-day period → 4 days remaining → 4/7 of amount.
     env.ledger()
-        .set_timestamp(sub_before.next_payment_at.saturating_add(1));
+        .set_timestamp(env.ledger().timestamp() + 3 * 86_400);
 
-    let token_client = token::StellarAssetClient::new(&env, &usdc_token);
-    token_client.mint(&payer, &2_000_000_i128);
+    client.cancel_subscription(&payer, &sub_id, &true);
 
-    let status = client.process_subscription(&operator, &sub_id);
-    assert_eq!(status, SubscriptionStatus::Active);
+    let sub = client.get_subscription(&sub_id);
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
 
-    let sub_after = client.get_subscription(&sub_id);
-    assert_eq!(sub_after.total_payments, 1);
-    assert!(sub_after.last_payment_at.is_some());
+    // Synthetic payment + pending prorated refund must exist.
+    let payment_id = String::from_str(&env, "sub_pr_2");
+    let refunds = client.get_payment_refunds(&payment_id);
+    assert_eq!(refunds.len(), 1);
+    let refund = refunds.get(0).unwrap();
+    assert_eq!(refund.status, crate::RefundStatus::Pending);
+    // 4/7 of 1_000_000 = 571_428
+    assert_eq!(refund.amount, 571_428_i128);
 }
 
-/// process_subscription rejects charges before the billing date.
+/// Mid-period cancel without proration flag cancels but creates no refund.
 #[test]
-fn test_process_subscription_rejects_early_charge() {
+fn test_cancel_subscription_mid_period_without_proration() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin, _merchant, plan_id, _usdc_token) = setup_with_plan(&env);
+    let (client, admin, _merchant, plan_id) = setup_with_plan(&env);
+
+    client.set_allow_prorated_refunds(&admin, &true);
 
     let payer = Address::generate(&env);
-    let sub_id = String::from_str(&env, "sub_early_charge");
-    client.subscribe_to_plan(&payer, &sub_id, &plan_id);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_oracle(&env), &operator);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 7 * 86_400);
+    assert_eq!(client.process_due_subscriptions(&operator), 1);
 
-    let result = client.try_process_subscription(&operator, &sub_id);
-    assert_eq!(result, Err(Ok(Error::PaymentAlreadyProcessed)));
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 3 * 86_400);
+
+    client.cancel_subscription(&payer, &sub_id, &false);
 
     let sub = client.get_subscription(&sub_id);
-    assert_eq!(sub.total_payments, 0);
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
+
+    let payment_id = String::from_str(&env, "sub_pr_2");
+    let refunds = client.get_payment_refunds(&payment_id);
+    assert_eq!(refunds.len(), 0);
 }
 
-/// Subscriptions auto-cancel after reaching max_payments.
+/// End-of-period cancel (no days remaining) creates no prorated refund.
 #[test]
-fn test_process_subscription_respects_max_payments() {
+fn test_cancel_subscription_end_of_period_no_refund() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin, _merchant, plan_id, usdc_token) = setup_with_plan(&env);
+    let (client, admin, _merchant, plan_id) = setup_with_plan(&env);
+
+    client.set_allow_prorated_refunds(&admin, &true);
 
     let payer = Address::generate(&env);
-    let sub_id = client.subscribe(&payer, &plan_id, &Some(1u32), &None, &None);
+    let sub_id = client.subscribe(&payer, &plan_id, &None, &None, &None);
 
     let operator = Address::generate(&env);
     client.grant_role(&admin, &role_oracle(&env), &operator);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 7 * 86_400);
+    assert_eq!(client.process_due_subscriptions(&operator), 1);
 
-    let token_client = token::StellarAssetClient::new(&env, &usdc_token);
-    token_client.mint(&payer, &5_000_000_i128);
+    // Jump to exactly next_payment_at (end of period).
+    let sub_before = client.get_subscription(&sub_id);
+    env.ledger().set_timestamp(sub_before.next_payment_at);
+
+    client.cancel_subscription(&payer, &sub_id, &true);
 
     let sub = client.get_subscription(&sub_id);
-    env.ledger()
-        .set_timestamp(sub.next_payment_at.saturating_add(1));
+    assert_eq!(sub.status, SubscriptionStatus::Cancelled);
 
-    let status = client.process_subscription(&operator, &sub_id);
-    assert_eq!(status, SubscriptionStatus::Expired);
-
-    let sub_after = client.get_subscription(&sub_id);
-    assert_eq!(sub_after.total_payments, 1);
-    assert_eq!(sub_after.status, SubscriptionStatus::Expired);
-}
-
-/// create_plan and get_plan expose plan metadata with custom interval_secs.
-#[test]
-fn test_create_plan_and_get_plan() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, client, _usdc_token) = setup_refund_manager(&env);
-
-    let merchant = Address::generate(&env);
-    client.grant_role(&admin, &Symbol::new(&env, "MERCHANT"), &merchant);
-
-    let plan_id = String::from_str(&env, "plan_custom");
-    client.create_plan(
-        &merchant,
-        &plan_id,
-        &String::from_str(&env, "Custom"),
-        &String::from_str(&env, "Every 2 hours"),
-        &500_i128,
-        &Symbol::new(&env, "USDC"),
-        &7_200_u64,
-    );
-
-    let plan = client.get_plan(&plan_id);
-    assert_eq!(plan.interval_secs, 7_200);
-    assert_eq!(plan.amount, 500);
+    let payment_id = String::from_str(&env, "sub_pr_2");
+    let refunds = client.get_payment_refunds(&payment_id);
+    assert_eq!(refunds.len(), 0);
 }

@@ -64,6 +64,11 @@ export interface CreatePaymentArgs {
   token_address: Option<string>;
   client_token: Option<string>;
   metadata_hash: Option<Buffer>;
+  /**
+   * Optional payment metadata.
+   * Limits: ≤20 keys; each key ≤64 chars; each value ≤256 chars.
+   * On-chain errors: MetadataTooLarge (#49), MetadataValueTooLong (#47).
+   */
   metadata: Option<Record<string, string>>;
   fee_waiver_code: Option<string>;
 }

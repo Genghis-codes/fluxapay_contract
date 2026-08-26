@@ -2,6 +2,10 @@ Fluxapay is a payment gateway on the Stellar blockchain that enables merchants t
 
 FluxaPay bridges the gap between crypto payments and real-world commerce—making stablecoin payments as easy to integrate as Stripe.
 
+## Getting Started
+
+New to FluxaPay? Follow the **[Merchant Quickstart Guide](docs/quickstart.md)** to go from SDK install to your first confirmed USDC payment in minutes.
+
 ## TypeScript SDK
 
 [![npm version](https://img.shields.io/npm/v/@fluxapay/sdk.svg)](https://www.npmjs.com/package/@fluxapay/sdk)
@@ -74,14 +78,19 @@ Fluxapay solves this by enabling _USDC-in → fiat-out_ payments with a merchant
 - Fetch payment status
 - Issue refunds (where supported)
 - Manage customers & metadata
+  - **Metadata limits:** ≤20 keys; each key ≤64 chars; each value ≤256 chars
+  - Violations return `MetadataTooLarge` / `MetadataValueTooLong`
   •⁠ ⁠*Webhooks*
 - ⁠ payment.created ⁠, ⁠ payment.pending ⁠, ⁠ payment.confirmed ⁠, ⁠ payment.failed ⁠, ⁠ payment.settled ⁠
+- Also: `refund.*` and `dispute.*` lifecycle events
+- Full merchant guide (payloads, HMAC verification, retries, idempotency, examples): **[docs/webhooks.md](docs/webhooks.md)**
 
 ### No-Code / Low-Code
 
 •⁠ ⁠*Payment Links*
 
 - Shareable links for quick checkout (social commerce, WhatsApp, Instagram, etc.)
+- Optional `base_url` builds `{base_url}/pay/{link_id}` as `shareable_url` (QR-ready)
   •⁠ ⁠*Invoices*
 - Generate invoices with payment links and track payment status
 - Perfect for freelancers, agencies, and B2B billing
@@ -261,6 +270,10 @@ FluxaPay emits the following on-chain events for refund lifecycle tracking:
 ## Architecture
 
 For a detailed understanding of the contract structure, cross-contract interactions, role model, and payment lifecycle, see [docs/architecture.md](docs/architecture.md).
+
+## Error Codes
+
+For a unified reference of every contract error code (`PaymentProcessor`, `RefundManager`, `AccessControl`, `Stream`, `FXOracle`, `MerchantRegistry`, `MerchantAuth`, `DexRouter`, `AccountAbstraction`) with common causes and remediation steps, see [docs/error-codes.md](docs/error-codes.md).
 
 ## Telegram link
 

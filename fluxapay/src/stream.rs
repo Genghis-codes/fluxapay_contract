@@ -6,6 +6,33 @@ use crate::PaymentProcessor;
 
 // ─── Data types ───────────────────────────────────────────────────────────────
 
+/// Pure accrual computation (lazy formula with saturating arithmetic).
+///
+/// `total = min(deposit, checkpoint + (now - last_checkpoint) * rate)`
+pub fn compute_total_accrued(
+    accrued_at_checkpoint: i128,
+    last_checkpoint_at: u64,
+    now: u64,
+    rate_per_second: i128,
+    remaining_deposit: i128,
+) -> i128 {
+    let rate = rate_per_second.max(0);
+    let deposit = remaining_deposit.max(0);
+    let elapsed = now.saturating_sub(last_checkpoint_at);
+    let newly_accrued = (elapsed as i128).saturating_mul(rate);
+    accrued_at_checkpoint
+        .saturating_add(newly_accrued)
+        .min(deposit)
+        .max(0)
+}
+
+/// Remaining deposit after a withdrawal; never negative.
+pub fn compute_remaining_after_withdraw(remaining_deposit: i128, withdraw_amount: i128) -> i128 {
+    remaining_deposit
+        .saturating_sub(withdraw_amount.max(0))
+        .max(0)
+}
+
 /// Status of a payment stream.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +133,8 @@ pub enum StreamError {
     RateBelowMinimum = 12,
     /// Stream is not paused.
     StreamNotPaused = 13,
+    /// Receiver address cannot be the same as sender address.
+    InvalidReceiver = 14,
 }
 
 /// Storage key for the per-stream withdrawal reentrancy lock.
@@ -258,6 +287,9 @@ impl PaymentStreaming {
         min_rate: Option<i128>,
     ) -> Result<PaymentStream, StreamError> {
         sender.require_auth();
+        if sender == receiver {
+            return Err(StreamError::InvalidReceiver);
+        }
 
         if rate_per_second <= 0 {
             return Err(StreamError::InvalidRate);
@@ -287,7 +319,7 @@ impl PaymentStreaming {
             last_checkpoint_at: now,
             accrued_at_checkpoint: 0,
             status: StreamStatus::Active,
-            milestones_approved: true,
+            milestones_approved: false,
         };
 
         // Persist state before interaction (reentrancy protection)
@@ -337,6 +369,9 @@ impl PaymentStreaming {
         if stream.status != StreamStatus::Active {
             return Err(StreamError::StreamNotActive);
         }
+        if stream.sender == destination {
+            return Err(StreamError::InvalidReceiver);
+        }
 
         stream.destination = Some(destination.clone());
 
@@ -379,6 +414,74 @@ impl PaymentStreaming {
             (Symbol::new(&env, "STREAM"), Symbol::new(&env, "MILESTONE_APPROVED")),
             (stream_id, sender),
         );
+
+        Ok(())
+    }
+
+    /// Sender revokes a previous milestone approval, re-locking distributions
+    /// until `approve_stream_milestone` is called again.
+    pub fn revoke_stream_milestone(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+
+        stream.milestones_approved = false;
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "STREAM"),
+                Symbol::new(&env, "MILESTONE_REVOKED"),
+                stream_id,
+            ),
+            (sender,),
+        );
+
+        Ok(())
+    }
+
+    /// Sender sets a floor below which [`Self::decrease_rate_per_second`] will
+    /// refuse to lower the stream's rate.
+    pub fn set_stream_min_rate(
+        env: Env,
+        sender: Address,
+        stream_id: String,
+        min_rate_per_second: i128,
+    ) -> Result<(), StreamError> {
+        sender.require_auth();
+
+        if min_rate_per_second < 0 {
+            return Err(StreamError::InvalidRate);
+        }
+
+        let mut stream: PaymentStream = env
+            .storage()
+            .persistent()
+            .get(&StreamDataKey::Stream(stream_id.clone()))
+            .ok_or(StreamError::StreamNotFound)?;
+
+        if stream.sender != sender {
+            return Err(StreamError::Unauthorized);
+        }
+
+        stream.min_rate_per_second = min_rate_per_second;
+        env.storage()
+            .persistent()
+            .set(&StreamDataKey::Stream(stream_id.clone()), &stream);
 
         Ok(())
     }
@@ -525,14 +628,13 @@ impl PaymentStreaming {
         }
 
         let now = env.ledger().timestamp();
-        let elapsed = now.saturating_sub(stream.last_checkpoint_at);
-        let newly_accrued = (elapsed as i128).saturating_mul(stream.rate_per_second);
-        let total = stream
-            .accrued_at_checkpoint
-            .saturating_add(newly_accrued)
-            .min(stream.remaining_deposit);
-
-        Ok(total)
+        Ok(compute_total_accrued(
+            stream.accrued_at_checkpoint,
+            stream.last_checkpoint_at,
+            now,
+            stream.rate_per_second,
+            stream.remaining_deposit,
+        ))
     }
 
     /// Query streams created by the given sender.

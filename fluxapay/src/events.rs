@@ -244,6 +244,34 @@ pub struct ArbitratorVote {
     pub vote: String,
 }
 
+/// Emitted when a dispute bond is collected.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DisputeBondCollected {
+    pub dispute_id: String,
+    pub disputer: Address,
+    pub amount: i128,
+}
+
+/// Emitted when a dispute bond is returned.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DisputeBondReturned {
+    pub dispute_id: String,
+    pub disputer: Address,
+    pub amount: i128,
+}
+
+/// Emitted when a dispute bond is forfeited.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DisputeBondForfeited {
+    pub dispute_id: String,
+    pub disputer: Address,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
 // ============================================================================
 // Subscription Events
 // ============================================================================
@@ -415,6 +443,16 @@ pub struct LinkViewed {
     pub link_id: String,
 }
 
+/// Emitted when a direct transfer payment link is used (issue #485).
+/// Provides mandatory audit trail for direct transfers bypassing escrow.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct DirectTransferUsed {
+    pub link_id: String,
+    pub payer: Address,
+    pub amount: i128,
+}
+
 // ============================================================================
 // Merchant Events
 // ============================================================================
@@ -427,9 +465,7 @@ pub struct MerchantRegistered {
     pub settlement_currency: String,
 }
 
-
 /// Emitted when a merchant is verified.
-
 
 #[contractevent]
 #[derive(Clone, Debug)]
@@ -641,4 +677,99 @@ pub struct SwapAndPayExecuted {
     pub amount: i128,
     pub token_in: Address,
     pub amount_in: i128,
+}
+
+// ============================================================================
+// Payment Retry Events (Issue #482)
+// ============================================================================
+
+/// Emitted when a payment retry is created.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct PaymentRetryCreated {
+    pub original_id: String,
+    pub new_id: String,
+}
+
+// ============================================================================
+// FX Oracle Rate Deviation Events (Issue #478)
+// ============================================================================
+
+/// Emitted when a rate update is within 50% of deviation limit.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RateDeviationWarning {
+    pub currency: Symbol,
+    pub current_rate: i128,
+    pub previous_rate: i128,
+    pub deviation_bps: u32,
+}
+
+// ============================================================================
+// Merchant Dispute Events (Issue #481)
+// ============================================================================
+
+/// Emitted when a merchant is auto-suspended due to dispute threshold.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantAutoSuspended {
+    pub merchant_id: Address,
+    pub resolved_against_count: u32,
+    pub threshold: u32,
+}
+
+/// Emitted when a merchant appeals a suspension.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct MerchantSuspensionAppealed {
+    pub merchant_id: Address,
+    pub reason: String,
+}
+
+// ============================================================================
+// Router & Session Events (Issue #437, Issue #435)
+// ============================================================================
+
+/// Emitted when a DEX router is added to the allowlist.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RouterAdded {
+    pub router: Address,
+}
+
+/// Emitted when a DEX router is removed from the allowlist.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct RouterRemoved {
+    pub router: Address,
+}
+
+/// Emitted when a session key is registered.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SessionRegistered {
+    pub account: Address,
+    pub session_key: Address,
+    pub expires_at: u64,
+}
+
+/// Emitted when a session key is revoked.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SessionRevoked {
+    pub account: Address,
+    pub session_key: Address,
+}
+
+// ============================================================================
+// Account Abstraction Events
+// ============================================================================
+
+/// Emitted when a session key executes a payload.
+#[contractevent]
+#[derive(Clone, Debug)]
+pub struct SessionExecutedEvent {
+    pub account: Address,
+    pub session_key: Address,
+    pub payload_hash: BytesN<32>,
 }

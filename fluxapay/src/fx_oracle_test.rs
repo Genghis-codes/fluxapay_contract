@@ -183,3 +183,85 @@ fn test_get_fx_admin_before_initialization_returns_none() {
 
     assert_eq!(client.get_fx_admin(), None);
 }
+
+#[test]
+fn test_check_rate_staleness_emits_alert() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_oracle(&env);
+
+    let oracle = Address::generate(&env);
+    client.oracle_grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+
+    let pair = Symbol::new(&env, "USDC_NGN");
+    client.set_rate(&oracle, &pair, &1500i128, &0);
+
+    assert!(!client.check_rate_staleness(&pair));
+
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 25 * 3600);
+
+    // Stale → returns true (and emits RATE/STALE_ALERT on-chain).
+    assert!(client.check_rate_staleness(&pair));
+}
+
+#[test]
+fn test_set_rates_batch_stores_all_rates() {
+    use soroban_sdk::vec;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_oracle(&env);
+
+    let oracle = Address::generate(&env);
+    client.oracle_grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+
+    let rates = vec![
+        &env,
+        (Symbol::new(&env, "USD"), 1_0000000i128, 7u32),
+        (Symbol::new(&env, "NGN"), 1500_0000000i128, 7u32),
+        (Symbol::new(&env, "EUR"), 9200000i128, 7u32),
+    ];
+
+    let count = client.set_rates_batch(&oracle, &rates);
+    assert_eq!(count, 3);
+
+    assert_eq!(client.get_rate(&Symbol::new(&env, "USD")).rate, 1_0000000i128);
+    assert_eq!(client.get_rate(&Symbol::new(&env, "NGN")).rate, 1500_0000000i128);
+    assert_eq!(client.get_rate(&Symbol::new(&env, "EUR")).rate, 9200000i128);
+}
+
+#[test]
+fn test_set_rates_batch_rejects_non_oracle() {
+    use soroban_sdk::vec;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_admin, client) = setup_oracle(&env);
+
+    let unauthorized = Address::generate(&env);
+    let rates = vec![&env, (Symbol::new(&env, "USD"), 1i128, 0u32)];
+
+    let result = client.try_set_rates_batch(&unauthorized, &rates);
+    assert_eq!(result, Err(Ok(FXOracleError::Unauthorized)));
+}
+
+#[test]
+fn test_set_rates_batch_rejects_oversized_batch() {
+    use soroban_sdk::vec;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (admin, client) = setup_oracle(&env);
+
+    let oracle = Address::generate(&env);
+    client.oracle_grant_role(&admin, &Symbol::new(&env, "ORACLE"), &oracle);
+
+    let mut rates = vec![&env];
+    for _ in 0..21u32 {
+        rates.push_back((Symbol::new(&env, "USD"), 1i128, 0u32));
+    }
+
+    let result = client.try_set_rates_batch(&oracle, &rates);
+    assert_eq!(result, Err(Ok(FXOracleError::BatchTooLarge)));
+}

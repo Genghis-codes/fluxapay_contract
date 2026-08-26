@@ -17,6 +17,19 @@ panic = "abort"
 codegen-units = 1
 lto = true
 
+# Issue #486: Specialized WASM optimization profile for mainnet deployment
+# Minimizes WASM binary size for Soroban deployment (256KB limit awareness)
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+overflow-checks = false
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true
+
 # For more information about this profile see https://soroban.stellar.org/docs/basic-tutorials/logging#cargotoml-profile
 [profile.release-with-logs]
 inherits = "release"

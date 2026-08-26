@@ -428,6 +428,8 @@ impl PaymentLinkManager {
             fee_waiver_code: None,
             retry_of_payment_id: None,
             payer_muxed_id: None,
+            // Issue #668: trace this payment back to the link that created it.
+            payment_link_id: Some(link_id.clone()),
         };
 
         // Store the payment charge

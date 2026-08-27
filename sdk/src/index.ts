@@ -64,6 +64,50 @@ export interface FluxapayConfig {
   merchantRegistryContractId?: string;
   /** PaymentLinkManager contract ID for payment link operations. */
   paymentLinkContractId?: string;
+  /**
+   * Issue #680: Base URL of the FluxaPay backend API, used for off-chain
+   * invoice management (`getInvoice`, `createInvoice`, etc). Required only
+   * when invoice methods are used.
+   */
+  apiUrl?: string;
+}
+
+/**
+ * Issue #680: A single line item on an invoice.
+ */
+export interface LineItem {
+  description: string;
+  quantity: number;
+  unitAmount: bigint;
+}
+
+/**
+ * Issue #680: Lifecycle status of an invoice.
+ */
+export type InvoiceStatus = "draft" | "sent" | "paid" | "void" | "expired";
+
+/**
+ * Issue #680: An invoice issued by a merchant, optionally linked to an
+ * on-chain payment once paid.
+ */
+export interface Invoice {
+  invoiceId: string;
+  merchantId: string;
+  customerId?: string;
+  lineItems: LineItem[];
+  currency: string;
+  status: InvoiceStatus;
+  paymentId?: string;
+  createdAt: string;
+  dueAt?: string;
+}
+
+export interface CreateInvoiceParams {
+  merchantId: string;
+  customerId?: string;
+  lineItems: LineItem[];
+  currency: string;
+  dueAt?: string;
 }
 
 export interface CreatePaymentParams {
@@ -212,6 +256,31 @@ export const MerchantAuthError = {
   6: { message: "AuthorizationAlreadyExists" },
 } as const;
 
+/**
+ * Issue #185 / #665: Record of a dispute settled off-chain by mutual
+ * agreement between buyer and merchant, mirroring `CollaborativeSettlement`
+ * in `fluxapay/src/lib.rs`.
+ */
+export interface CollaborativeSettlement {
+  dispute_id: string;
+  settlement_amount: bigint;
+  buyer_pubkey: Buffer;
+  merchant_pubkey: Buffer;
+  settled_at: bigint;
+}
+
+/**
+ * Issue #664: A single usage-metering record for a subscription, mirroring
+ * `UsageMetrics` in `fluxapay/src/lib.rs`.
+ */
+export interface UsageMetrics {
+  subscription_id: string;
+  units_used: bigint;
+  unit_price: bigint;
+  amount: bigint;
+  recorded_at: bigint;
+}
+
 export interface UpdateMerchantParams {
   merchantId: string;
   businessName?: string;
@@ -220,6 +289,17 @@ export interface UpdateMerchantParams {
   payoutAddress?: string;
   bankAccount?: string;
   feeConfig?: FeeConfig;
+}
+
+/**
+ * Issue #666: Aggregated platform fee report for a queried time period,
+ * returned by `PaymentProcessor.get_platform_fee_report`.
+ */
+export interface PlatformFeeReport {
+  totalFeesCollected: bigint;
+  treasuryShare: bigint;
+  developerShare: bigint;
+  paymentCount: bigint;
 }
 
 /**
@@ -689,6 +769,70 @@ export class FluxapayClient {
   }
 
   /**
+   * Issue #666: Aggregate platform fee collection over `[fromTs, toTs]`
+   * (inclusive, ledger timestamps in seconds), for treasury reporting.
+   *
+   * Read-only — no authorization required.
+   */
+  async getPlatformFeeReport(fromTs: bigint, toTs: bigint): Promise<PlatformFeeReport> {
+    const result = await withMappedContractError(() =>
+      this.contract.get_platform_fee_report({
+        from_ts: fromTs,
+        to_ts: toTs,
+      }),
+    );
+    return {
+      totalFeesCollected: result.total_fees_collected,
+      treasuryShare: result.treasury_share,
+      developerShare: result.developer_share,
+      paymentCount: result.payment_count,
+    };
+  }
+
+  /**
+   * Issue #660: Add an address to the global compliance blacklist.
+   * Blacklisted addresses are rejected as payer, merchant, or requester on
+   * subsequent payment/refund/dispute operations.
+   *
+   * Requires the PaymentProcessor ADMIN role.
+   */
+  async addToBlacklist(admin: string, address: string): Promise<void> {
+    return withMappedContractError(() =>
+      this.contract.add_to_blacklist({
+        admin,
+        address,
+      }),
+    );
+  }
+
+  /**
+   * Issue #660: Remove an address from the global compliance blacklist.
+   *
+   * Requires the PaymentProcessor ADMIN role.
+   */
+  async removeFromBlacklist(admin: string, address: string): Promise<void> {
+    return withMappedContractError(() =>
+      this.contract.remove_from_blacklist({
+        admin,
+        address,
+      }),
+    );
+  }
+
+  /**
+   * Issue #660: Check whether an address is currently blacklisted.
+   *
+   * Read-only — no authorization required.
+   */
+  async isBlacklisted(address: string): Promise<boolean> {
+    return withMappedContractError(() =>
+      this.contract.is_blacklisted({
+        address,
+      }),
+    );
+  }
+
+  /**
    * Create a refund request
    */
   async createRefund(params: {
@@ -717,6 +861,14 @@ export class FluxapayClient {
         refund_id: refundId,
       }),
     );
+  }
+
+  /**
+   * Issue #676: Read the consolidated refund policy — `require_receipt_hash`,
+   * `refund_expiry_secs`, `refund_fee_bps`, and `cooldown_secs` — in one call.
+   */
+  async getRefundPolicy() {
+    return withMappedContractError(() => this.contract.get_refund_policy());
   }
 
   /**
@@ -1018,6 +1170,166 @@ export class FluxapayClient {
     return withMappedContractError(() =>
       this.contract.bulk_bump_payment_ttls({ payment_ids: paymentIds }),
     );
+  }
+
+  /**
+   * Issue #665: Close a dispute instantly when both the buyer and merchant
+   * have agreed on a settlement amount off-chain and submit their Ed25519
+   * signatures over `SHA-256(dispute_id || settlement_amount_le16)`.
+   *
+   * Wraps `RefundManager::settle_dispute_collaboratively`. Note: bindings
+   * for this entry point haven't been regenerated yet (TODO: `npm run
+   * generate`), so this calls through `this.contract` untyped.
+   *
+   * @returns The refund ID created for the settlement.
+   */
+  async settleDisputeCollaboratively(params: {
+    disputeId: string;
+    settlementAmount: bigint;
+    buyerPubkey: Buffer;
+    signatureBuyer: Buffer;
+    merchantPubkey: Buffer;
+    signatureMerchant: Buffer;
+  }): Promise<string> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).settle_dispute_collaboratively({
+        dispute_id: params.disputeId,
+        settlement_amount: params.settlementAmount,
+        buyer_pubkey: params.buyerPubkey,
+        signature_buyer: params.signatureBuyer,
+        merchant_pubkey: params.merchantPubkey,
+        signature_merchant: params.signatureMerchant,
+      });
+      return tx.result;
+    });
+  }
+
+  /**
+   * Issue #665: Retrieve the collaborative settlement record for a dispute,
+   * or `null` if the dispute has no such record (or doesn't exist —
+   * `DisputeNotFound`).
+   */
+  async getCollaborativeSettlement(disputeId: string): Promise<CollaborativeSettlement | null> {
+    try {
+      return await withMappedContractError(async () => {
+        const tx = await (this.contract as any).get_collaborative_settlement({
+          dispute_id: disputeId,
+        });
+        return tx.result;
+      });
+    } catch (error) {
+      if (error instanceof FluxapayError && error.contractErrorName === "DisputeNotFound") {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Issue #664: Submit usage metrics for a metered subscription. The
+   * subscription's charge amount is overridden to `units * unitPrice` and
+   * charged immediately. Throws a mapped `InvalidStatusTransition` error if
+   * the subscription is Cancelled/Expired (not currently billable).
+   *
+   * Wraps `RefundManager::submit_usage_metrics`. Note: bindings for this
+   * entry point haven't been regenerated yet (TODO: `npm run generate`),
+   * so this calls through `this.contract` untyped.
+   */
+  async submitUsageMetrics(params: {
+    subscriptionId: string;
+    units: bigint;
+    unitPrice: bigint;
+    token: string;
+    caller: string;
+  }): Promise<void> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).submit_usage_metrics({
+        operator: params.caller,
+        subscription_id: params.subscriptionId,
+        units_used: params.units,
+        unit_price: params.unitPrice,
+        token: params.token,
+      });
+      return tx.result;
+    });
+  }
+
+  /**
+   * Issue #664: Retrieve usage-metric records for a subscription recorded
+   * within `[fromTimestamp, toTimestamp]` (inclusive), oldest first.
+   */
+  async getUsageMetrics(
+    subscriptionId: string,
+    fromTimestamp: number,
+    toTimestamp: number,
+  ): Promise<UsageMetrics[]> {
+    return withMappedContractError(async () => {
+      const tx = await (this.contract as any).get_usage_metrics({
+        subscription_id: subscriptionId,
+        from_timestamp: BigInt(fromTimestamp),
+        to_timestamp: BigInt(toTimestamp),
+      });
+      return tx.result;
+    });
+   * Issue #680: Resolve the configured backend API URL, throwing a clear
+   * error if invoice methods are used without one.
+   */
+  private getApiUrl(): string {
+    if (!this.config.apiUrl) {
+      throw new Error(
+        "apiUrl is required in FluxapayConfig to use invoice methods.",
+      );
+    }
+    return this.config.apiUrl.replace(/\/$/, "");
+  }
+
+  /**
+   * Issue #680: Fetch a single invoice by id from the FluxaPay backend.
+   */
+  async getInvoice(invoiceId: string): Promise<Invoice> {
+    const res = await fetch(`${this.getApiUrl()}/invoices/${invoiceId}`);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch invoice ${invoiceId}: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Issue #680: List invoice ids for a merchant from the FluxaPay backend.
+   */
+  async getMerchantInvoices(merchantId: string): Promise<string[]> {
+    const res = await fetch(`${this.getApiUrl()}/merchants/${merchantId}/invoices`);
+    if (!res.ok) {
+      throw new Error(`Failed to fetch invoices for merchant ${merchantId}: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Issue #680: Create a new invoice via the FluxaPay backend.
+   */
+  async createInvoice(params: CreateInvoiceParams): Promise<Invoice> {
+    const res = await fetch(`${this.getApiUrl()}/invoices`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to create invoice: ${res.status}`);
+    }
+    return res.json();
+  }
+
+  /**
+   * Issue #680: Mark an invoice as paid via the FluxaPay backend.
+   */
+  async markInvoicePaid(invoiceId: string): Promise<void> {
+    const res = await fetch(`${this.getApiUrl()}/invoices/${invoiceId}/mark-paid`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      throw new Error(`Failed to mark invoice ${invoiceId} as paid: ${res.status}`);
+    }
   }
 
   private getPaymentLinkManager(): PaymentLinkManagerClient {

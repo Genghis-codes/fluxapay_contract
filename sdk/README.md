@@ -12,6 +12,10 @@ npm install @fluxapay/sdk
 
 See [CHANGELOG.md](./CHANGELOG.md) for version history.
 
+Upgrading between major versions? See the
+[SDK Migration Guide](../docs/sdk-migration-guide.md) for breaking changes
+and before/after code snippets.
+
 ## Quick Start
 
 ```typescript

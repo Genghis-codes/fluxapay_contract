@@ -619,6 +619,24 @@ pub struct CollaborativeSettlement {
     pub settled_at: u64,
 }
 
+/// Issue #664: A single usage-metering record for a subscription, appended
+/// by `submit_usage_metrics` and queryable via `get_usage_metrics`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageMetrics {
+    /// The subscription this usage record belongs to.
+    pub subscription_id: String,
+    /// Number of usage units consumed in this billing cycle.
+    pub units_used: i128,
+    /// Price per unit (in the subscription token's smallest unit) at the
+    /// time this record was submitted.
+    pub unit_price: i128,
+    /// `units_used * unit_price` — the metered charge amount for this cycle.
+    pub amount: i128,
+    /// Ledger timestamp when this usage record was submitted.
+    pub recorded_at: u64,
+}
+
 /// Configuration for creating a payment.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -887,6 +905,9 @@ pub enum DataKey {
     MerchantPaymentCount(Address),
     /// Issue #185: Collaborative settlement record for a dispute.
     CollaborativeSettlement(String),
+    /// Issue #664: Append-only log of `UsageMetrics` records for a
+    /// subscription, keyed by subscription_id.
+    UsageMetricsLog(String),
     /// Issue #301: List of supported token addresses for enumeration.
     SupportedTokens,
     /// Issue #303: KYC tier limits configuration.
@@ -4993,6 +5014,16 @@ impl RefundManager {
 
         let mut subscription = Self::get_subscription_internal(&env, &subscription_id)?;
 
+        // Issue #664: Usage metrics can only be submitted for a subscription
+        // that is still billable (Active, or Paused-but-auto-resuming via
+        // `charge_subscription` below). A Cancelled/Expired subscription
+        // cannot be metered.
+        if subscription.status == SubscriptionStatus::Cancelled
+            || subscription.status == SubscriptionStatus::Expired
+        {
+            return Err(Error::InvalidStatusTransition);
+        }
+
         // Override the subscription amount with the metered charge for this cycle.
         let metered_amount = units_used.saturating_mul(unit_price);
         subscription.amount = metered_amount;
@@ -5008,8 +5039,56 @@ impl RefundManager {
             (subscription_id.clone(), units_used, unit_price, metered_amount),
         );
 
+        // Issue #664: Append this usage record to the subscription's metrics
+        // log so `get_usage_metrics` can return usage history over a range.
+        let mut usage_log: Vec<UsageMetrics> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsageMetricsLog(subscription_id.clone()))
+            .unwrap_or_else(|| vec![&env]);
+        usage_log.push_back(UsageMetrics {
+            subscription_id: subscription_id.clone(),
+            units_used,
+            unit_price,
+            amount: metered_amount,
+            recorded_at: env.ledger().timestamp(),
+        });
+        env.storage()
+            .persistent()
+            .set(&DataKey::UsageMetricsLog(subscription_id.clone()), &usage_log);
+        Self::bump_ttl(
+            &env,
+            &DataKey::UsageMetricsLog(subscription_id.clone()),
+            LONG_LIVE_TTL,
+        );
+
         // Trigger the charge at the updated metered amount.
         Self::charge_subscription(env, operator, subscription_id, token)
+    }
+
+    /// Issue #664: Return usage-metric records for `subscription_id`
+    /// recorded within `[from_timestamp, to_timestamp]` (inclusive),
+    /// oldest first. Returns an empty vector if none were recorded, or if
+    /// the subscription itself doesn't exist.
+    pub fn get_usage_metrics(
+        env: Env,
+        subscription_id: String,
+        from_timestamp: u64,
+        to_timestamp: u64,
+    ) -> Vec<UsageMetrics> {
+        let log: Vec<UsageMetrics> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UsageMetricsLog(subscription_id))
+            .unwrap_or_else(|| vec![&env]);
+
+        let mut result = vec![&env];
+        for record in log.iter() {
+            if record.recorded_at >= from_timestamp && record.recorded_at <= to_timestamp {
+                result.push_back(record.clone());
+            }
+        }
+        result
     }
 
     /// Issue #302: Track subscription in the ActiveSubscriptions index

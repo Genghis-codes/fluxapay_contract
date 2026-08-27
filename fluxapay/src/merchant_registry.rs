@@ -212,7 +212,14 @@ pub enum MerchantDataKey {
     SuspensionVote(u64, Address),
     SuspensionProposalCounter,
     SuspensionThreshold,
+    /// Issue #667: Arbitrary on-chain contract metadata (description, deployment
+    /// notes, audit commit hash, etc.), keyed by an admin-chosen Symbol.
+    ContractMetadata(Symbol),
 }
+
+/// ~3 years at 5s/ledger — mirrors `LONG_LIVE_TTL` in lib.rs (issue #667).
+const LONG_LIVE_TTL: u32 = 18_921_600;
+const TTL_BUMP_THRESHOLD_DIVISOR: u32 = 5;
 
 /// Platform fee configuration stored in MerchantRegistry.
 #[contracttype]
@@ -289,7 +296,76 @@ impl MerchantRegistry {
             },
         );
 
+        // Issue #667: pre-populate on-chain metadata with description, version, and
+        // deployment timestamp so explorers/integrators can identify the contract.
+        env.storage().instance().set(
+            &MerchantDataKey::ContractMetadata(Symbol::new(&env, "description")),
+            &String::from_str(&env, "FluxaPay MerchantRegistry contract"),
+        );
+        env.storage().instance().set(
+            &MerchantDataKey::ContractMetadata(Symbol::new(&env, "version")),
+            &String::from_str(&env, "1"),
+        );
+        env.storage().instance().set(
+            &MerchantDataKey::ContractMetadata(Symbol::new(&env, "deployed_at")),
+            &Self::u64_to_string(&env, env.ledger().timestamp()),
+        );
+        let threshold = core::cmp::max(1, LONG_LIVE_TTL / TTL_BUMP_THRESHOLD_DIVISOR);
+        env.storage().instance().extend_ttl(threshold, LONG_LIVE_TTL);
+
         Ok(())
+    }
+
+    /// Admin-only: set an arbitrary on-chain metadata entry (issue #667), e.g. a
+    /// description, deployment notes, or audit commit hash. Stored in instance
+    /// storage under a caller-chosen key, with the instance TTL bumped to
+    /// `LONG_LIVE_TTL` so metadata survives archival.
+    pub fn set_contract_metadata(
+        env: Env,
+        admin: Address,
+        key: Symbol,
+        value: String,
+    ) -> Result<(), MerchantError> {
+        admin.require_auth();
+
+        if !AccessControl::has_role(&env, &role_admin(&env), &admin) {
+            return Err(MerchantError::Unauthorized);
+        }
+
+        env.storage()
+            .instance()
+            .set(&MerchantDataKey::ContractMetadata(key), &value);
+
+        let threshold = core::cmp::max(1, LONG_LIVE_TTL / TTL_BUMP_THRESHOLD_DIVISOR);
+        env.storage().instance().extend_ttl(threshold, LONG_LIVE_TTL);
+
+        Ok(())
+    }
+
+    /// Public read of an on-chain metadata entry set via `set_contract_metadata`
+    /// (issue #667). Returns `None` if the key was never set.
+    pub fn get_contract_metadata(env: Env, key: Symbol) -> Option<String> {
+        env.storage()
+            .instance()
+            .get(&MerchantDataKey::ContractMetadata(key))
+    }
+
+    /// Formats a u64 as a decimal `String` without relying on `alloc`/`format!`
+    /// (this crate is `#![no_std]`). Used to store `deployed_at` as metadata
+    /// text so it round-trips through `get_contract_metadata`'s `String` type.
+    fn u64_to_string(env: &Env, mut n: u64) -> String {
+        if n == 0 {
+            return String::from_str(env, "0");
+        }
+        let mut buf = [0u8; 20];
+        let mut i = buf.len();
+        while n > 0 {
+            i -= 1;
+            buf[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+        let s = core::str::from_utf8(&buf[i..]).unwrap_or("0");
+        String::from_str(env, s)
     }
 
     pub fn grant_role(env: Env, admin: Address, role: Symbol, account: Address) -> Result<(), MerchantError> {

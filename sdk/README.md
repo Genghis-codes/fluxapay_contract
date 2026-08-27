@@ -235,6 +235,36 @@ const dispute = await client.getDispute("dispute_001");
 const paymentDisputes = await client.getPaymentDisputes("pay_123");
 ```
 
+## Compliance / Admin Tooling (FluxapayClient)
+
+Blacklist management for blocking fraudulent payers, merchants, or requesters.
+`addToBlacklist` / `removeFromBlacklist` require the PaymentProcessor `ADMIN`
+role; `isBlacklisted` is a read-only call with no authorization required.
+Blacklisted addresses are rejected on subsequent payment, refund, and
+dispute operations.
+
+```typescript
+// Block an address (admin only)
+await client.addToBlacklist("G...ADMIN", "G...FRAUDULENT_ADDRESS");
+
+// Check blacklist status (no auth required)
+const blocked = await client.isBlacklisted("G...FRAUDULENT_ADDRESS"); // true
+
+// Unblock an address (admin only)
+await client.removeFromBlacklist("G...ADMIN", "G...FRAUDULENT_ADDRESS");
+```
+
+## Treasury / Platform Fee Reporting (FluxapayClient)
+
+`getPlatformFeeReport` aggregates platform fee collection over a queried
+time period `[fromTs, toTs]` (ledger timestamps, in seconds) for treasury
+reporting. Read-only — no authorization required.
+
+```typescript
+const report = await client.getPlatformFeeReport(1700000000n, 1700086400n);
+// { totalFeesCollected, treasuryShare, developerShare, paymentCount }
+```
+
 ## Collaborative Dispute Settlement (issue #665)
 
 When the buyer and merchant agree on a settlement amount off-chain, they can

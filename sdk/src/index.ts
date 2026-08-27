@@ -292,6 +292,17 @@ export interface UpdateMerchantParams {
 }
 
 /**
+ * Issue #666: Aggregated platform fee report for a queried time period,
+ * returned by `PaymentProcessor.get_platform_fee_report`.
+ */
+export interface PlatformFeeReport {
+  totalFeesCollected: bigint;
+  treasuryShare: bigint;
+  developerShare: bigint;
+  paymentCount: bigint;
+}
+
+/**
  * Maps numeric contract error codes to their name, for the main `Error` enum
  * shared by the `PaymentProcessor` and `RefundManager` contracts
  * (`fluxapay/src/lib.rs`).
@@ -753,6 +764,70 @@ export class FluxapayClient {
         code: params.code,
         expires_at: params.expiresAt,
         max_uses: params.maxUses,
+      }),
+    );
+  }
+
+  /**
+   * Issue #666: Aggregate platform fee collection over `[fromTs, toTs]`
+   * (inclusive, ledger timestamps in seconds), for treasury reporting.
+   *
+   * Read-only — no authorization required.
+   */
+  async getPlatformFeeReport(fromTs: bigint, toTs: bigint): Promise<PlatformFeeReport> {
+    const result = await withMappedContractError(() =>
+      this.contract.get_platform_fee_report({
+        from_ts: fromTs,
+        to_ts: toTs,
+      }),
+    );
+    return {
+      totalFeesCollected: result.total_fees_collected,
+      treasuryShare: result.treasury_share,
+      developerShare: result.developer_share,
+      paymentCount: result.payment_count,
+    };
+  }
+
+  /**
+   * Issue #660: Add an address to the global compliance blacklist.
+   * Blacklisted addresses are rejected as payer, merchant, or requester on
+   * subsequent payment/refund/dispute operations.
+   *
+   * Requires the PaymentProcessor ADMIN role.
+   */
+  async addToBlacklist(admin: string, address: string): Promise<void> {
+    return withMappedContractError(() =>
+      this.contract.add_to_blacklist({
+        admin,
+        address,
+      }),
+    );
+  }
+
+  /**
+   * Issue #660: Remove an address from the global compliance blacklist.
+   *
+   * Requires the PaymentProcessor ADMIN role.
+   */
+  async removeFromBlacklist(admin: string, address: string): Promise<void> {
+    return withMappedContractError(() =>
+      this.contract.remove_from_blacklist({
+        admin,
+        address,
+      }),
+    );
+  }
+
+  /**
+   * Issue #660: Check whether an address is currently blacklisted.
+   *
+   * Read-only — no authorization required.
+   */
+  async isBlacklisted(address: string): Promise<boolean> {
+    return withMappedContractError(() =>
+      this.contract.is_blacklisted({
+        address,
       }),
     );
   }
